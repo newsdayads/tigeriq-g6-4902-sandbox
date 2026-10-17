@@ -1,0 +1,110 @@
+name: G6 native Coding Lane and provider branch proof
+on:
+  push:
+    branches:
+      - g6/4902-verified
+    paths:
+      - .github/workflows/g6-native-provider.yml
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  native-provider:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: g6test
+          POSTGRES_PASSWORD: g6-disposable-only
+          POSTGRES_DB: g6test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U g6test" --health-interval 5s --health-timeout 5s --health-retries 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_TOKEN: ${{ github.token }}
+      DATABASE_URL: postgres://g6test:g6-disposable-only@127.0.0.1:5432/g6test
+      TIGERIQ_GITHUB_OWNER: newsdayads
+      TIGERIQ_GITHUB_REPO: tigeriq-g6-4902-sandbox
+      TIGERIQ_CODING_AUTO_MERGE: 'false'
+      TIGERIQ_CODING_PORT: '18097'
+      TIGERIQ_CORE_STATUS_URL: http://127.0.0.1:9/api/status
+      TIGERIQ_CODING_MAX_PARALLEL: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Exact repository and revision guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "newsdayads/tigeriq-g6-4902-sandbox"
+          test "$GITHUB_REF" = "refs/heads/g6/4902-verified"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git hash-object apps/tigeriq-coding-lane/coding-lane.mjs)" = "7caf31850e66f3799a4ccb68a7bf2ef77330697c"
+          echo "G6_NATIVE_SOURCE_BLOB_VERIFIED"
+      - name: Install pinned dependencies with no lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Validate actual native branch naming against GitHub provider
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="$(node --input-type=module -e "import {branchName} from './apps/tigeriq-coding-lane/policy.mjs'; console.log(branchName('NV09','CODE-4902-RUN-$GITHUB_RUN_ID'))")"
+          test "$branch" = "tigeriq/nv09/code-4902-run-$GITHUB_RUN_ID"
+          out="tigeriq/nv11/code-4902-run-$GITHUB_RUN_ID"
+          cleanup() { gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$branch" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          if gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$out" -f sha="$GITHUB_SHA" >/dev/null 2>"$RUNNER_TEMP/outside-denial"; then
+            echo "FAIL_UNAUTHORIZED_NATIVE_BRANCH"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$out" >/dev/null 2>&1 || true
+            exit 1
+          fi
+          grep -Eq 'HTTP (403|422)' "$RUNNER_TEMP/outside-denial"
+          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$branch" -f sha="$GITHUB_SHA" --jq '.ref' | grep -F "$branch"
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$branch"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$branch" >/dev/null 2>&1; then exit 1; fi
+          trap - EXIT
+          echo "G6_REAL_NATIVE_BRANCHNAME_PROVIDER_FENCED_SUCCESS"
+      - name: Boot native Coding Lane process and verify PostgreSQL restart
+        shell: bash
+        run: |
+          set -euo pipefail
+          PID=''
+          cleanup() { if test -n "$PID"; then kill "$PID" >/dev/null 2>&1 || true; wait "$PID" >/dev/null 2>&1 || true; fi; }
+          trap cleanup EXIT
+          boot() {
+            node apps/tigeriq-coding-lane/coding-lane.mjs > "$RUNNER_TEMP/g6-lane.log" 2>&1 &
+            PID=$!
+            for i in $(seq 1 80); do
+              if ! kill -0 "$PID" 2>/dev/null; then cat "$RUNNER_TEMP/g6-lane.log"; return 1; fi
+              if curl -fsS --max-time 1 "http://127.0.0.1:18097/health" > "$RUNNER_TEMP/g6-health.json" 2>/dev/null; then
+                node -e "const r=require('$RUNNER_TEMP/g6-health.json'); if(!r.ok)process.exit(1)" 2>/dev/null || node --input-type=module -e "import{readFileSync}from'node:fs'; const r=JSON.parse(readFileSync(process.env.RUNNER_TEMP+'/g6-health.json')); if(r.ok!==true)process.exit(1)"
+                return 0
+              fi
+              sleep 0.3
+            done
+            cat "$RUNNER_TEMP/g6-lane.log"
+            return 1
+          }
+          boot
+          first="$(node --input-type=module -e "import{readFileSync}from'node:fs'; console.log(JSON.parse(readFileSync(process.env.RUNNER_TEMP+'/g6-health.json')).pid)")"
+          node --input-type=module -e "import pg from 'pg';const p=new pg.Pool({connectionString:process.env.DATABASE_URL});await p.query('insert into tigeriq_coding_objectives(id,objective,priority,status) values($1,$2,$3,$4)', ['CODEOBJ-G6-SANDBOX-4902','Synthetic isolated owner-held receipt','P0','waiting_owner']);await p.end()"
+          cleanup
+          PID=''
+          sleep 1
+          boot
+          second="$(node --input-type=module -e "import{readFileSync}from'node:fs'; console.log(JSON.parse(readFileSync(process.env.RUNNER_TEMP+'/g6-health.json')).pid)")"
+          test "$first" != "$second"
+          node --input-type=module -e "import pg from 'pg';const p=new pg.Pool({connectionString:process.env.DATABASE_URL});const r=await p.query('select status from tigeriq_coding_objectives where id=$1',['CODEOBJ-G6-SANDBOX-4902']);if(r.rows.length!==1||r.rows[0].status!=='waiting_owner')process.exit(1);await p.end()"
+          echo "G6_NATIVE_REAL_PROCESS_POSTGRES_RESTART_HOLD_VERIFIED pid_before=$first pid_after=$second"
+          cleanup
+          PID=''
+          trap - EXIT
+          echo "G6_NATIVE_PROVIDER_ISOLATED_SMOKE_SUCCESS"
