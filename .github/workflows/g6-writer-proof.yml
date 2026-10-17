@@ -1,0 +1,54 @@
+name: G6 isolated branch writer proof
+on:
+  push:
+    branches:
+      - g6/4902-verified
+    paths:
+      - .github/workflows/g6-writer-proof.yml
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  writer-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Verify isolated source and run context
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "newsdayads/tigeriq-g6-4902-sandbox"
+          test "$GITHUB_REF" = "refs/heads/g6/4902-verified"
+          test "$(gh api repos/$GITHUB_REPOSITORY/git/ref/heads/g6/4902-verified --jq .object.sha)" = "$GITHUB_SHA"
+          echo "G6_SCOPE_VERIFIED repo=$GITHUB_REPOSITORY sha=$GITHUB_SHA"
+      - name: Exercise real provider branch deny and allow
+        shell: bash
+        run: |
+          set -euo pipefail
+          blocked="refs/heads/unapproved-probe-$GITHUB_RUN_ID"
+          allowed="refs/heads/g6/probe-$GITHUB_RUN_ID"
+          cleanup() {
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/$allowed" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          if gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="$blocked" -f sha="$GITHUB_SHA" > /dev/null 2>"$RUNNER_TEMP/blocked-response.txt"; then
+            echo "FAIL_UNAPPROVED_BRANCH_WRITABLE"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/$blocked" >/dev/null 2>&1 || true
+            exit 1
+          fi
+          if ! grep -Eq 'HTTP (403|422)' "$RUNNER_TEMP/blocked-response.txt"; then
+            echo "FAIL_DENIAL_UNCLASSIFIED"
+            exit 1
+          fi
+          echo "G6_OUT_OF_SCOPE_WRITE_DENIED_BY_GITHUB"
+          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="$allowed" -f sha="$GITHUB_SHA" --jq '.ref' | grep -F "$allowed"
+          echo "G6_ALLOWED_BRANCH_WRITE_PASSED"
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/$allowed"
+          if gh api "repos/$GITHUB_REPOSITORY/git/$allowed" >/dev/null 2>&1; then
+            echo "FAIL_CLEANUP"
+            exit 1
+          fi
+          trap - EXIT
+          echo "G6_BRANCH_WRITER_PROVIDER_RECEIPT_VERIFIED"
