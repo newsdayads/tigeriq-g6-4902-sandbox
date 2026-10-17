@@ -95,14 +95,14 @@ jobs:
           }
           boot
           first="$(node --input-type=module -e "import{readFileSync}from'node:fs'; console.log(JSON.parse(readFileSync(process.env.RUNNER_TEMP+'/g6-health.json')).pid)")"
-          node --input-type=module -e "import pg from 'pg';const p=new pg.Pool({connectionString:process.env.DATABASE_URL});await p.query('insert into tigeriq_coding_objectives(id,objective,priority,status) values($1,$2,$3,$4)', ['CODEOBJ-G6-SANDBOX-4902','Synthetic isolated owner-held receipt','P0','waiting_owner']);await p.end()"
+          node --input-type=module -e "import pg from 'pg';const p=new pg.Pool({connectionString:process.env.DATABASE_URL});await p.query('insert into tigeriq_coding_objectives(id,objective,priority,status) values(\$1,\$2,\$3,\$4)', ['CODEOBJ-G6-SANDBOX-4902','Synthetic isolated owner-held receipt','P0','waiting_owner']);await p.end()"
           cleanup
           PID=''
           sleep 1
           boot
           second="$(node --input-type=module -e "import{readFileSync}from'node:fs'; console.log(JSON.parse(readFileSync(process.env.RUNNER_TEMP+'/g6-health.json')).pid)")"
           test "$first" != "$second"
-          node --input-type=module -e "import pg from 'pg';const p=new pg.Pool({connectionString:process.env.DATABASE_URL});const r=await p.query('select status from tigeriq_coding_objectives where id=$1',['CODEOBJ-G6-SANDBOX-4902']);if(r.rows.length!==1||r.rows[0].status!=='waiting_owner')process.exit(1);await p.end()"
+          node --input-type=module -e "import pg from 'pg';const p=new pg.Pool({connectionString:process.env.DATABASE_URL});const r=await p.query('select status from tigeriq_coding_objectives where id=\$1',['CODEOBJ-G6-SANDBOX-4902']);if(r.rows.length!==1||r.rows[0].status!=='waiting_owner')process.exit(1);await p.end()"
           echo "G6_NATIVE_REAL_PROCESS_POSTGRES_RESTART_HOLD_VERIFIED pid_before=$first pid_after=$second"
           cleanup
           PID=''
