@@ -1,0 +1,45 @@
+import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+
+describe('NV02 idle self-pull continuity', () => {
+  it('durably idles without local continue/model-loop dispatch', () => {
+    const bridge = readFileSync('apps/chrome-controller/direct-cdp-bridge.mjs', 'utf8');
+    expect(bridge).toContain("stateBefore.idleState==='READY_NO_ELIGIBLE_WORK'");
+    expect(bridge).toContain("status:'READY_NO_ELIGIBLE_WORK_IDLE'");
+    expect(bridge).toContain("action==='NV02_IDLE'");
+    expect(bridge).toContain('NV02_IDLE_MARKER');
+    expect(bridge).toContain("fs.existsSync(NV02_IDLE_MARKER)");
+  });
+  it('keeps backlog selection outside App Chrome', () => {
+    const server = readFileSync('apps/chrome-controller/src/server.ts', 'utf8');
+    expect(server).toContain("action==='idle'");
+    expect(server).not.toContain('github/issues');
+    expect(readFileSync('apps/tigeriq-core/work-routing-policy.mjs', 'utf8')).toContain('Core không assign/route NV02');
+  });
+  it('claims resource ownership before any dependency reconcile write', () => {
+    const runner = readFileSync('scripts/nv02-local-self-pull.mjs', 'utf8');
+    const claimIndex = runner.indexOf('const lease = await claimNv02WorkOrder');
+    const reconcileIndex = runner.indexOf('const reconcileResult = await reconcile(issue, lease)');
+    expect(claimIndex).toBeGreaterThan(-1);
+    expect(reconcileIndex).toBeGreaterThan(claimIndex);
+    expect(runner).not.toContain('.map((issue) => reconcile(issue))');
+    expect(runner).toContain('refreshAllComments: async () => activeIssueComments()');
+    expect(runner).toContain('assertWriteOwnership: () => assertLeaseOwnership(issue, lease)');
+    expect(runner).toContain('nv02LeaseAuthority(issue, lease)');
+    expect(runner).toContain('nv02LeaseAuthority(issue, own || {})');
+    const dispatchFn = runner.slice(runner.indexOf('async function controllerDispatch'), runner.indexOf('function terminal'));
+    expect(dispatchFn).toContain('assertLeaseOwnership(issue, lease);');
+  });
+  it('bounds external I/O so command 02 cannot hang indefinitely', () => {
+    const runner = readFileSync('scripts/nv02-local-self-pull.mjs', 'utf8');
+    expect(runner).toContain('const GITHUB_CLI_TIMEOUT_MS = 60_000;');
+    expect(runner).toContain('const CONTROLLER_REQUEST_TIMEOUT_MS = 30_000;');
+    expect(runner).toContain('timeout: GITHUB_CLI_TIMEOUT_MS');
+    const dispatchFn = runner.slice(runner.indexOf('async function controllerDispatch'), runner.indexOf('function terminal'));
+    expect(dispatchFn).toContain('signal: AbortSignal.timeout(CONTROLLER_REQUEST_TIMEOUT_MS)');
+    const idleFn = runner.slice(runner.indexOf('async function setIdle'), runner.indexOf("console.log(JSON.stringify({ event: 'NV02_COMMAND_02'"));
+    expect(idleFn).toContain('signal: AbortSignal.timeout(CONTROLLER_REQUEST_TIMEOUT_MS)');
+  });
+
+
+});

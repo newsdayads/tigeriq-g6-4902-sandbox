@@ -1,0 +1,851 @@
+/* TigerIQ Work Center — OWNER-approved LIVE visual contract V1.
+ * One canonical WorkCard theme for Live / API Health / Web Control.
+ * Load AFTER page-specific CSS. Do not fork card styles per surface.
+ * Per-surface space/scroll may differ; card geometry, colors, typography and progress may not.
+ */
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center {
+  display:grid!important;
+  grid-template-columns:repeat(auto-fill,minmax(min(100%,280px),1fr))!important;
+  grid-auto-rows:auto!important;
+  align-items:stretch!important;
+  gap:14px 13px!important;
+  min-width:0!important;
+  padding:9px 4px 11px!important;
+  max-width:100%!important;
+}
+/* Retain exact Owner-approved LIVE column breakpoints (2/3/4/5/6).
+   The Health rail below is container-driven; sharing a card skin does not mean
+   compressing cards into unreadable columns. */
+body:not(.api-health) #workList.tiq-work-center{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+@media(min-width:900px){body:not(.api-health) #workList.tiq-work-center{grid-template-columns:repeat(3,minmax(0,1fr))!important}}
+@media(min-width:1200px){body:not(.api-health) #workList.tiq-work-center{grid-template-columns:repeat(4,minmax(0,1fr))!important}}
+@media(min-width:1450px){body:not(.api-health) #workList.tiq-work-center{grid-template-columns:repeat(5,minmax(0,1fr))!important}}
+@media(min-width:2100px){body:not(.api-health) #workList.tiq-work-center{grid-template-columns:repeat(6,minmax(0,1fr))!important}}
+@media(max-width:599px){body:not(.api-health) #workList.tiq-work-center{grid-template-columns:minmax(0,1fr)!important}}
+/* API Health has a much narrower content rail than LIVE. Columns must respect
+   container width, not screen width; remove legacy forced 4–5 microcards. */
+body.api-health #workList.tiq-work-center {
+  grid-template-columns:repeat(auto-fill,minmax(min(100%,290px),1fr))!important;
+  align-content:start!important;
+  max-height:min(68vh,840px)!important;
+  overflow-x:hidden!important;
+  overflow-y:auto!important;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card {
+  display:block!important;
+  position:relative!important;
+  isolation:isolate;
+  min-width:0!important;
+  min-height:188px!important;
+  height:auto!important;
+  align-self:stretch!important;
+  margin:0!important;
+  padding:0!important;
+  background:transparent!important;
+  background-image:none!important;
+  border:0!important;
+  border-radius:0!important;
+  box-shadow:none!important;
+  overflow:visible!important;
+  text-shadow:none!important;
+  transform:none;
+  cursor:pointer;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card::before,
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card::after {
+  content:none!important;
+  display:none!important;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card > .work-main {
+  position:static!important; /* id and priority tabs are anchored to outer card */
+  box-sizing:border-box;
+  display:flex!important;
+  flex-direction:column!important;
+  margin-top:27px!important;
+  min-height:160px!important;
+  height:calc(100% - 27px)!important;
+  width:100%!important;
+  padding:10px 11px 12px!important;
+  border:1px solid var(--status-color,#64748B)!important;
+  border-radius:0 0 13px 13px!important;
+  background:#10243A!important;
+  background-image:none!important;
+  box-shadow:0 8px 24px rgba(0,0,0,.16)!important;
+  color:#EDF5FE!important;
+  transform:none!important;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card:is(:hover,:focus-visible) > .work-main {
+  box-shadow:0 13px 28px rgba(0,0,0,.32)!important;
+  border-color:var(--status-color,#64748B)!important;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card :is(.work-id,.priority) {
+  position:absolute!important;
+  top:0!important;
+  z-index:3!important;
+  display:flex!important;
+  align-items:center!important;
+  justify-content:center!important;
+  height:27px!important;
+  min-height:27px!important;
+  padding:0 10px!important;
+  border:0!important;
+  border-radius:9px 9px 0 0!important;
+  font-size:16px!important;
+  font-weight:900!important;
+  line-height:1!important;
+  white-space:nowrap;
+  text-shadow:none!important;
+  box-shadow:none!important;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .work-id {
+  left:0!important;
+  right:auto!important;
+  color:#fff!important;
+  background:var(--status-color,#64748B)!important;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .priority {
+  right:0!important;
+  left:auto!important;
+  color:white!important;
+  background:#64748B!important;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .priority.p0{background:#EF4444!important}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .priority.p1{background:#F97316!important}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .priority.p2{background:#F59E0B!important;color:#071321!important}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .priority.p3{background:#3B82F6!important}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .priority.p4{background:#8B5CF6!important}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .priority.p5{background:#64748B!important}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .work-top {
+  display:flex!important;
+  align-items:center!important;
+  flex-wrap:nowrap!important;
+  gap:5px!important;
+  min-width:0;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .rank{
+  width:25px;height:24px;flex:none;
+  font-size:11px!important;font-weight:900;
+  color:#EAF6FF!important;background:#234460!important;
+  border:1px solid #4B7497!important;border-radius:5px;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .work-nv{
+  font-size:10px!important;color:#A4B9CE!important;
+  max-width:80px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .work-top .state{
+  display:inline-flex!important;
+  align-items:center!important;
+  gap:5px!important;
+  flex:none;max-width:145px;min-width:0;
+  margin-left:auto!important;
+  padding:2px 0!important;
+  color:var(--status-color,#64748B)!important;
+  border:0!important;background:transparent!important;
+  font-size:10px!important;font-weight:800!important;
+  box-shadow:none!important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .state .live-status-icon{
+  width:15px;height:15px;flex:none;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .work-hierarchy{
+  display:block!important;
+  margin-top:7px!important;
+  font-size:11px!important;font-weight:750!important;
+  color:#97C8E2!important;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .work-hierarchy span{color:#CBD5E1!important}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .work-title{
+  margin:7px 0 0!important;
+  min-height:2.68em!important;
+  font-size:14px!important;line-height:1.34!important;font-weight:800!important;
+  color:#F3F7FC!important;
+  display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;
+  overflow:hidden;overflow-wrap:anywhere;letter-spacing:0;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .work-quick{
+  margin-top:8px!important;
+  font-size:11px!important;line-height:1.42!important;
+  color:#A9D4F8!important;
+  overflow-wrap:anywhere;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .work-quick span{
+  display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .work-progress-bottom{
+  margin-top:auto!important;padding-top:10px!important;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .work-step-summary{
+  display:flex;justify-content:space-between;gap:6px;
+  font-size:10px!important;line-height:1.4!important;
+  color:#B5D6EB!important;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .work-step-summary .step-remaining{
+  color:#F2C879!important;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .progress{
+  margin:6px 0 0!important;color:var(--status-color,#64748B)!important;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .progress-track{
+  height:6px!important;background:#1A3148!important;border-radius:999px!important;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .progress-fill{
+  background:var(--status-color,#64748B)!important;
+  background-image:none!important;
+  box-shadow:none!important;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .progress-text{
+  color:var(--status-color,#64748B)!important;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card:not(.progress-running) .progress-fill::after{content:none!important;animation:none!important}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card:not(.progress-running) .progress.indeterminate .progress-fill{display:none!important;animation:none!important}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .tiq-work-times{
+  margin-top:auto!important;padding-top:9px!important;
+  font-size:10px!important;color:#9CB0C5!important;
+}
+/* Honor the same approved status palette across all host themes. */
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card.status-working{--status-color:#10B981!important}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card.status-done{--status-color:#06B6D4!important}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card.status-owner_gate{--status-color:#A78BFA!important}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card.status-review{--status-color:#3B82F6!important}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card.status-verify{--status-color:#14B8A6!important}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card.status-waiting{--status-color:#F59E0B!important}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card.status-blocked{--status-color:#F43F5E!important}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card.status-queued{--status-color:#F59E0B!important}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card.status-closed_unverified{--status-color:#94A3B8!important}
+@media(max-width:599px){
+  :is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center{grid-template-columns:minmax(0,1fr)!important}
+  :is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .work-title{font-size:14px!important}
+}
+@media(prefers-reduced-motion:reduce){
+  :is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card,
+  :is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center > .tiq-work-card .work-main{animation:none!important;transition:none!important}
+}
+
+/* Compact, four-state owner-facing work filters shared by Health and Web Control. */
+.work-scope-note{display:block;color:#98AEC4;font-size:10px;line-height:1.4;margin:6px 0 8px}
+#workCenterWebFilters{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
+#workCenterWebFilters button{border:1px solid #34536D;border-radius:999px;background:#112A40;color:#B6D3EC;padding:7px 9px;font:700 11px/1.2 inherit;cursor:pointer}
+#workCenterWebFilters button[aria-pressed="true"]{border-color:#61B8E9;color:#EDF8FF;background:#194C71}
+#workCenterWebFilters button:focus-visible{outline:2px solid #A8DEFF;outline-offset:2px}
+
+
+/* TigerIQ System Control — responsive density V2 (Owner 2026-10-13).
+   Canonical presentation layer for PC01 Health and Vercel's PC01 mirror.
+   Readability is viewport/context dependent; do not stretch individual cards
+   on FHD, QHD, 4K. No change to underlying runtime or status semantics. */
+body.api-health .app{max-width:none!important;width:100%;padding:clamp(6px,.65vw,14px)!important}
+body.api-health .topbar{margin:calc(-1 * clamp(6px,.65vw,14px)) calc(-1 * clamp(6px,.65vw,14px)) 12px!important;padding-inline:clamp(10px,1vw,22px)!important;min-width:0}
+body.api-health .layout{min-width:0}
+body.api-health .layout>main,body.api-health .layout>.side,body.api-health .panel{min-width:0}
+body.api-health .workforce-panel .panel-h h2{color:#60A5FA!important}
+body.api-health .work-panel .panel-h h2{color:#2DD4BF!important}
+body.api-health .api-perf-panel .panel-h h2{color:#38BDF8!important}
+body.api-health .activity-panel .panel-h h2{color:#C4B5FD!important}
+body.api-health .alert-panel .panel-h h2{color:#FCA5A5!important}
+body.api-health .panel-h{padding:9px 12px!important;gap:8px}
+body.api-health .panel-h h2{font-size:clamp(13px,1vw,17px)!important;line-height:1.2!important;letter-spacing:.01em}
+body.api-health .panel-h small{font-size:10px!important}
+body.api-health .wo-panel{margin-top:10px!important}
+body.api-health .wo-filters{gap:6px!important;padding:7px 10px!important;flex-wrap:wrap;overflow:visible!important}
+body.api-health .work-scope-note{font-size:10px;line-height:1.3;margin:3px 0 5px}
+body.api-health .work-scope-note select{border:1px solid #527699;border-radius:6px;background:#10243A;color:#E4F4FF;padding:4px 7px}
+body.api-health .work-panel .wo-filter{--wc-tab:#94A3B8;color:var(--wc-tab)!important;border:1px solid color-mix(in srgb,var(--wc-tab) 64%,#21344B)!important;background:#111C2E!important;border-radius:9px!important;padding:5px 8px!important;font-weight:850!important;font-size:11px!important}
+body.api-health .work-panel .wo-filter.action{--wc-tab:#60A5FA}
+body.api-health .work-panel .wo-filter.working{--wc-tab:#4ADE80}
+body.api-health .work-panel .wo-filter.waitblocked{--wc-tab:#FBBF24}
+body.api-health .work-panel .wo-filter.closed{--wc-tab:#2DD4BF}
+body.api-health .work-panel .wo-filter.on{background:color-mix(in srgb,var(--wc-tab) 20%,#111C2E)!important;color:#F8FAFC!important;border-color:var(--wc-tab)!important;box-shadow:inset 0 0 0 1px var(--wc-tab)!important}
+body.api-health .work-panel .wo-filter:focus-visible{outline:2px solid var(--wc-tab)!important;outline-offset:2px}
+
+/* Compact cards use clipped summaries only; full source detail stays available on click. */
+body.api-health #workers.workers{align-content:start;gap:7px!important;padding:8px!important}
+body.api-health #workers.workers>.worker.employee-card{padding:8px!important;min-width:0!important;min-height:104px!important}
+body.api-health .employee-card-head{gap:4px!important;margin-bottom:4px!important}
+body.api-health .employee-identity{gap:6px!important;min-width:0}
+body.api-health .employee-avatar{width:33px!important;height:33px!important;border-radius:9px!important}
+body.api-health .employee-avatar img{max-width:26px!important;max-height:26px!important}
+body.api-health .employee-name{font-size:11px!important;line-height:1.23!important;overflow:hidden!important;display:-webkit-box!important;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+body.api-health .employee-id{font-size:10px!important;padding:2px 5px!important}
+body.api-health .employee-state{font-size:9px!important;padding:2px 5px!important}
+body.api-health .employee-task{font-size:10px!important;line-height:1.24!important;margin-top:5px!important;padding-top:4px!important;overflow:hidden!important;display:-webkit-box!important;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+body.api-health .employee-live-line{font-size:9px!important;margin-top:4px!important}
+body.api-health #workList.wo-list.work-list.tiq-work-center{padding:7px!important;gap:9px!important;grid-auto-rows:max-content!important;align-items:start!important;overflow-x:hidden!important}
+body.api-health #workList.tiq-work-center>.tiq-work-card{min-width:0!important;min-height:0!important;height:auto!important;align-self:start!important}
+body.api-health #workList.tiq-work-center>.tiq-work-card>.work-main{padding:7px 9px 8px!important;min-height:0!important;height:auto!important}
+/* API Health: full owner-readable titles, never clipped by the shared compact clamp. */
+body.api-health #workList.tiq-work-center>.tiq-work-card .work-title{
+ margin-top:5px!important;font-size:14px!important;line-height:1.28!important;
+ min-height:0!important;height:auto!important;max-height:none!important;
+ display:block!important;-webkit-line-clamp:unset!important;
+ overflow:visible!important;white-space:normal!important;overflow-wrap:anywhere!important;
+ flex:0 0 auto!important; /* a flex column must never shrink a multi-line heading to 0 */
+}
+body.api-health #workList.tiq-work-center>.tiq-work-card .work-hierarchy{margin-top:4px!important;font-size:10px!important}
+body.api-health #workList.tiq-work-center>.tiq-work-card .work-quick{margin-top:5px!important;font-size:10px!important;line-height:1.3!important}
+body.api-health #workList.tiq-work-center>.tiq-work-card .work-quick span{display:-webkit-box!important;-webkit-box-orient:vertical!important;-webkit-line-clamp:2!important;overflow:hidden!important}
+body.api-health #workList.tiq-work-center>.tiq-work-card .work-progress-bottom{margin-top:5px!important;padding-top:0!important}
+body.api-health #workList.tiq-work-center>.tiq-work-card .tiq-work-times{padding-top:4px!important;margin-top:4px!important;font-size:9px!important;gap:2px 8px!important}
+
+/* Landscape smartphones / compact tablets: 4 AI cards, 3 work cards, 2+1
+   monitoring panels. Portrait retains readable 1-column work cards. */
+@media (orientation:landscape) and (min-width:640px) and (max-width:1199px) and (max-height:600px){
+  body.api-health .layout{display:grid!important;grid-template-columns:minmax(0,1fr)!important;gap:8px!important}
+  body.api-health #workers.workers{grid-template-columns:repeat(4,minmax(0,1fr))!important}
+  body.api-health #workList.wo-list.work-list.tiq-work-center{grid-template-columns:repeat(3,minmax(0,1fr))!important;max-height:none!important}
+  body.api-health .side{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:8px!important;align-content:start}
+  body.api-health .side>.alert-panel{grid-column:1 / -1}
+  body.api-health .side>.panel{min-width:0!important;max-height:245px;overflow:auto!important}
+  body.api-health .side>.chart{height:auto!important;min-height:140px;padding:8px!important}
+  body.api-health .side .chartbox{height:94px!important}
+  body.api-health .side .events,body.api-health .side .alert-list{max-height:145px!important;overflow:auto!important}
+  body.api-health .workforce-panel .panel-h{display:flex!important;align-items:center!important}
+  body.api-health .workforce-panel .filters{gap:4px!important}
+  body.api-health .workforce-panel .filter{padding:4px 6px!important;font-size:10px!important}
+  body.api-health .topbar{height:42px!important;margin-bottom:8px!important;gap:8px!important}
+  body.api-health #workers.workers>.worker.employee-card{min-height:88px!important;padding:6px!important}
+  body.api-health #workList.tiq-work-center>.tiq-work-card .work-quick span{-webkit-line-clamp:1!important}
+  body.api-health #workList.tiq-work-center>.tiq-work-card .work-title{font-size:12px!important}
+  body.api-health .tiq-floating-reload{width:39px;height:39px}
+  body.api-health .tiq-floating-reload svg{width:19px;height:19px}
+}
+
+/* Full HD → QHD → 4K: consume the added width as additional cards rather
+   than scaling each card or imposing a 1920px application canvas. */
+@media (min-width:1200px){
+  body.api-health .layout{grid-template-columns:minmax(0,1fr) minmax(280px,340px)!important;gap:12px!important}
+  body.api-health #workers.workers{grid-template-columns:repeat(auto-fill,minmax(205px,1fr))!important}
+  body.api-health #workList.wo-list.work-list.tiq-work-center{grid-template-columns:repeat(auto-fill,minmax(245px,1fr))!important}
+}
+@media (min-width:1920px){
+  body.api-health .layout{grid-template-columns:minmax(0,1fr) minmax(320px,370px)!important}
+  body.api-health #workers.workers{grid-template-columns:repeat(auto-fill,minmax(215px,1fr))!important}
+  body.api-health #workList.wo-list.work-list.tiq-work-center{grid-template-columns:repeat(auto-fill,minmax(260px,1fr))!important}
+}
+@media (min-width:2560px){
+  body.api-health .layout{grid-template-columns:minmax(0,1fr) minmax(350px,420px)!important}
+  body.api-health #workers.workers{grid-template-columns:repeat(auto-fill,minmax(220px,1fr))!important}
+  body.api-health #workList.wo-list.work-list.tiq-work-center{grid-template-columns:repeat(auto-fill,minmax(270px,1fr))!important}
+}
+@media (min-width:3840px){
+  body.api-health .layout{grid-template-columns:minmax(0,1fr) minmax(390px,470px)!important}
+  body.api-health #workers.workers{grid-template-columns:repeat(auto-fill,minmax(230px,1fr))!important}
+  body.api-health #workList.wo-list.work-list.tiq-work-center{grid-template-columns:repeat(auto-fill,minmax(285px,1fr))!important}
+}
+/* Small portrait: do not force unreadable landscape columns. */
+@media (orientation:portrait) and (max-width:599px){
+  body.api-health #workers.workers{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+  body.api-health #workList.wo-list.work-list.tiq-work-center{grid-template-columns:minmax(0,1fr)!important}
+  body.api-health #workList.tiq-work-center>.tiq-work-card .work-title{font-size:12px!important}
+  body.api-health .layout{grid-template-columns:minmax(0,1fr)!important}
+  body.api-health .side{grid-template-columns:minmax(0,1fr)!important}
+}
+
+/* OWNER P0 semantic filter FIX: legacy Health inline CSS used a more
+   specific background:transparent!important shorthand. The scoped #woFilters
+   contract is intentionally stronger and loaded after the legacy stylesheet. */
+body.api-health .work-panel #woFilters.wo-filters .wo-filter{
+  background:#111C2E!important;
+  border-color:var(--wc-tab,#94A3B8)!important;
+  color:var(--wc-tab,#94A3B8)!important;
+}
+body.api-health .work-panel #woFilters.wo-filters .wo-filter.on{
+  background:color-mix(in srgb,var(--wc-tab,#94A3B8) 24%,#111C2E)!important;
+  border-color:var(--wc-tab,#94A3B8)!important;
+  color:#F8FAFC!important;
+  box-shadow:inset 0 0 0 1px var(--wc-tab,#94A3B8)!important;
+}
+
+/* Owner 2026-10-13: TigerIQ AI is the product brand; API Health is a module. */
+body.api-health .brand-ai{font-style:normal;font-size:.7em;font-weight:800;color:#7DD3FC;white-space:nowrap;letter-spacing:.015em}
+body.api-health .workforce-panel>.panel-h{
+ display:grid!important;grid-template-columns:minmax(210px,max-content) minmax(0,1fr)!important;
+ align-items:center!important;column-gap:12px!important;row-gap:5px!important;
+}
+body.api-health .workforce-panel>.panel-h>div:first-child{min-width:0}
+body.api-health .workforce-panel>.panel-h .filters{
+ display:flex!important;flex-wrap:wrap!important;justify-content:flex-end!important;
+ min-width:0!important;max-width:100%!important;align-items:center!important;
+}
+body.api-health .workforce-panel>.panel-h h2{max-width:100%;overflow-wrap:anywhere!important}
+@media(max-width:1199px){
+ body.api-health .workforce-panel>.panel-h{grid-template-columns:minmax(0,1fr)!important}
+ body.api-health .workforce-panel>.panel-h .filters{justify-content:flex-start!important}
+}
+/* Do not create a nested scroller, and ensure each card in a CSS grid row
+   shares the row height. Other rows may legitimately have another height. */
+body.api-health #workList.wo-list.work-list.tiq-work-center{
+ max-height:none!important;height:auto!important;overflow:visible!important;
+ grid-auto-rows:auto!important;align-items:stretch!important;align-content:start!important;
+}
+/* Let the tallest content size each grid row; main flexes inside the card,
+   excluding the 27px ID/priority tabs from its own height. */
+body.api-health #workList.tiq-work-center>.tiq-work-card{
+ height:auto!important;align-self:stretch!important;display:flex!important;
+ flex-direction:column!important;min-height:0!important;
+}
+body.api-health #workList.tiq-work-center>.tiq-work-card>.work-main{
+ height:auto!important;min-height:max-content!important;
+ flex:1 0 auto!important; /* keep natural content height, grow only to fill equal-height rows */
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center .work-activity{
+ margin-top:5px;display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 8px;
+ font-size:10px;line-height:1.25;color:#B9DEF8;min-width:0;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center .work-activity span:first-child{
+ font-weight:700;color:#93C5FD;white-space:nowrap;
+}
+:is(#workList,#workCenterWeb,#workCenterArchiveWeb).tiq-work-center .work-activity span:last-child{
+ overflow:hidden;white-space:nowrap;text-overflow:ellipsis;min-width:0;max-width:100%;
+}
+
+/* Health desktop regression: the legacy Work panel uses height:100% with an
+   indefinite containing height while its work-list has flex-basis:0. That can
+   collapse grid-row sizes and put card contents over neighboring rows.
+   Let the panel and work grid establish height from their real content. */
+@media (min-width:1450px){
+ body.api-health .work-panel{height:auto!important;min-height:0!important}
+ body.api-health .work-panel #workList.wo-list.work-list.tiq-work-center{
+  flex:0 0 auto!important;height:auto!important;min-height:max-content!important;
+ }
+}
+
+/* Owner 2026-10-15: compact workforce, status colors, verified progress shimmer. */
+body.api-health #workers.workers{
+ grid-template-columns:repeat(auto-fit,minmax(min(100%,155px),1fr))!important;
+}
+@media (orientation:landscape) and (min-width:640px) and (max-width:1199px) and (max-height:600px){body.api-health #workers.workers{grid-template-columns:repeat(4,minmax(0,1fr))!important}}
+body.api-health #workers.workers>.worker.employee-card{min-width:0!important;padding:6px!important}
+body.api-health #workers.workers .employee-identity{min-width:0!important}
+body.api-health #workList.tiq-work-center>.tiq-work-card .work-activity{
+ color:#4ade80!important;border-color:rgba(74,222,128,.32)!important;
+}
+body.api-health #workList.tiq-work-center>.tiq-work-card .work-quick.blocked{
+ color:#f87171!important;border-color:rgba(248,113,113,.4)!important;
+}
+body.api-health #workList.tiq-work-center>.tiq-work-card .progress:not(.indeterminate) .progress-fill{position:relative!important;overflow:hidden!important}
+body.api-health #workList.tiq-work-center>.tiq-work-card .progress:not(.indeterminate) .progress-fill::after{
+ content:''!important;position:absolute!important;inset:0!important;width:44%!important;
+ background:linear-gradient(100deg,transparent 0%,rgba(255,255,255,.08) 20%,rgba(255,255,255,.62) 50%,rgba(255,255,255,.08) 80%,transparent 100%)!important;
+ transform:translateX(-160%) skewX(-15deg);animation:tiq-owner-shine 2.7s ease-in-out infinite!important;
+ pointer-events:none;
+}
+@keyframes tiq-owner-shine{0%,15%{transform:translateX(-160%) skewX(-15deg)}75%,100%{transform:translateX(360%) skewX(-15deg)}}
+@media(max-width:480px){body.api-health #workers.workers{grid-template-columns:repeat(2,minmax(0,1fr))!important}}
+@media(prefers-reduced-motion:reduce){body.api-health #workList.tiq-work-center>.tiq-work-card .progress-fill::after{animation:none!important;content:none!important}}
+
+/* OWNER P0 2026-10-15: Flat UI, equal filter controls, strong verified-progress motion.
+   Animation is decorative, not evidence that a job is executing. */
+body.api-health,body.api-health *,body.api-health *::before,body.api-health *::after{
+ text-shadow:none!important;
+}
+body.api-health .work-panel .wo-filters{align-items:center!important;gap:8px!important}
+body.api-health .work-panel .wo-filters>.wo-filter{
+ box-sizing:border-box!important;flex:0 0 134px!important;width:134px!important;
+ min-width:134px!important;min-height:36px!important;height:36px!important;
+ padding:6px 8px!important;display:inline-flex!important;align-items:center!important;
+ justify-content:center!important;gap:5px!important;border-radius:9px!important;
+ background-image:none!important;box-shadow:none!important;white-space:nowrap!important;
+}
+body.api-health .work-panel .wo-filters>.wo-filter.on{
+ background-image:none!important;box-shadow:none!important;
+}
+@media(max-width:650px){body.api-health .work-panel .wo-filters>.wo-filter{
+ flex:1 1 calc(50% - 8px)!important;width:auto!important;min-width:0!important;
+}}
+body.api-health #workList.tiq-work-center>.tiq-work-card :is(.priority.p0,.priority.p1,.priority.p2,.priority.p3,.priority.p4,.priority.p5){
+ box-sizing:border-box!important;min-width:48px!important;height:27px!important;
+ color:#fff!important;text-shadow:none!important;box-shadow:none!important;background-image:none!important;
+}
+body.api-health #workList.tiq-work-center>.tiq-work-card .priority.p2{background-color:#A65305!important;background:#A65305!important;color:#fff!important}
+body.api-health #workList.tiq-work-center>.tiq-work-card .work-activity,
+body.api-health #workList.tiq-work-center>.tiq-work-card .work-activity span,
+body.api-health #workList.tiq-work-center>.tiq-work-card .work-activity span:first-child{
+ color:#4ADE80!important;
+}
+/* A fast moving highlight stays clipped to the verified portion of the bar. */
+body.api-health #workList.tiq-work-center>.tiq-work-card .progress:not(.indeterminate) .progress-track{
+ height:9px!important;background:#1B3149!important;
+}
+body.api-health #workList.tiq-work-center>.tiq-work-card .progress:not(.indeterminate) .progress-fill{
+ position:relative!important;overflow:hidden!important;
+}
+body.api-health #workList.tiq-work-center>.tiq-work-card .progress:not(.indeterminate) .progress-fill::before{
+ content:""!important;position:absolute!important;z-index:2!important;
+ top:0!important;bottom:0!important;left:0!important;width:55%!important;
+ background:linear-gradient(90deg,transparent,rgba(255,255,255,.90) 48%,transparent)!important;
+ transform:translateX(-120%) skewX(-13deg);animation:tiq-owner-flow-fast .95s linear infinite!important;
+ pointer-events:none!important;
+}
+@keyframes tiq-owner-flow-fast{from{transform:translateX(-120%) skewX(-13deg)}to{transform:translateX(240%) skewX(-13deg)}}
+/* No duplicate slower sheen competing with the fast beam. */
+body.api-health #workList.tiq-work-center>.tiq-work-card .progress-fill::after{content:none!important;animation:none!important}
+@media(prefers-reduced-motion:reduce){
+ body.api-health #workList.tiq-work-center>.tiq-work-card .progress:not(.indeterminate) .progress-fill::before{
+  content:none!important;animation:none!important;
+ }
+}
+
+/* OWNER P0 2026-10-15: adaptive information density across 1664 / 924 / 630 widths. */
+/* Responsive 5 / 3 / 2 work-card columns where usable content width allows. */
+body.api-health #workList.wo-list.work-list.tiq-work-center{
+ grid-template-columns:repeat(auto-fill,minmax(min(100%,205px),1fr))!important;
+ gap:9px!important;align-items:stretch!important;
+}
+body.api-health #workList.tiq-work-center>.tiq-work-card{
+ align-self:stretch!important;
+ transition:transform 150ms ease,border-color 150ms ease!important;
+}
+body.api-health #workList.tiq-work-center>.tiq-work-card>.work-main{
+ height:calc(100% - 27px)!important;min-height:0!important;
+ background:#10243A!important;box-shadow:none!important;
+ transition:background-color 150ms ease,border-color 150ms ease!important;
+}
+body.api-health #workList.tiq-work-center>.tiq-work-card:is(:hover,:focus-visible){
+ transform:translateY(-2px)!important;
+}
+body.api-health #workList.tiq-work-center>.tiq-work-card:is(:hover,:focus-visible)>.work-main{
+ background:#19334D!important;border-color:#8BA4BF!important;
+ box-shadow:none!important;
+}
+body.api-health #workList.tiq-work-center>.tiq-work-card:focus-visible{
+ outline:2px solid #7AB9F7!important;outline-offset:3px!important;
+}
+/* Keep the existing verified small-landscape contract at 3 work columns. */
+@media (orientation:landscape) and (min-width:640px) and (max-width:1199px) and (max-height:600px){
+ body.api-health #workList.wo-list.work-list.tiq-work-center{
+  grid-template-columns:repeat(3,minmax(0,1fr))!important;
+ }
+}
+/* One readable content size; the actual work title alone is larger. */
+body.api-health #workList.tiq-work-center>.tiq-work-card :is(
+ .work-top,.work-nv,.state,.rank,.work-hierarchy,.work-hierarchy span,
+ .work-quick,.work-quick span,.work-activity,.work-activity span,
+ .work-step-summary,.work-step-summary span,.tiq-work-times,.tiq-work-times span,
+ .progress,.progress-text){
+ font-size:11.5px!important;line-height:1.4!important;
+ text-shadow:none!important;
+}
+body.api-health #workList.tiq-work-center>.tiq-work-card .work-title{
+ font-size:14px!important;line-height:1.36!important;font-weight:800!important;
+}
+body.api-health #workList.tiq-work-center>.tiq-work-card .work-main{
+ padding:8px 9px 9px!important;
+}
+body.api-health #workList.tiq-work-center>.tiq-work-card .work-top .state{
+ max-width:148px!important;font-size:11.5px!important;
+}
+body.api-health #workList.tiq-work-center>.tiq-work-card .tiq-work-times{
+ margin-top:5px!important;padding-top:4px!important;
+}
+/* Make workforce cards pack tightly too, without shrinking readable text. */
+body.api-health #workers.workers{
+ grid-template-columns:repeat(auto-fill,minmax(min(100%,180px),1fr))!important;
+}
+@media (orientation:landscape) and (min-width:640px) and (max-width:1199px) and (max-height:600px){
+ body.api-health #workers.workers{grid-template-columns:repeat(4,minmax(0,1fr))!important}
+}
+@media(max-width:599px){
+ body.api-health #workers.workers{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+ body.api-health #workList.wo-list.work-list.tiq-work-center{grid-template-columns:minmax(0,1fr)!important}
+}
+/* Consistent compact sizes per toolbar; maintain wrap instead of side scrolling. */
+body.api-health .work-panel .wo-filters{
+ display:flex!important;flex-wrap:wrap!important;align-items:center!important;
+ gap:6px!important;padding:7px 9px!important;
+}
+body.api-health .work-panel .wo-filters>.wo-filter{
+ flex:0 0 110px!important;width:110px!important;min-width:110px!important;
+ height:32px!important;min-height:32px!important;
+ padding:4px 5px!important;font-size:11px!important;
+ border-radius:8px!important;box-shadow:none!important;
+}
+body.api-health .workforce-panel .filters{
+ display:flex!important;flex-wrap:wrap!important;align-items:center!important;
+ gap:6px!important;
+}
+body.api-health .workforce-panel .filters .filter[data-filter]{
+ box-sizing:border-box!important;flex:0 0 112px!important;
+ width:112px!important;min-width:112px!important;
+ height:32px!important;min-height:32px!important;
+ display:inline-flex!important;align-items:center!important;justify-content:center!important;
+ font-size:11px!important;line-height:1.1!important;padding:4px 5px!important;
+ border-radius:8px!important;white-space:nowrap!important;
+ text-shadow:none!important;box-shadow:none!important;
+}
+body.api-health .work-panel .work-scope-note select{
+ height:32px!important;min-height:32px!important;
+ box-sizing:border-box!important;font-size:11.5px!important;
+}
+@media(max-width:430px){
+ body.api-health .work-panel .wo-filters>.wo-filter{
+  flex:0 0 110px!important;width:110px!important;min-width:110px!important;
+ }
+}
+/* Work detail: one readable body type scale, title is the only size exception. */
+body.api-health #workDetailModal{
+ background:#0B1B2D!important;box-shadow:none!important;
+ font-size:12px!important;line-height:1.45!important;text-shadow:none!important;
+}
+body.api-health #workDetailModal :is(
+ .work-detail-kicker,.work-detail-body,.work-detail-section,.work-detail-section h3,
+ .work-detail-row,.work-detail-row span,.work-step-summary,.progress,
+ .tiq-audit-grid,.tiq-audit-grid small,.tiq-audit-grid strong,
+ .tiq-audit-timeline,.tiq-audit-timeline li,.tiq-audit-timeline small,
+ .tiq-audit-timeline time,.work-detail-btn){
+ font-size:12px!important;line-height:1.45!important;
+}
+body.api-health #workDetailModal .work-detail-title{
+ font-size:17px!important;line-height:1.35!important;font-weight:800!important;
+}
+body.api-health #workDetailModal .work-detail-actions>*{
+ min-height:34px!important;padding:6px!important;box-shadow:none!important;
+}
+@media(prefers-reduced-motion:reduce){
+ body.api-health #workList.tiq-work-center>.tiq-work-card,
+ body.api-health #workList.tiq-work-center>.tiq-work-card>.work-main{
+  transition:none!important;transform:none!important;
+ }
+}
+
+/* Tablet/compact PC portrait: give work and workforce the usable full rail.
+   Monitoring remains accessible immediately below, never dropped. */
+@media (min-width:900px) and (max-width:1199px) and (orientation:portrait){
+ body.api-health .layout{
+  display:grid!important;grid-template-columns:minmax(0,1fr)!important;
+ }
+ body.api-health #workList.wo-list.work-list.tiq-work-center{
+  grid-template-columns:repeat(3,minmax(0,1fr))!important;
+ }
+ body.api-health #workers.workers{
+  grid-template-columns:repeat(4,minmax(0,1fr))!important;
+ }
+ body.api-health .layout>.side{
+  display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;
+ }
+ body.api-health .layout>.side>.alert-panel{grid-column:1/-1!important}
+}
+
+/* Owner P0 mobile: four tight, equal-width chips per line, not oversized tiles. */
+@media (min-width:360px) and (max-width:599px){
+ body.api-health .workforce-panel>.panel-h .filters{
+  display:grid!important;grid-template-columns:repeat(4,minmax(0,1fr))!important;
+  align-items:center!important;gap:4px!important;
+  padding:0!important;margin:0!important;width:100%!important;
+ }
+ body.api-health .workforce-panel .filters .filter-divider{display:none!important}
+ body.api-health .workforce-panel .filters .filter[data-filter]{
+  box-sizing:border-box!important;min-width:0!important;max-width:none!important;
+  width:100%!important;flex:none!important;
+  height:27px!important;min-height:27px!important;
+  padding:2px 2px!important;margin:0!important;
+  border-radius:6px!important;
+  font-size:10px!important;line-height:1.15!important;
+  letter-spacing:-.12px!important;white-space:nowrap!important;
+ }
+ body.api-health .work-panel #woFilters.wo-filters{
+  display:grid!important;grid-template-columns:repeat(4,minmax(0,1fr))!important;
+  gap:4px!important;padding:5px 8px!important;
+  align-items:center!important;
+ }
+ body.api-health .work-panel #woFilters.wo-filters>.wo-filter{
+  box-sizing:border-box!important;min-width:0!important;max-width:none!important;
+  width:100%!important;flex:none!important;
+  height:27px!important;min-height:27px!important;
+  padding:2px 2px!important;margin:0!important;
+  border-radius:6px!important;font-size:10px!important;
+  line-height:1.1!important;letter-spacing:-.12px!important;white-space:nowrap!important;
+ }
+ body.api-health .work-panel #woFilters.wo-filters>.work-scope-note{
+  grid-column:1/-1!important;margin:0!important;min-height:27px!important;
+  font-size:10px!important;display:flex!important;align-items:center!important;
+  gap:6px!important;
+ }
+ body.api-health .work-panel #woFilters .work-scope-note select{
+  height:27px!important;min-height:27px!important;
+  padding:2px 6px!important;font-size:10px!important;
+ }
+ body.api-health .workforce-panel .panel-h{
+  padding-bottom:7px!important;gap:7px!important;
+ }
+}
+@media (max-width:359px){
+ body.api-health .workforce-panel>.panel-h .filters{
+  display:grid!important;grid-template-columns:repeat(3,minmax(0,1fr))!important;
+  gap:4px!important;padding:0!important;
+ }
+ body.api-health .workforce-panel .filters .filter-divider{display:none!important}
+ body.api-health .workforce-panel .filters .filter[data-filter]{
+  min-width:0!important;width:100%!important;height:27px!important;min-height:27px!important;
+  padding:2px!important;font-size:10px!important;flex:none!important;border-radius:6px!important;
+ }
+ body.api-health .work-panel #woFilters.wo-filters{
+  display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;
+  gap:4px!important;padding:5px 8px!important;
+ }
+ body.api-health .work-panel #woFilters.wo-filters>.wo-filter{
+  min-width:0!important;width:100%!important;height:27px!important;min-height:27px!important;
+  padding:2px!important;font-size:10px!important;flex:none!important;border-radius:6px!important;
+ }
+ body.api-health .work-panel #woFilters.wo-filters>.work-scope-note{
+  grid-column:1/-1!important;margin:0!important;
+ }
+}
+
+/* API Health Owner final overlays migrated out of HTML: post-canonical card CSS. */
+/* P0 owner visual acceptance: scoped, canonical PC01 viewer only.
+   This stylesheet lives in dashboard because the authorized core release gate
+   explicitly forbids mutating public/ assets. Vercel mirrors the same HTML. */
+body.api-health .brand-health{display:inline-flex;align-items:center;flex:0 0 auto;white-space:nowrap!important;min-width:0}
+body.api-health .brand-health>span:nth-child(2){white-space:nowrap!important}
+body.api-health .brand-health .brand-ai{display:inline;color:#7DD3FC}
+body.api-health .footer{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;justify-content:space-between;max-width:100%}
+body.api-health #labRelease{font:800 11px/1.4 var(--tiq-font,system-ui);letter-spacing:.03em;white-space:nowrap;color:#7DD3FC}
+@media(max-width:599px){
+ body.api-health .brand-health{font-size:clamp(17px,4.3vw,22px)!important;min-width:0}
+ body.api-health .footer{padding-bottom:max(10px,env(safe-area-inset-bottom))}
+}
+body.api-health #workers.workers{
+ grid-auto-rows:max-content!important;align-items:stretch!important
+}
+body.api-health #workers.workers>.worker.employee-card{
+ padding:8px!important;min-width:0!important;min-height:0!important;
+ height:auto!important;align-self:stretch!important;overflow:hidden!important;
+ display:flex!important;flex-direction:column!important
+}
+body.api-health #workers .employee-card-head,
+body.api-health #workers .employee-identity{min-width:0;max-width:100%}
+body.api-health #workers .employee-name,
+body.api-health #workers .employee-task{
+ min-width:0!important;max-width:100%!important;
+ overflow:hidden!important;overflow-wrap:anywhere!important;word-break:break-word!important
+}
+body.api-health #workers .employee-state{max-width:calc(100% - 46px);overflow:hidden;text-overflow:ellipsis}
+body.api-health #workers .employee-live-line{
+ margin-top:6px!important;min-width:0;max-width:100%;flex-shrink:0
+}
+body.api-health #workers .employee-live-line span:last-child{
+ min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap
+}
+body.api-health #workDetailBackdrop{isolation:isolate}
+body.api-health #workDetailModal{min-width:0;max-width:calc(100vw - 24px)}
+body.api-health #workDetailModal .work-detail-head{flex:0 0 auto;min-width:0}
+body.api-health #workDetailModal .work-detail-head-main,
+body.api-health #workDetailModal .work-detail-title{min-width:0;overflow-wrap:anywhere}
+body.api-health #workDetailModal .work-detail-body{
+ display:flex!important;flex:1 1 auto!important;flex-direction:column!important;
+ min-width:0!important;min-height:0!important;
+ overflow-x:hidden!important;overflow-y:auto!important;
+ gap:12px;overscroll-behavior:contain;-webkit-overflow-scrolling:touch
+}
+body.api-health #workDetailModal .work-detail-section{
+ flex:0 0 auto!important;min-width:0!important;max-width:100%!important;
+ width:100%!important;overflow-wrap:anywhere;box-sizing:border-box
+}
+body.api-health #workDetailModal #workDetailAudit,
+body.api-health #workDetailModal .tiq-audit-grid,
+body.api-health #workDetailModal .tiq-audit-timeline{
+ min-width:0!important;max-width:100%!important;overflow-wrap:anywhere
+}
+body.api-health #workDetailModal .work-detail-actions{
+ margin-top:0!important;flex:0 0 auto!important
+}
+
+/* P0 #4750 — narrow phones: indicators must wrap, not disappear behind
+   an overflow-hidden 58px header (PC01 measured 448px content at 390px). */
+@media(max-width:599px){
+ body.api-health .topbar{
+  height:auto!important;min-height:58px!important;
+  flex-wrap:wrap!important;gap:5px 7px!important;
+  padding-block:8px!important
+ }
+ body.api-health .topbar .brand-health{
+  flex:1 1 100%!important;margin-right:0!important
+ }
+ body.api-health .topbar :is(.top-indicator,.sync-status,.ops-freshness){
+  min-width:0!important;flex-shrink:1!important
+ }
+ body.api-health .topbar #topLive{max-width:calc(100vw - 24px)!important}
+ body.api-health .topbar #topLiveMeta{
+  display:block!important;min-width:0!important;
+  max-width:min(35vw,140px)!important;
+  overflow:hidden!important;text-overflow:ellipsis!important;white-space:nowrap!important
+ }
+ body.api-health .topbar .sync-status{
+  max-width:calc(100vw - 24px)!important;
+  overflow:hidden!important;text-overflow:ellipsis!important
+ }
+ body.api-health .topbar .ops-freshness{flex:0 0 auto!important;margin-left:auto!important}
+}
+
+/* Owner API Health layout corrections: no synthetic progress or state change. */
+@media (min-width:1200px){
+ body.api-health #workers.workers{
+  grid-template-columns:repeat(auto-fill,minmax(185px,1fr))!important;
+ }
+}
+@media (min-width:600px) and (max-width:899px){
+ body.api-health #workers.workers{
+  grid-template-columns:repeat(auto-fill,minmax(185px,1fr))!important;
+ }
+}
+@media (max-width:899px){
+ /* 'hidden' on the app creates a nested scrolling ancestor; clip instead
+    and let the page own vertical scrolling, including the final work card. */
+ html,body.api-health{height:auto!important;overflow-x:clip!important;overflow-y:auto!important}
+ body.api-health .app{
+  height:auto!important;min-height:100dvh!important;
+  overflow-x:clip!important;overflow-y:visible!important;
+  padding-bottom:max(18px,env(safe-area-inset-bottom))!important
+ }
+ body.api-health .layout,body.api-health .layout>main,
+ body.api-health .work-panel{height:auto!important;min-height:0!important;overflow:visible!important}
+ body.api-health .work-panel #workList.wo-list.work-list.tiq-work-center{
+  height:auto!important;max-height:none!important;min-height:0!important;
+  overflow:visible!important;grid-auto-rows:max-content!important;
+  align-items:stretch!important;overscroll-behavior:auto!important
+ }
+}
+
+/* Owner V6 — neutral workforce surfaces; only an evidence-backed status label carries color. */
+.worker.employee-card{--state-border:#344257!important;background:#101c2e!important;border:1px solid #344257!important;box-shadow:none!important;animation:none!important;}
+.worker.employee-card:hover,.worker.employee-card:focus-visible{border-color:#718096!important;box-shadow:0 0 0 1px #53657d44!important;}
+.worker.employee-card .employee-id{color:#e2e8f0;background:#19283a;border:1px solid #405069;box-shadow:none;text-shadow:none;}
+.worker.employee-card .employee-avatar{background:#17273a;border:1px solid #405069;box-shadow:none;}
+.worker.employee-card .employee-source{color:#a8b7c9;background:#172439;border-color:#405069;}
+.worker.employee-card .employee-state{color:var(--state-color,#94a3b8);background:none;border:0;padding:3px 0;letter-spacing:.01em;}
+.worker.employee-card .employee-name{color:#f1f5f9;}
+.worker.employee-card .employee-task{color:#b0bfd0;border-top-color:#293a51;}
+.worker.employee-card.state-working{--state-color:#22c55e;}
+.worker.employee-card.state-ready{--state-color:#3b82f6;}.worker.employee-card.state-ondemand{--state-color:#a8b7c9;}
+.worker.employee-card.state-waiting{--state-color:#fbbf24;}
+.worker.employee-card.state-attention{--state-color:#fb7185;}
+.worker.employee-card.state-unknown,.worker.employee-card.state-paused{--state-color:#94a3b8;}
+.worker.employee-card .employee-live-line{color:#94a3b8;}.worker.employee-card.state-ready .employee-live-line{color:#3b82f6;}
+.worker.employee-card .employee-live-dot{background:#94a3b8;box-shadow:none;animation:none;}.worker.employee-card.state-ready .employee-live-dot{background:#3b82f6;box-shadow:none;animation:none;}
+.worker.employee-card.state-working .employee-live-dot{background:#22c55e;}
+.worker.employee-card.state-waiting .employee-live-dot{background:#fbbf24;}
+.worker.employee-card.state-attention .employee-live-dot{background:#fb7185;}
+.worker.employee-card.changed{animation:none;}
+/* Workforce filter colors mirror real status labels; provider/category remains neutral. */
+body.api-health .workforce-panel .filters{align-items:center;gap:6px;}
+body.api-health .workforce-panel .filter-divider{height:20px;width:1px;background:#405069;margin:0 3px;flex:none;}
+body.api-health .workforce-panel .filters .filter.on{outline:2px solid currentColor!important;outline-offset:-2px!important;}
+body.api-health .workforce-panel .filters .filter[data-filter="working"]{color:#22c55e!important;}
+body.api-health .workforce-panel .filters .filter[data-filter="ready"]{color:#3b82f6!important;}
+body.api-health .workforce-panel .filters .filter[data-filter="problem"],body.api-health .workforce-panel .filters .filter[data-filter="local"],body.api-health .workforce-panel .filters .filter[data-filter="cloud"],body.api-health .workforce-panel .filters .filter[data-filter="manual"]{color:#cbd5e1!important;}
+/* Same state accent as selected workforce card; flat details, no gray forced border. */
+body.api-health #detailModal.detail-modal{
+ --modal-accent:var(--state-color,#94A3B8);
+ border:1px solid var(--modal-accent)!important;
+ background:#111C2E!important;box-shadow:none!important;
+}
+body.api-health #detailModal.detail-modal .detail-modal-head{
+ border-bottom:2px solid var(--modal-accent)!important;
+}
+body.api-health #detailModal.detail-modal :is(.detail-status,.detail-modal-title strong){
+ color:var(--modal-accent)!important;
+}
+body.api-health #detailModal.detail-modal .employee-avatar{
+ border-color:var(--modal-accent)!important;
+}

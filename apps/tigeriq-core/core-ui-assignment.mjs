@@ -1,0 +1,596 @@
+import {createHash} from 'node:crypto';
+import {nv04IdleAuditGate,readNv04IdleHeartbeat,nv04IdleSourcePacket,nv04IdleAuditSlot,buildNv04IdleAuditPrompt,parseNv04IdleAuditResult} from './nv04-idle-audit.mjs';
+import {PRIORITY_RANK,bodyValue,effectiveBacklogPriority} from './github-backlog-policy.mjs';
+import {activeRoleClaim,classifyWorkOrder} from './work-routing-policy.mjs';
+import { localizeOwnerFacingText, ownerStatusIcon, ownerStatusLabel } from './owner-facing-vietnamese.mjs';
+
+const OWNER='newsdayads',REPO='tigeriq-ai-lab';
+const DEFAULT_TARGET_REPOSITORY=OWNER+'/'+REPO;
+const ALLOWED_TARGET_REPOSITORIES=new Set([DEFAULT_TARGET_REPOSITORY.toLowerCase(),'newsdayads/tigeriq-media']);
+const ALL_WORKERS=['NV02','NV03','NV04'];
+const WORKERS=['NV03','NV04'];
+// Default disabled. Activation requires a separately verified global claim/lease and source-specific runtime mode.
+export function coreUiNv03CoreRoutingDisabled(env=process.env){
+  // Owner direct 2026-10-10: NV03 is an external, GitHub-self-pull UI worker just like NV02.
+  // A separate switch fences Core assignment without pretending the global GitHub lease is verified.
+  return String(env?.TIGERIQ_NV03_CORE_DISPATCH_DISABLED||'')==='1';
+}
+export function coreUiNv03SelfPullFenced(env=process.env){
+  return String(env?.TIGERIQ_NV03_SELF_PULL_MODE||'')==='GITHUB_SELF_PULL'
+    && String(env?.TIGERIQ_NV03_CORE_ROUTE_FENCED||'')==='1'
+    && String(env?.TIGERIQ_NV03_GLOBAL_LEASE_VERIFIED||'')==='1';
+}
+const REQUIRED=['NO_PC01_SHELL','NO_DIRECT_MAIN','NO_PAID_COST','NO_CREDENTIAL_CHANGE','NO_DESTRUCTIVE','NO_PRODUCTION_RELEASE'];
+export const CORE_UI_ASSIGNMENT_STALE_MS=Math.max(30000,Number(process.env.TIGERIQ_CORE_UI_ASSIGNMENT_STALE_MS||90000));
+
+// Read permissions only from the current canonical section. Previous
+// Markdown snapshots must never authorize an excluded UI assignment.
+function currentCoreUiHeader(body=''){
+  const text=String(body||'');
+  const headings=[...text.matchAll(/^ {0,3}#{1,6}[ \t]+\S[^\r\n]*/gm)];
+  const first=headings[0];
+  if(first?.index===0&&/(?:\b(?:HISTORICAL|HISTORY|SUPERSEDED|ARCHIVED)\b|LỊCH SỬ)/i.test(first[0]))return '';
+  const boundary=first?.index===0
+    ?(headings[1]?.index??text.length)
+    :(first?.index??text.length);
+  const divider=text.match(/^ {0,3}(?:-{3,}|\*{3,}|_{3,})(?:[ \t]+(?:HISTORICAL|SUPERSEDED|LỊCH SỬ)[^\r\n]*)?[ \t]*$/mi);
+  return text.slice(0,Math.min(boundary,divider?.index??text.length));
+}
+function value(body,key){return bodyValue(body,key);}
+// First current value is authoritative: a later true cannot undo a denial.
+function yes(body,key){return value(body,key)==='true';}
+function clean(v){return String(v||'').replace(/[\r\n\t]+/g,' ').replace(/\s+/g,' ').trim().slice(0,180);}
+function safeResult(v){return String(v||'').replace(/\0/g,'').trim().slice(0,4000);}
+const VI_TERMINAL_TO_CODE=new Map([
+  ['HOÀN TẤT','DONE'],
+  ['BỊ CHẶN','BLOCKED'],
+  ['CHỜ BÊN NGOÀI','EXTERNAL_WAIT'],
+]);
+export function coreUiTerminalStateFromComment(body=''){
+  const text=String(body||'');
+  const legacy=String(text.match(/^STATE=(DONE|BLOCKED|EXTERNAL_WAIT)$/m)?.[1]||'');
+  if(legacy)return legacy;
+  const vi=String(text.match(/^TRẠNG_THÁI=(.+)$/m)?.[1]||'').trim().toUpperCase();
+  return VI_TERMINAL_TO_CODE.get(vi)||'';
+}
+export function formatCoreUiTerminalComment({jobId,workerId,state,result=''}) {
+  const normalized=String(state||'').toUpperCase();
+  const status=ownerStatusLabel(normalized);
+  const ownerResult=localizeOwnerFacingText(safeResult(result||normalized));
+  return [
+    ownerStatusIcon(normalized)+' [KẾT QUẢ] TigerIQ Core đã nhận kết quả từ '+String(workerId||'')+'.',
+    'Trạng thái: '+status,
+    '',
+    'TIGERIQ_CORE_UI_TERMINAL_V1',
+    'TIGERIQ_CORE_UI_TERMINAL_KEY='+String(jobId||''),
+    'JOB_ID='+String(jobId||''),
+    'WORKER='+String(workerId||''),
+    'TRẠNG_THÁI='+status,
+    'SOURCE=APP_CHROME_UI_TRANSPORT',
+    'RESULT_BEGIN',
+    ownerResult,
+    'RESULT_END',
+  ].join('\n');
+}
+function rank(p){return PRIORITY_RANK[String(p||'P5')]??PRIORITY_RANK.P5;}
+function issueNo(jobId){const m=String(jobId||'').match(/^GH-(\d+)(?:-R[a-f0-9]{12})?$/i);return m?Number(m[1]):null;}
+function resourceId(workerId){return 'res:ui:'+String(workerId).toLowerCase()+':subscription:chrome';}
+export function coreUiSourceRevision(issue={}){
+  return createHash('sha256').update(String(issue?.title||'')).update('\n').update(String(issue?.body||'')).digest('hex').slice(0,12);
+}
+function coreUiRearmEpoch(body=''){
+  let latest=0;
+  for(const match of String(body||'').matchAll(/^(?:REARMED_AT|QUEUE_REARMED_AT|EPOCH_STARTED_AT)=(.+)$/gmi)){
+    const ts=Date.parse(String(match[1]||'').trim());
+    if(Number.isFinite(ts)&&ts>latest)latest=ts;
+  }
+  return latest;
+}
+const MAX_EXACT_CONTEXT_FILES=20;
+const MAX_EXACT_CONTEXT_PATCH_CHARS=24000;
+function targetPrNumber(body=''){
+  const raw=String(value(body,'TARGET_PR')||'').trim();
+  const match=raw.match(/#?(\d{1,8})/);
+  return match?Number(match[1]):null;
+}
+function targetHeadSha(body=''){
+  const raw=String(value(body,'TARGET_HEAD')||'').trim();
+  return /^[a-f0-9]{40}$/i.test(raw)?raw.toLowerCase():'';
+}
+
+function resolveCoreUiTargetRepository(body=''){
+  const raw=String(value(body,'TARGET_REPOSITORY')||'').trim();
+  const selected=raw||DEFAULT_TARGET_REPOSITORY;
+  const match=selected.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/);
+  if(!match)return {valid:false,reason:'TARGET_REPOSITORY_INVALID',fullName:null,owner:null,repo:null};
+  if(!ALLOWED_TARGET_REPOSITORIES.has(selected.toLowerCase()))return {valid:false,reason:'TARGET_REPOSITORY_NOT_ALLOWED',fullName:null,owner:null,repo:null};
+  return {valid:true,reason:null,fullName:selected,owner:match[1],repo:match[2]};
+}
+function boundedPatchFiles(files=[]){
+  let remaining=MAX_EXACT_CONTEXT_PATCH_CHARS;
+  const out=[];
+  for(const file of (Array.isArray(files)?files:[]).slice(0,MAX_EXACT_CONTEXT_FILES)){
+    const filename=clean(file?.filename||'unknown');
+    const status=clean(file?.status||'modified');
+    const raw=String(file?.patch||'');
+    const patch=raw.slice(0,Math.max(0,remaining));
+    remaining-=patch.length;
+    out.push(['FILE='+filename,'STATUS='+status,'PATCH_BEGIN',patch||'[PATCH_UNAVAILABLE]','PATCH_END'].join('\n'));
+    if(remaining<=0)break;
+  }
+  return out;
+}
+export async function loadCoreUiExactHeadContext({fetchImpl=fetch,owner=OWNER,repo=REPO,token='',spec}={}){
+  const body=String(spec?.body||'');
+  const targetRepository=spec?.targetRepository?.valid?spec.targetRepository:resolveCoreUiTargetRepository(body);
+  if(!targetRepository.valid)return {required:true,ok:false,reason:targetRepository.reason,targetPr:null,targetHead:null,targetRepository:null};
+  const targetPr=targetPrNumber(body);
+  const rawTargetHead=String(value(body,'TARGET_HEAD')||'').trim();
+  const targetHead=targetHeadSha(body);
+  if(!targetPr&&!rawTargetHead)return {required:false,ok:true,bundle:'',targetPr:null,targetHead:null,targetRepository:targetRepository.fullName};
+  if(!targetPr)return {required:true,ok:false,reason:'TARGET_PR_REQUIRED',targetPr:null,targetHead:rawTargetHead||null,targetRepository:targetRepository.fullName};
+  if(!targetHead)return {required:true,ok:false,reason:'TARGET_HEAD_REQUIRED_OR_INVALID',targetPr,targetHead:rawTargetHead||null,targetRepository:targetRepository.fullName};
+  let pr,files;
+  try{
+    pr=await gh(fetchImpl,'https://api.github.com/repos/'+targetRepository.owner+'/'+targetRepository.repo+'/pulls/'+targetPr,token);
+    const actualHead=String(pr?.head?.sha||'').toLowerCase();
+    if(actualHead!==targetHead)return {required:true,ok:false,reason:'TARGET_HEAD_MISMATCH',targetPr,targetHead,actualHead};
+    files=await gh(fetchImpl,'https://api.github.com/repos/'+targetRepository.owner+'/'+targetRepository.repo+'/pulls/'+targetPr+'/files?per_page=100',token);
+  }catch(error){
+    return {required:true,ok:false,reason:'EXACT_CONTEXT_LOAD_FAILED',targetPr,targetHead,error:String(error?.message||error)};
+  }
+  const patches=boundedPatchFiles(files);
+  const bundle=[
+    'EXACT_HEAD_CONTEXT_BEGIN',
+    'REPOSITORY='+targetRepository.fullName,
+    'TARGET_PR=#'+targetPr,
+    'TARGET_HEAD='+targetHead,
+    'PR_TITLE='+clean(pr?.title||''),
+    'PR_STATE='+clean(pr?.state||''),
+    'PR_BASE_SHA='+String(pr?.base?.sha||''),
+    'PR_HEAD_SHA='+String(pr?.head?.sha||''),
+    'PR_CHANGED_FILES='+String(pr?.changed_files??''),
+    'PR_ADDITIONS='+String(pr?.additions??''),
+    'PR_DELETIONS='+String(pr?.deletions??''),
+    'CONTEXT_FILE_LIMIT='+MAX_EXACT_CONTEXT_FILES,
+    'CONTEXT_PATCH_CHAR_LIMIT='+MAX_EXACT_CONTEXT_PATCH_CHARS,
+    ...patches,
+    'EXACT_HEAD_CONTEXT_END',
+  ].join('\n');
+  return {required:true,ok:true,targetPr,targetHead,targetRepository:targetRepository.fullName,bundle,fileCount:patches.length,truncated:Number(pr?.changed_files||0)>patches.length||String(bundle).length>=MAX_EXACT_CONTEXT_PATCH_CHARS};
+}
+
+export function selectCoreUiWorker(capability='general'){
+  const cap=String(capability||'general').toLowerCase();
+  return cap==='review'?(coreUiNv03CoreRoutingDisabled()?'NV04':'NV03'):(cap==='research'||cap==='deep_research'||cap==='second_opinion')?'NV04':null;
+}
+
+function explicitUiWorkerRequested(body=''){
+  return ['TARGET_EMPLOYEE','ASSIGNED_EXECUTOR','PRIMARY_EMPLOYEE','PREFERRED_REVIEWER','OWNER_REVIEWER']
+    .some((key)=>String(value(body,key)||'').trim());
+}
+
+export function parseCoreUiIssue(issue){
+  if(!issue||issue.pull_request||issue.state!=='open')return null;
+  const body=currentCoreUiHeader(issue.body);
+  if(!yes(body,'TIGERIQ_EXECUTABLE')||value(body,'OWNER_POLICY')!=='AUTO')return null;
+  const queue=value(body,'AUTO_QUEUE').toUpperCase();
+  const state=value(body,'CURRENT_STATE').toUpperCase();
+  if(queue==='EXCLUDED'||queue.startsWith('EXCLUDED_'))return null;
+  if(/^(?:DONE|COMPLETED|TERMINAL|FAILED|CANCELLED|CANCELED|CLOSED|SUPERSEDED|NOT_PLANNED|WAIT|WAITING|BLOCKED|PARKED|EXTERNAL_WAIT)(?:_|$)/.test(state))return null;
+  if(['OWNER_HOLD','OWNER_CONTROLLED','OWNER_GATE','OWNER_APPROVAL_REQUIRED','MANUAL_GATE'].some(key=>yes(body,key)))return null;
+  if(value(body,'NO_SECURITY_BOUNDARY_CHANGE').toLowerCase()==='false')return null;
+  const targetRepository=resolveCoreUiTargetRepository(body);
+  if(!targetRepository.valid)return null;
+  if(REQUIRED.some(k=>!yes(body,k)))return null;
+  const readOnly=yes(body,'NO_CODE_CHANGE');
+  // NV03/NV04 are bounded review/research UI workers, never autonomous source mutators.
+  // An explicit worker ID plus AUTONOMOUS_CODE must not bypass NO_CODE_CHANGE.
+  if(!readOnly||yes(body,'AUTONOMOUS_CODE'))return null;
+  const autonomousCode=false;
+  const classification=classifyWorkOrder(body);
+  const coreReviewOverflow=classification.route==='CORE_REVIEW'&&classification.capability==='review';
+  if(classification.route!=='UI'&&!coreReviewOverflow)return null;
+  const explicitWorker=String(classification.workerId||'');
+  const flexibleReview=classification.capability==='review'&&String(value(body,'CORE_TARGET_STRICT')||'').trim().toLowerCase()==='false';
+  const genericReviewOverflow=classification.capability==='review'&&readOnly===true&&classification.sourcePriority!=='P0'&&!explicitUiWorkerRequested(body);
+  const implementers=new Set(['IMPLEMENTER_EMPLOYEE','IMPLEMENTER','CODING_EXECUTOR']
+    .map((key)=>String(value(body,key)||'').trim().toUpperCase())
+    .filter((workerId)=>WORKERS.includes(workerId)));
+  const eligibleWorkerIds=((coreReviewOverflow||flexibleReview||genericReviewOverflow)?WORKERS:[explicitWorker]).filter((workerId)=>WORKERS.includes(workerId)&&!implementers.has(workerId)&&!(workerId==='NV03'&&coreUiNv03CoreRoutingDisabled()));
+  if(!eligibleWorkerIds.length)return null;
+  const resourceScope=String(value(body,'RESOURCE_SCOPE')||'').trim();if(!resourceScope)return null;
+  if(/^APP_CHROME_/i.test(resourceScope)||/\[APP-CHROME\]/i.test(String(issue.title||''))||/apps\/chrome-controller\//i.test(body))return null;
+  const number=Number(issue.number);if(!Number.isInteger(number)||number<=0)return null;
+  return {
+    number,jobId:'GH-'+number,workItemId:'CORE-UI-GH-'+number,sourceRevision:coreUiSourceRevision(issue),title:clean(issue.title),url:String(issue.html_url||''),
+    priority:classification.priority,sourcePriority:classification.sourcePriority,legacyP0Autonomous:classification.legacyP0Autonomous,
+    ownerControlled:classification.ownerControlled,capability:classification.capability,resourceScope,workerId:coreReviewOverflow?null:classification.workerId,eligibleWorkerIds,targetRepository,
+    readOnly,autonomousCode,body:String(issue.body||'').slice(0,12000),updatedAt:String(issue.updated_at||''),commentCount:Math.max(0,Number(issue.comments||0)),
+  };
+}
+
+export function buildCoreUiPrompt(spec,repo=OWNER+'/'+REPO,exactContext=''){
+  const guard='LÀM — NO YAPPING. Đây là Core assignment duy nhất đang hiệu lực. Không tự đổi việc/P0. Không MAIN/Production, không chi phí, không credential/security, không destructive.';
+  const body='WORK_ORDER_BODY_BEGIN\n'+String(spec.body||'').slice(0,12000)+'\nWORK_ORDER_BODY_END';
+  const context=String(exactContext||'').trim();
+  if(spec.workerId==='NV04'){
+    const cap=String(spec.capability||'').toLowerCase();
+    const role=cap==='second_opinion'?'SECOND_OPINION':cap==='review'?'INDEPENDENT_REVIEW':'DEEP_RESEARCH';
+    return [
+      guard,
+      'NV04_ROLE='+role,
+      'CURRENT_WORK_ORDER=#'+spec.number+' - '+spec.title,
+      'EXACT_INPUT='+spec.url,
+      'RESOURCE_SCOPE='+spec.resourceScope,
+      'CHECKLIST=Thực hiện đúng Work Order/body bên dưới; kiểm chứng kết quả; không mutation source/runtime nếu Work Order không cho phép.',
+      'OUTPUT=Trả kết quả ngắn gọn kèm evidence cần thiết; dòng cuối bắt buộc DONE hoặc BLOCKED hoặc EXTERNAL_WAIT.',
+      'EVIDENCE_DESTINATION='+spec.url,
+      'REVIEW_ONLY='+(role==='INDEPENDENT_REVIEW'?'true':'false'),
+      'MUTATION_ALLOWED=false',
+      body,
+      context,
+    ].filter(Boolean).join('\n');
+  }
+  return [
+    guard,
+    'CURRENT_WORK_ORDER=#'+spec.number+' - '+spec.title,
+    'JOB_ID='+spec.jobId,
+    'ROLE=INDEPENDENT_REVIEW_QA',
+    'RESOURCE_SCOPE='+spec.resourceScope,
+    'YÊU CẦU: làm đúng Work Order/body bên dưới; không tự quét backlog; dòng cuối bắt buộc DONE hoặc BLOCKED hoặc EXTERNAL_WAIT.',
+    body,
+    context,
+  ].filter(Boolean).join('\n');
+}
+
+function bindings(){return Object.fromEntries(ALL_WORKERS.map(workerId=>[workerId,{workerId,state:WORKERS.includes(workerId)&&!(workerId==='NV03'&&coreUiNv03CoreRoutingDisabled())?'READY_UNASSIGNED':'EXTERNAL_TO_CORE',currentWorkOrder:null}]));}
+export function readyUnassignedCoreUiSnapshot({observedAt=new Date().toISOString(),revision='core-ui-v3:ready-unassigned',previousJob,reason='NO_CURRENT_UI_ASSIGNMENT'}={}){
+  return {source:'CORE',authority:'CORE',observedAt,revision,assignmentState:'READY_UNASSIGNED',previousJob,nextJobs:[],requiredWorkers:[],workerBindings:bindings(),reason};
+}
+function completion({jobId,workerId,priority,issueRef,closedAt,updatedAt,verifiedAt}){
+  const completedAt=String(closedAt||updatedAt||verifiedAt),completionRevision=['core-ui-completion-v1',jobId,completedAt,String(updatedAt||'')].join(':');
+  return {jobId,workItemId:'CORE-UI-'+jobId,workerId,status:'DONE',executable:false,priority,issueRef,coreSelected:true,completedAt,completionRevision,evidence:[{source:'GITHUB',ref:issueRef,verifiedAt,jobId,completedAt,completionRevision}]};
+}
+async function gh(fetchImpl,url,token=''){const headers={accept:'application/vnd.github+json','user-agent':'TigerIQ-Core-UI-Assignment/3.0','x-github-api-version':'2022-11-28'};if(token)headers.authorization='Bearer '+token;const r=await fetchImpl(url,{headers,signal:AbortSignal.timeout(12000)});if(!r.ok)throw new Error('GITHUB_HTTP_'+r.status);return r.json();}
+const CORE_UI_OPEN_ISSUE_PAGE_SIZE=100;
+const CORE_UI_OPEN_ISSUE_MAX_PAGES=20;
+async function readOpenIssues(fetchImpl,owner,repo,token){
+  const out=[];
+  for(let page=1;page<=CORE_UI_OPEN_ISSUE_MAX_PAGES;page++){
+    const rows=await gh(fetchImpl,'https://api.github.com/repos/'+owner+'/'+repo+'/issues?state=open&per_page='+CORE_UI_OPEN_ISSUE_PAGE_SIZE+'&sort=created&direction=asc&page='+page,token);
+    if(!Array.isArray(rows))throw new Error('CORE_UI_GITHUB_ISSUES_INVALID');
+    out.push(...rows);
+    if(rows.length<CORE_UI_OPEN_ISSUE_PAGE_SIZE)return out;
+  }
+  throw new Error('CORE_UI_GITHUB_ISSUES_PAGE_LIMIT');
+}
+async function ghWrite(fetchImpl,url,token,method,payload){if(!token)throw new Error('GITHUB_TOKEN_REQUIRED');const headers={accept:'application/vnd.github+json','content-type':'application/json','user-agent':'TigerIQ-Core-UI-Assignment/3.0','x-github-api-version':'2022-11-28',authorization:'Bearer '+token};const r=await fetchImpl(url,{method,headers,body:JSON.stringify(payload),signal:AbortSignal.timeout(12000)});if(!r.ok)throw new Error('GITHUB_WRITE_HTTP_'+r.status);return r.status===204?{}:r.json();}
+async function readIssue(fetchImpl,owner,repo,token,n){return gh(fetchImpl,'https://api.github.com/repos/'+owner+'/'+repo+'/issues/'+n,token);}
+async function readComments(fetchImpl,owner,repo,token,n,count){if(Number(count||0)<=0)return[];try{return await gh(fetchImpl,'https://api.github.com/repos/'+owner+'/'+repo+'/issues/'+n+'/comments?per_page=100',token);}catch{return[];}}
+
+async function row(pool,{jobId,workerId}={}){
+  const params=[];let where="o.status='active' and j.kind='ui' and j.status in ('ui_assigned','ui_running') and (o.metadata->>'executionSurface'='CORE_UI' or j.routing_decision->>'authority'='CORE_UI_FINAL_REVIEW')";
+  if(jobId){params.push(jobId);where="j.id=$1 and j.kind='ui'";}
+  else if(workerId){params.push(workerId);where+=" and j.employee_id=$1";}
+  const q=await pool.query("select j.id job_id,j.objective_id,j.status,j.employee_id,j.resource_id,j.provider,j.prompt,j.created_at,j.started_at,j.completed_at,j.result,j.routing_decision,o.priority,o.metadata,o.updated_at objective_updated_at from tigeriq_jobs j join tigeriq_objectives o on o.id=j.objective_id where "+where+" order by j.created_at limit 1",params);
+  return q.rows[0]||null;
+}
+
+async function reconcile({pool,fetchImpl,owner,repo,token,item,observedAt}){
+  if(!item)return null;const n=Number(item.metadata?.issueNumber||issueNo(item.job_id));if(!n)return item;
+  // Failure to refresh the source must not expose an unverified assignment
+  // as executable. Keep the persisted job unchanged for a subsequent retry.
+  let issue;try{issue=await readIssue(fetchImpl,owner,repo,token,n);}
+  catch{throw new Error('CORE_UI_CURRENT_SOURCE_UNVERIFIED');}
+  const githubUi=String(item.metadata?.source||'')==='github_ui'
+    ||String(item.routing_decision?.authority||'')==='CORE';
+  const spec=githubUi&&issue.state==='open'?parseCoreUiIssue(issue):null;
+  const revised=spec&&String(item.metadata?.sourceRevision||'');
+  const sourceChanged=Boolean(revised)&&revised!==spec.sourceRevision;
+  if(issue.state==='open'&&(!githubUi||(spec&&!sourceChanged)))return {...item,issue};
+  const done=issue.state==='closed'&&(issue.state_reason==='completed'||!issue.state_reason);
+  const status=done?'done':'cancelled';
+  await pool.query("update tigeriq_jobs set status=$2,lease_until=null,completed_at=coalesce(completed_at,now()),result=coalesce(result,'{}'::jsonb)||$3::jsonb where id=$1 and status in ('ui_assigned','ui_running')",[item.job_id,status,JSON.stringify({source:'github',issueRef:issue.html_url,verifiedAt:observedAt})]);
+  await pool.query("update tigeriq_objectives set status=$2,summary=$3,updated_at=now() where id=$1 and status='active'",[item.objective_id,done?'completed':'blocked',done?'Core-assigned UI Work Order completed with GitHub evidence':'Core-assigned UI Work Order cancelled/superseded']);
+  return {...item,status,completed_at:issue.closed_at||issue.updated_at,issue};
+}
+
+async function latestCoreUiObjective(pool,spec){
+  const q=await pool.query("select id,status,metadata,updated_at from tigeriq_objectives where metadata->>'source'='github_ui' and metadata->>'issueNumber'=$1 order by updated_at desc limit 1",[String(spec.number)]);
+  return q.rows[0]||null;
+}
+function sameCoreUiRevision(prior,spec){
+  if(!prior)return false;
+  const priorScope=String(prior.metadata?.resourceScope||'');
+  if(priorScope!==String(spec.resourceScope||''))return false;
+  const priorRevision=String(prior.metadata?.sourceRevision||'');
+  if(priorRevision)return priorRevision===String(spec.sourceRevision||'');
+  const rearmEpoch=coreUiRearmEpoch(spec.body);
+  const priorUpdated=Date.parse(String(prior.updated_at||''));
+  return !(rearmEpoch>0&&Number.isFinite(priorUpdated)&&rearmEpoch>priorUpdated);
+}
+function materializedCoreUiIds(spec,prior){
+  if(!prior)return {objectiveId:'OBJ-UI-GH-'+spec.number,jobId:'GH-'+spec.number};
+  const revision=String(spec.sourceRevision||'').toLowerCase();
+  return {objectiveId:'OBJ-UI-GH-'+spec.number+'-R'+revision,jobId:'GH-'+spec.number+'-R'+revision};
+}
+
+async function insertObjectiveIfScopeFree(pool,spec,metadata,objectiveId){
+  const oid=objectiveId;
+  const q=await pool.query(
+    "with locked as materialized (select pg_advisory_xact_lock(hashtext($1)) as guard), inserted as ("+
+    "insert into tigeriq_objectives(id,objective,priority,status,summary,metadata) "+
+    "select $2,$3,$4,'active',$5,$6 from locked "+
+    "where not exists (select 1 from tigeriq_objectives where status='active' and metadata->>'resourceScope'=$1) "+
+    "on conflict(id) do nothing returning id) select id from inserted",
+    [spec.resourceScope,oid,'Core-selected UI Work Order #'+spec.number+' - '+spec.title,spec.priority,'CURRENT_WORK_ORDER=#'+spec.number+' - '+spec.title+'; worker='+spec.workerId,JSON.stringify(metadata)]
+  );
+  return q.rowCount>0;
+}
+
+async function materializeForWorker({pool,fetchImpl,owner,repo,token,workerId,rows}){
+  // Never create a Core typed assignment for NV03 while its independent self-pull lane is enabled.
+  if(workerId==='NV03'&&(coreUiNv03CoreRoutingDisabled()||coreUiNv03SelfPullFenced()))return null;
+  if(await row(pool,{workerId}))return null;
+  const specs=(Array.isArray(rows)?rows:[]).map(parseCoreUiIssue).filter(x=>x&&Array.isArray(x.eligibleWorkerIds)&&x.eligibleWorkerIds.includes(workerId)).map(x=>({...x,workerId})).sort((a,b)=>rank(a.priority)-rank(b.priority)||a.number-b.number);
+  for(const spec of specs){
+    const prior=await latestCoreUiObjective(pool,spec);
+    if(sameCoreUiRevision(prior,spec))continue;
+    const ids=materializedCoreUiIds(spec,prior);
+    if((await pool.query('select 1 from tigeriq_objectives where id=$1',[ids.objectiveId])).rowCount)continue;
+    const exactContext=await loadCoreUiExactHeadContext({fetchImpl,owner,repo,token,spec});
+    if(!exactContext.ok)continue;
+    const comments=await readComments(fetchImpl,owner,repo,token,spec.number,spec.commentCount);
+    if(activeRoleClaim(comments))continue;
+    const metadata={source:'github_ui',issueNumber:spec.number,issueUrl:spec.url,capability:spec.capability,resourceScope:spec.resourceScope,executionSurface:'CORE_UI',uiWorkerId:spec.workerId,currentWorkOrder:'#'+spec.number+' - '+spec.title,assignmentAuthority:'CORE',keepParentOpenAtAssignment:(yes(currentCoreUiHeader(spec.body),'REVIEW_ONLY')||yes(currentCoreUiHeader(spec.body),'KEEP_OPEN_ON_STEP_COMPLETE')),readOnly:spec.readOnly,autonomousCode:spec.autonomousCode,sourcePriority:spec.sourcePriority,legacyP0Autonomous:spec.legacyP0Autonomous,ownerControlled:spec.ownerControlled,sourceRevision:spec.sourceRevision,rearmedFromObjectiveId:prior?.id||null,exactContextRequired:exactContext.required===true,targetRepository:exactContext.targetRepository||spec.targetRepository?.fullName||DEFAULT_TARGET_REPOSITORY,targetPr:exactContext.targetPr||null,targetHead:exactContext.targetHead||null,exactContextFileCount:exactContext.fileCount||0,exactContextTruncated:exactContext.truncated===true};
+    if(!await insertObjectiveIfScopeFree(pool,spec,metadata,ids.objectiveId))continue;
+    const materializedSpec={...spec,jobId:ids.jobId};
+    await pool.query("insert into tigeriq_jobs(id,objective_id,title,prompt,capability,kind,status,employee_id,resource_id,provider,routing_profile,routing_decision,max_attempts) values($1,$2,$3,$4,$5,'ui','ui_assigned',$6,$7,'ui','UI',$8,1) on conflict(id) do nothing",[ids.jobId,ids.objectiveId,'#'+spec.number+' - '+spec.title,buildCoreUiPrompt(materializedSpec,owner+'/'+repo,exactContext.bundle),spec.capability,spec.workerId,resourceId(spec.workerId),JSON.stringify({authority:'CORE',workerId:spec.workerId,capability:spec.capability,resourceScope:spec.resourceScope,sourceRevision:spec.sourceRevision,targetPr:exactContext.targetPr||null,targetHead:exactContext.targetHead||null})]);
+    await pool.query("insert into tigeriq_events(type,objective_id,job_id,employee_id,resource_id,task_kind,data) values('CORE_UI_ASSIGNMENT_CREATED',$1,$2,$3,$4,'ui',$5)",[ids.objectiveId,ids.jobId,spec.workerId,resourceId(spec.workerId),JSON.stringify({issueNumber:spec.number,issueUrl:spec.url,resourceScope:spec.resourceScope,capability:spec.capability,priority:spec.priority,sourceRevision:spec.sourceRevision,rearmedFromObjectiveId:prior?.id||null})]);
+    return row(pool,{jobId:ids.jobId});
+  }
+  return null;
+}
+
+function publicJob(item,{status='READY',executable=true,prompt}={}){
+  const m=item.metadata||{},out={jobId:String(item.job_id),workItemId:'CORE-UI-'+String(item.job_id),workerId:String(item.employee_id||m.uiWorkerId||'NV03'),status,executable,priority:String(item.priority||'P3'),issueRef:String(m.issueUrl||''),coreSelected:true,riskFlags:[],resourceScope:String(m.resourceScope||''),currentWorkOrder:String(m.currentWorkOrder||'')};
+  if(prompt!==undefined)out.prompt=String(prompt||'');return out;
+}
+
+async function recoverStaleUiAssignment({pool,fetchImpl,owner,repo,token,item,observedAt}={}){
+  if(!item||String(item.status||'')!=='ui_assigned')return item;
+  const priorFailoverCount=Math.max(0,Number(item.routing_decision?.staleFailoverCount||0));
+  if(priorFailoverCount>=1)return item;
+  const createdMs=Date.parse(String(item.created_at||''));
+  const observedMs=Date.parse(String(observedAt||''));
+  if(!Number.isFinite(createdMs)||!Number.isFinite(observedMs)||observedMs-createdMs<CORE_UI_ASSIGNMENT_STALE_MS)return item;
+  const n=Number(item.metadata?.issueNumber||issueNo(item.job_id));
+  if(!n)return item;
+  let issue;
+  try{issue=await readIssue(fetchImpl,owner,repo,token,n);}catch{return item;}
+  const spec=parseCoreUiIssue(issue);
+  if(!spec)return item;
+  const currentWorker=String(item.employee_id||item.metadata?.uiWorkerId||'');
+  for(const workerId of spec.eligibleWorkerIds.filter((id)=>id!==currentWorker&&!(id==='NV03'&&(coreUiNv03CoreRoutingDisabled()||coreUiNv03SelfPullFenced())))){
+    if(await row(pool,{workerId}))continue;
+    const exactContext=await loadCoreUiExactHeadContext({fetchImpl,owner,repo,token,spec});
+    if(!exactContext.ok)continue;
+    const destinationSpec={...spec,workerId,jobId:item.job_id};
+    const destinationPrompt=buildCoreUiPrompt(destinationSpec,owner+'/'+repo,exactContext.bundle);
+    const routingDecision={...(item.routing_decision||{}),authority:'CORE',failoverFrom:currentWorker,workerId,reason:'STALE_UI_ASSIGNMENT_NOT_STARTED',staleMs:Math.max(0,observedMs-createdMs),staleFailoverCount:priorFailoverCount+1,staleFailoverAt:observedAt};
+    const changed=await pool.query("update tigeriq_jobs set employee_id=$2,resource_id=$3,routing_decision=$4::jsonb,prompt=$5 where id=$1 and status='ui_assigned' and employee_id=$6",[item.job_id,workerId,resourceId(workerId),JSON.stringify(routingDecision),destinationPrompt,currentWorker]);
+    if(changed.rowCount!==1)continue;
+    await pool.query("update tigeriq_objectives set metadata=jsonb_set(metadata,'{uiWorkerId}',$2::jsonb,true),summary=$3,updated_at=now() where id=$1 and status='active'",[item.objective_id,JSON.stringify(workerId),'Core UI failover '+currentWorker+' -> '+workerId+' after stale unstarted assignment']);
+    await pool.query("insert into tigeriq_events(type,objective_id,job_id,employee_id,resource_id,task_kind,data) values('CORE_UI_ASSIGNMENT_FAILOVER',$1,$2,$3,$4,'ui',$5)",[item.objective_id,item.job_id,workerId,resourceId(workerId),JSON.stringify({issueNumber:n,fromWorker:currentWorker,toWorker:workerId,reason:'STALE_UI_ASSIGNMENT_NOT_STARTED',staleMs:Math.max(0,observedMs-createdMs)})]);
+    return row(pool,{jobId:item.job_id});
+  }
+  return item;
+}
+
+let nv04IdleNextProbeAt=0;
+async function materializeNv04IdleSourceAudit({pool,fetchImpl,owner,repo,token,nv04Observation=undefined,nv04IdleEnabled=undefined,forceProbe=false}){
+  const now=Date.now();
+  if(!forceProbe&&now<nv04IdleNextProbeAt)return null;
+  const gate=nv04IdleAuditGate({
+    enabled:nv04IdleEnabled===undefined?process.env.TIGERIQ_NV04_IDLE_AUDIT_ENABLED==='1':nv04IdleEnabled===true,
+    worker:nv04Observation===undefined?readNv04IdleHeartbeat():nv04Observation,
+    normalJobPending:false,coreAvailable:true,now,
+  });
+  if(!gate.eligible){
+    nv04IdleNextProbeAt=now+60_000;
+    return null;
+  }
+  // Bounded source fetch: no issue creation, no direct GitHub writes and no App Chrome mutation.
+  nv04IdleNextProbeAt=now+10*60_000;
+  let packet;
+  try{packet=await nv04IdleSourcePacket({fetchImpl,owner,repo,token,slot:nv04IdleAuditSlot(now)});}
+  catch{return null;}
+  const suffix=packet.sha.slice(0,12)+'-'+packet.slot;
+  const objectiveId='OBJ-NV04-IDLE-AUDIT-'+suffix,jobId='NV04-AUDIT-'+suffix;
+  if((await pool.query('select 1 from tigeriq_objectives where id=$1',[objectiveId])).rowCount)return null;
+  const resourceScope='NV04_IDLE_SOURCE_AUDIT';
+  const metadata={
+    source:'nv04_idle_audit',sourceSha:packet.sha,auditSlot:packet.slot,sourceUrl:packet.sourceUrl,
+    sourcePaths:packet.files.map(file=>file.path),resourceScope,
+    executionSurface:'CORE_UI',uiWorkerId:'NV04',currentWorkOrder:'NV04: rà mã nguồn khi rảnh @'+suffix,
+    assignmentAuthority:'CORE',readOnly:true,autonomousCode:false,sourceRevision:suffix,
+  };
+  const inserted=await insertObjectiveIfScopeFree(pool,{
+    resourceScope,priority:'P5',
+  },metadata,objectiveId);
+  if(!inserted)return null;
+  await pool.query("insert into tigeriq_jobs(id,objective_id,title,prompt,capability,kind,status,employee_id,resource_id,provider,routing_profile,routing_decision,max_attempts) values($1,$2,$3,$4,$5,'ui','ui_assigned',$6,$7,'ui','UI',$8,1) on conflict(id) do nothing",[
+    jobId,objectiveId,'NV04: rà mã nguồn khi rảnh @'+suffix,buildNv04IdleAuditPrompt(packet),
+    'research','NV04',resourceId('NV04'),JSON.stringify({authority:'NV04_IDLE_AUDIT',workerId:'NV04',sourceSha:packet.sha,auditSlot:packet.slot,sourcePaths:metadata.sourcePaths}),
+  ]);
+  await pool.query("insert into tigeriq_events(type,objective_id,job_id,employee_id,resource_id,task_kind,data) values('NV04_IDLE_AUDIT_ASSIGNED',$1,$2,$3,$4,'ui',$5)",[
+    objectiveId,jobId,'NV04',resourceId('NV04'),JSON.stringify({sourceSha:packet.sha,auditSlot:packet.slot,sourcePaths:metadata.sourcePaths,resourceScope}),
+  ]);
+  return row(pool,{jobId});
+}
+
+export async function buildCoreUiAssignmentSnapshot({pool,fetchImpl=fetch,token='',owner=OWNER,repo=REPO,previousJobId,nv04Observation=undefined,nv04IdleEnabled=undefined,nv04IdleForceProbe=false}={}){
+  if(!pool)throw new Error('CORE_UI_POOL_REQUIRED');
+  const observedAt=new Date().toISOString();let previous;
+  let prev=previousJobId?await row(pool,{jobId:previousJobId}):null;
+  if(prev){
+    prev=await reconcile({pool,fetchImpl,owner,repo,token,item:prev,observedAt});
+    const m=prev.metadata||{},n=Number(m.issueNumber||issueNo(prev.job_id));let issue=prev.issue;if(!issue&&n)try{issue=await readIssue(fetchImpl,owner,repo,token,n);}catch{}
+    if(prev.status==='done'&&issue)previous=completion({jobId:prev.job_id,workerId:prev.employee_id||m.uiWorkerId||'NV03',priority:prev.priority||'P3',issueRef:m.issueUrl||issue.html_url,closedAt:issue.closed_at||prev.completed_at,updatedAt:issue.updated_at,verifiedAt:observedAt});
+    else if(prev.status==='done'&&String(m.source||'')==='nv04_idle_audit')previous=publicJob(prev,{status:'DONE',executable:false});
+    else if(prev.status==='cancelled')previous=publicJob(prev,{status:'CANCELLED',executable:false});
+    else{previous=publicJob(prev,{status:'RUNNING',executable:true});if(prev.status==='ui_assigned')await pool.query("update tigeriq_jobs set status='ui_running',started_at=coalesce(started_at,now()) where id=$1",[prev.job_id]);}
+  }
+  const current=[],missingWorkers=[];
+  for(const workerId of WORKERS.filter(id=>id!=='NV03'||!coreUiNv03CoreRoutingDisabled())){
+    let item=await row(pool,{workerId});
+    if(item)item=await reconcile({pool,fetchImpl,owner,repo,token,item,observedAt});
+    if(item&&current.some((existing)=>existing.job_id===item.job_id))continue;
+    if(item)item=await recoverStaleUiAssignment({pool,fetchImpl,owner,repo,token,item,observedAt});
+    if(item&&current.some((existing)=>existing.job_id===item.job_id))continue;
+    if(item&&['ui_assigned','ui_running'].includes(String(item.status||'')))current.push(item);
+    else if(!(workerId==='NV03'&&(coreUiNv03CoreRoutingDisabled()||coreUiNv03SelfPullFenced())))missingWorkers.push(workerId);
+  }
+  if(missingWorkers.length){
+    let issues,sourceError;
+    try{issues=await readOpenIssues(fetchImpl,owner,repo,token);}
+    catch(error){sourceError=error;}
+    if(Array.isArray(issues)){
+      for(const workerId of missingWorkers){
+        const item=await materializeForWorker({pool,fetchImpl,owner,repo,token,workerId,rows:issues});
+        if(item&&['ui_assigned','ui_running'].includes(String(item.status||'')))current.push(item);
+      }
+    }else if(!current.length){
+      throw sourceError||new Error('CORE_UI_GITHUB_SOURCE_UNAVAILABLE');
+    }
+    if(Array.isArray(issues)&&missingWorkers.includes('NV04')&&!current.some(item=>item.employee_id==='NV04')){
+      // Only after a complete normal-work selection: idle audit never steals a real assignment.
+      const idle=await materializeNv04IdleSourceAudit({pool,fetchImpl,owner,repo,token,nv04Observation,nv04IdleEnabled,forceProbe:nv04IdleForceProbe});
+      if(idle&&['ui_assigned','ui_running'].includes(String(idle.status||'')))current.push(idle);
+    }
+  }
+  const b=bindings(),nextJobs=[];
+  for(const item of current){
+    const wid=String(item.employee_id||item.metadata?.uiWorkerId||'NV03');
+    const isPrevious=Boolean(previousJobId&&previousJobId===item.job_id);
+    b[wid]={workerId:wid,state:isPrevious?'WORKING':'ASSIGNED',currentWorkOrder:{workItemId:'CORE-UI-'+item.job_id,jobId:item.job_id,issueRef:item.metadata?.issueUrl||null,resourceScope:item.metadata?.resourceScope||null,title:item.metadata?.currentWorkOrder||null}};
+    if(!isPrevious&&item.status==='ui_assigned'){const p=(await pool.query('select prompt from tigeriq_jobs where id=$1',[item.job_id])).rows[0]?.prompt;nextJobs.push(publicJob(item,{status:'READY',executable:true,prompt:p}));}
+  }
+  nextJobs.sort((a,b2)=>rank(a.priority)-rank(b2.priority)||WORKERS.indexOf(a.workerId)-WORKERS.indexOf(b2.workerId));
+  const nextJob=nextJobs[0];
+  const requiredWorkers=current.map(x=>String(x.employee_id||x.metadata?.uiWorkerId||'NV03'));
+  const assignmentState=nextJobs.length?'READY_ASSIGNED':current.length?'WORKING':'READY_UNASSIGNED';
+  const revision=['core-ui-v3',previous?.jobId||'none',previous?.status||'none',...current.map(x=>x.job_id+':'+x.status)].join(':');
+  if(!current.length&&!previous)return readyUnassignedCoreUiSnapshot({observedAt,revision});
+  return{source:'CORE',authority:'CORE',observedAt,revision,assignmentState,previousJob:previous,nextJob,nextJobs,requiredWorkers,workerBindings:b};
+}
+
+
+export function parseInternalReviewEvidence(result='',prompt=''){
+  const raw=String(result||'').trim();
+  const expected=String(prompt||'').match(/^TARGET_HEAD=([a-f0-9]{7,64})$/mi)?.[1]?.toLowerCase()||'';
+  const decision=raw.match(/^REVIEW=(PASS|CHANGES_REQUIRED)$/mi)?.[1]?.toUpperCase()||'';
+  const targetHead=raw.match(/^TARGET_HEAD=([a-f0-9]{7,64})$/mi)?.[1]?.toLowerCase()||'';
+  const summary=raw.match(/^SUMMARY=(.+)$/mi)?.[1]?.trim().slice(0,600)||'';
+  const findings=raw.match(/^FINDINGS=([\s\S]+)$/mi)?.[1]?.trim().slice(0,1800)||'';
+  const valid=raw.includes('[TIGERIQ_INDEPENDENT_REVIEW_V1]')&&Boolean(expected)&&Boolean(decision)&&targetHead===expected&&Boolean(summary)&&Boolean(findings);
+  return {valid,reviewEvidence:valid?{schema:'TIGERIQ_INDEPENDENT_REVIEW_V1',decision,targetHead,summary,findings}:null,expectedHead:expected||null,targetHead:targetHead||null,decision:decision||null};
+}
+
+export async function completeCoreUiAssignment({pool,fetchImpl=fetch,token='',owner=OWNER,repo=REPO,jobId,workerId,terminal,result=''}={}){
+  if(!pool)throw new Error('CORE_UI_POOL_REQUIRED');
+  if(typeof pool.connect!=='function')throw new Error('CORE_UI_POOL_CONNECT_REQUIRED');
+  if(!WORKERS.includes(String(workerId||'')))throw new Error('CORE_UI_WORKER_INVALID');
+  const requestedState=String(terminal||'').toUpperCase();
+  if(!['DONE','BLOCKED','EXTERNAL_WAIT'].includes(requestedState))throw new Error('CORE_UI_TERMINAL_INVALID');
+  const terminalResult=safeResult(result||requestedState);
+  const terminalKey='TIGERIQ_CORE_UI_TERMINAL_KEY='+jobId;
+  const client=await pool.connect();
+  try{
+    await client.query('begin');
+    await client.query('select pg_advisory_xact_lock(hashtext($1))',[terminalKey]);
+    const item=await row(client,{jobId});
+    if(!item)throw new Error('CORE_UI_JOB_NOT_FOUND');
+    if(String(item.employee_id)!==String(workerId))throw new Error('CORE_UI_JOB_WORKER_MISMATCH');
+    if(!['ui_assigned','ui_running'].includes(String(item.status||''))){
+      await client.query('commit');
+      return {ok:true,alreadyTerminal:true,jobId,workerId,terminal:String(item?.result?.terminal||requestedState),evidenceRef:String(item?.result?.evidenceRef||item?.metadata?.issueUrl||''),issueRef:String(item?.metadata?.issueUrl||'')};
+    }
+
+    const internalFinalReview=String(item?.routing_decision?.authority||'')==='CORE_UI_FINAL_REVIEW';
+    if(internalFinalReview){
+      const parsed=parseInternalReviewEvidence(terminalResult,item.prompt||'');
+      const pass=requestedState==='DONE'&&parsed.valid;
+      const jobStatus=pass?'done':requestedState==='BLOCKED'?'blocked':requestedState==='EXTERNAL_WAIT'?'external_wait':'failed';
+      const evidenceRef=String(item?.metadata?.issueUrl||'');
+      const payload=pass
+        ? {source:'app_chrome_ui_final_review',terminal:requestedState,evidenceRef,result:terminalResult,reviewEvidence:parsed.reviewEvidence,terminalKey}
+        : {source:'app_chrome_ui_final_review',terminal:requestedState,evidenceRef,result:terminalResult,terminalKey,failure:{kind:requestedState==='DONE'?'invalid_response':requestedState,expectedHead:parsed.expectedHead,targetHead:parsed.targetHead,decision:parsed.decision}};
+      const eventType=pass?'CORE_UI_FINAL_REVIEW_DONE':requestedState==='BLOCKED'?'CORE_UI_FINAL_REVIEW_BLOCKED':requestedState==='EXTERNAL_WAIT'?'CORE_UI_FINAL_REVIEW_EXTERNAL_WAIT':'CORE_UI_FINAL_REVIEW_FAILED';
+      await client.query("update tigeriq_jobs set status=$2,lease_until=null,completed_at=coalesce(completed_at,now()),result=$3::jsonb,failure=$4::jsonb where id=$1 and status in ('ui_assigned','ui_running')",[jobId,jobStatus,JSON.stringify(payload),pass?null:JSON.stringify(payload.failure)]);
+      await client.query("insert into tigeriq_events(type,objective_id,job_id,employee_id,resource_id,task_kind,data) values($1,$2,$3,$4,$5,'ui',$6)",[eventType,item.objective_id,jobId,workerId,item.resource_id,JSON.stringify({terminal:requestedState,evidenceRef,reviewEvidence:parsed.reviewEvidence,failure:payload.failure||null})]);
+      await client.query('commit');
+      return {ok:true,jobId,workerId,terminal:requestedState,evidenceRef,issueRef:evidenceRef,reviewEvidence:parsed.reviewEvidence,accepted:pass};
+    }
+
+    if(String(item?.routing_decision?.authority||'')==='NV04_IDLE_AUDIT'){
+      const sourceSha=String(item?.metadata?.sourceSha||'');
+      let parsed={accepted:false,reason:'AUDIT_TERMINAL_NO_SOURCE'};
+      if(requestedState==='DONE'){
+        try{
+          const packet=await nv04IdleSourcePacket({fetchImpl,owner,repo,token,refSha:sourceSha,slot:String(item?.metadata?.auditSlot||'')});
+          parsed=parseNv04IdleAuditResult(terminalResult,packet);
+        }catch(error){parsed={accepted:false,reason:String(error?.message||error)};}
+      }
+      const valid=requestedState==='DONE'&&parsed.accepted===true;
+      const jobStatus=valid?'done':requestedState==='BLOCKED'?'blocked':requestedState==='EXTERNAL_WAIT'?'external_wait':'failed';
+      const payload={source:'nv04_idle_audit',terminal:requestedState,sourceSha,auditSlot:String(item?.metadata?.auditSlot||''),validation:parsed.reason,
+        findings:parsed.findings||[],findingCount:(parsed.findings||[]).length,
+        verified:valid,repairAuthorized:false};
+      await client.query("update tigeriq_jobs set status=$2,lease_until=null,completed_at=coalesce(completed_at,now()),result=$3::jsonb,failure=$4::jsonb where id=$1 and status in ('ui_assigned','ui_running')",[
+        jobId,jobStatus,JSON.stringify(payload),valid?null:JSON.stringify({kind:'NV04_IDLE_AUDIT_UNVERIFIED',reason:parsed.reason}),
+      ]);
+      await client.query("update tigeriq_objectives set status=$2,summary=$3,updated_at=now() where id=$1 and status='active'",[
+        item.objective_id,valid?'completed':'blocked',valid?'NV04 idle source audit source-grounded; findings pending independent verification':'NV04 idle audit unverified',
+      ]);
+      const eventType=valid?'NV04_IDLE_AUDIT_RESULT_RECORDED':'NV04_IDLE_AUDIT_RESULT_UNVERIFIED';
+      await client.query("insert into tigeriq_events(type,objective_id,job_id,employee_id,resource_id,task_kind,data) values($1,$2,$3,$4,$5,'ui',$6)",[
+        eventType,item.objective_id,jobId,'NV04',item.resource_id,JSON.stringify(payload),
+      ]);
+      await client.query('commit');
+      return {ok:true,jobId,workerId,terminal:requestedState,accepted:valid,sourceSha,
+        findingCount:payload.findingCount,findingsRequireIndependentVerification:true,
+        repairAuthorized:false};
+    }
+
+    const n=issueNo(jobId);if(!n)throw new Error('CORE_UI_JOB_ID_INVALID');
+    const issue=await readIssue(fetchImpl,owner,repo,token,n);
+    const comments=await gh(fetchImpl,'https://api.github.com/repos/'+owner+'/'+repo+'/issues/'+n+'/comments?per_page=100',token).catch(()=>[]);
+    const prior=(Array.isArray(comments)?comments:[]).find((comment)=>String(comment?.body||'').includes(terminalKey));
+    const priorText=String(prior?.body||'');
+    const priorState=coreUiTerminalStateFromComment(priorText);
+    const state=priorState||requestedState;
+    const evidenceBody=formatCoreUiTerminalComment({jobId,workerId,state,result:terminalResult});
+    const comment=prior||await ghWrite(fetchImpl,'https://api.github.com/repos/'+owner+'/'+repo+'/issues/'+n+'/comments',token,'POST',{body:evidenceBody});
+    // A review-step terminal does not signify parent Work Order acceptance/merge.
+    // Sticky assignment evidence survives mutable issue headers; legacy rows use current policy.
+    const activePolicy=currentCoreUiHeader(issue.body);
+    const keepParentOpen=item.metadata?.keepParentOpenAtAssignment===true
+      ||yes(activePolicy,'REVIEW_ONLY')||yes(activePolicy,'KEEP_OPEN_ON_STEP_COMPLETE');
+    if(state==='DONE'&&!keepParentOpen&&issue.state!=='closed')await ghWrite(fetchImpl,'https://api.github.com/repos/'+owner+'/'+repo+'/issues/'+n,token,'PATCH',{state:'closed',state_reason:'completed'});
+    const jobStatus=state==='DONE'?'done':'failed';
+    const objectiveStatus=state==='DONE'?'completed':'blocked';
+    const evidenceRef=String(comment?.html_url||issue.html_url||'');
+    await client.query("update tigeriq_jobs set status=$2,lease_until=null,completed_at=coalesce(completed_at,now()),result=coalesce(result,'{}'::jsonb)||$3::jsonb where id=$1 and status in ('ui_assigned','ui_running')",[jobId,jobStatus,JSON.stringify({source:'app_chrome_ui',terminal:state,evidenceRef,result:terminalResult,terminalKey})]);
+    await client.query("update tigeriq_objectives set status=$2,summary=$3,updated_at=now() where id=$1 and status='active'",[item.objective_id,objectiveStatus,'Core UI terminal '+state+' from '+workerId]);
+    await client.query("insert into tigeriq_events(type,objective_id,job_id,employee_id,resource_id,task_kind,data) values('CORE_UI_ASSIGNMENT_TERMINAL',$1,$2,$3,$4,'ui',$5)",[item.objective_id,jobId,workerId,item.resource_id,JSON.stringify({terminal:state,evidenceRef,issueNumber:n,terminalKey,recoveredExistingEvidence:Boolean(prior)})]);
+    await client.query('commit');
+    return {ok:true,jobId,workerId,terminal:state,evidenceRef,issueRef:String(issue.html_url||''),recoveredExistingEvidence:Boolean(prior)};
+  }catch(error){
+    try{await client.query('rollback')}catch{}
+    throw error;
+  }finally{
+    client.release();
+  }
+}

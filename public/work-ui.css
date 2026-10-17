@@ -1,0 +1,1308 @@
+/* TigerIQ shared Work UI + API Health visual system — #3918 */
+:root{
+  --tiq-work-card:#0b1829;
+  --tiq-work-card-top:#102139;
+  --tiq-work-line:#203953;
+  --tiq-work-line-hover:#315a82;
+  --tiq-work-text:#f3f7fc;
+  --tiq-work-muted:#91a4ba;
+  --tiq-live:#58a6ff;
+  --tiq-review:#58a6ff;
+  --tiq-queue:#efb85c;
+  --tiq-error:#ff747e;
+  --tiq-done:#46d48f;
+  --tiq-violet:#8c72d6;
+}
+.work-row,.wo-card{
+  display:block;
+  position:relative;
+  overflow:hidden;
+  min-width:0;
+  border:1px solid var(--tiq-work-line);
+  background:linear-gradient(180deg,var(--tiq-work-card-top),var(--tiq-work-card));
+  border-radius:13px;
+  padding:9px 10px;
+  box-shadow:0 8px 24px rgba(0,0,0,.12);
+  transition:border-color .18s ease,transform .18s ease,box-shadow .18s ease;
+}
+.work-row:hover,.wo-card:hover{border-color:var(--tiq-work-line-hover);transform:translateY(-1px);box-shadow:0 10px 28px rgba(0,0,0,.2),0 0 18px rgba(49,90,130,.1)}
+.work-row::before,.wo-card::before{content:"";position:absolute;inset:0 auto 0 0;width:3px;background:#71849a;opacity:.95}
+.work-row.status-working::before,.wo-card.status-working::before{background:var(--tiq-live)}
+.work-row.status-review::before,.wo-card.status-review::before{background:var(--tiq-review)}
+.work-row.status-waiting::before,.wo-card.status-waiting::before{background:var(--tiq-queue)}
+.work-row.status-queued::before,.wo-card.status-queued::before{background:var(--tiq-queue)}
+.work-row.status-blocked::before,.work-row.status-owner_gate::before,.wo-card.status-blocked::before,.wo-card.status-owner_gate::before{background:var(--tiq-error)}
+.work-row.status-done::before,.wo-card.status-done::before{background:var(--tiq-done)}
+.work-row.status-verify::before,.wo-card.status-verify::before{background:var(--tiq-review)}
+.work-row.status-goal::before,.wo-card.status-goal::before{background:var(--tiq-violet)}
+.work-row.status-system::before,.wo-card.status-system::before{background:#6c7987}
+.work-main{min-width:0}
+.work-top{display:flex;align-items:center;gap:6px;min-width:0;flex-wrap:wrap}
+.rank{width:19px;height:19px;border-radius:5px;display:inline-flex;align-items:center;justify-content:center;background:#17375a;color:#cfe7ff;font-size:10px;font-weight:900;flex:none}
+.work-id{font-size:12px;font-weight:900;color:#dbeaff}
+.priority{font-size:9px;font-weight:850;border:1px solid #3a506b;background:#142337;color:#aebed0;border-radius:999px;padding:2px 6px}
+.priority.p0{border-color:#8a3e78;background:#35182f;color:#ffb7df}.priority.p1{border-color:#6b50a4;background:#251b43;color:#d3bdff}.priority.p2{border-color:#315f92;background:#102b4a;color:#a9d6ff}.priority.p3{border-color:#2e7181;background:#0f3038;color:#93e7f4}.priority.p4{border-color:#7c6330;background:#392f18;color:#f4d491}.priority.p5{border-color:#4a5969;background:#1a2430;color:#b5c1cd}.priority.meta{border-color:#3d4b59;background:#18212b;color:#9aa8b6}
+.work-nv{font-size:10px;color:#a7b8cb;font-weight:780}
+.state{display:inline-flex;align-items:center;border:1px solid #3a4d63;border-radius:999px;padding:4px 7px;font-weight:850;font-size:9px;white-space:nowrap;margin-left:auto}
+.state.working{border-color:#2b7655;background:#113b2a;color:#9af0bc}.state.review,.state.waiting{border-color:#7a5b2a;background:#3b2d18;color:#ffd58f}.state.queued{border-color:#37699f;background:#112f50;color:#b5dcff}.state.blocked{border-color:#81404a;background:#401f26;color:#ffb8bf}.state.done{border-color:#27736a;background:#0f3a35;color:#94ecdf}.state.open,.state.unknown{border-color:#455d76;background:#132234;color:#b0c1d3}.state.owner_gate{border-color:#914652;background:#421f27;color:#ffc0c7}.state.verify{border-color:#816126;background:#3b2d18;color:#ffda92}.state.goal{border-color:#68529a;background:#281f42;color:#d9c9ff}.state.system{border-color:#4b5968;background:#19242f;color:#bdc8d3}
+.work-facts b{color:#d7e5f3;font-weight:760}.work-facts .proof{color:#8fc8ff}.work-facts .owner-pending{color:#ffc0c7;font-weight:800}
+.progress{display:flex;align-items:center;gap:8px;margin-top:9px;color:#7f95ac}.progress-track{height:8px;flex:1;min-width:60px;background:#16283b;border-radius:999px;overflow:hidden;box-shadow:inset 0 1px 2px rgba(0,0,0,.35)}.progress-fill{height:100%;background:currentColor;border-radius:999px;position:relative;overflow:hidden;transition:width .45s ease}.progress-text{font-size:10px;font-weight:900;color:currentColor;white-space:nowrap;min-width:31px;text-align:right}
+.work-row.status-working .progress{color:var(--tiq-live)}.work-row.status-review .progress,.work-row.status-waiting .progress,.work-row.status-verify .progress{color:var(--tiq-review)}.work-row.status-queued .progress{color:var(--tiq-queue)}.work-row.status-blocked .progress,.work-row.status-owner_gate .progress{color:var(--tiq-error)}.work-row.status-done .progress{color:var(--tiq-done)}.work-row.status-goal .progress{color:var(--tiq-violet)}
+.work-title,.wo-title{font-size:13.5px;font-weight:780;line-height:1.38;margin-top:7px;overflow-wrap:anywhere;color:var(--tiq-work-text);letter-spacing:.002em}
+.work-summary,.wo-current{font-size:11.75px;line-height:1.42;color:#a9bbce;margin-top:5px}
+.work-facts,.wo-facts{display:grid;gap:3px;margin-top:6px;padding-top:6px;border-top:1px solid #1c344d;font-size:10.5px;line-height:1.35;color:#8fa5bc}
+.progress-track,.wo-track{height:7px;flex:1;background:#16283b;border-radius:999px;overflow:hidden}
+.progress-fill,.wo-fill{height:100%;border-radius:inherit;transition:width .45s ease}
+.work-row.status-working,.wo-card.status-working{animation:tiq-work-live 2.8s ease-in-out infinite}
+.work-row.status-working .progress-fill,.wo-card.status-working .wo-fill{position:relative;overflow:hidden;box-shadow:0 0 10px rgba(70,212,143,.18)}
+.work-row.status-working .progress-fill::after,.wo-card.status-working .wo-fill::after{content:"";position:absolute;inset:0;width:38%;transform:translateX(-140%) skewX(-18deg);background:linear-gradient(90deg,transparent,rgba(255,255,255,.28),transparent);animation:tiq-work-shimmer 2.3s ease-in-out infinite}
+@keyframes tiq-work-live{0%,100%{box-shadow:0 8px 24px rgba(0,0,0,.12)}50%{box-shadow:0 8px 24px rgba(0,0,0,.12),0 0 0 1px rgba(70,212,143,.14),0 0 18px rgba(70,212,143,.08)}}
+@keyframes tiq-work-shimmer{0%,28%{transform:translateX(-140%) skewX(-18deg)}70%,100%{transform:translateX(360%) skewX(-18deg)}}
+
+/* API Health is intentionally a compact variant of the same Work visual system. */
+.api-health{
+  background:
+    radial-gradient(circle at 82% -8%,rgba(44,188,255,.15),transparent 30%),
+    radial-gradient(circle at 12% 20%,rgba(140,114,214,.08),transparent 24%),
+    linear-gradient(135deg,#050d19,#07162a 55%,#061020);
+}
+.api-health .topbar{box-shadow:0 12px 30px rgba(0,0,0,.18)}
+.api-health .nav{display:none!important}
+.api-health .brand{margin-right:auto}
+.api-health .sync-status{font-size:10px;color:#78d9ff;border:1px solid #1f557d;background:#091d33;border-radius:999px;padding:5px 8px;white-space:nowrap}
+.api-health .panel{
+  background:linear-gradient(145deg,rgba(8,24,44,.94),rgba(9,23,42,.96));
+  box-shadow:0 14px 36px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.025);
+  transition:border-color .2s ease,box-shadow .2s ease,transform .2s ease;
+}
+.api-health .panel:hover{border-color:#1c5d91;box-shadow:0 16px 42px rgba(0,0,0,.4),0 0 24px rgba(44,188,255,.045)}
+.api-health .panel-h h2{text-transform:uppercase;letter-spacing:.035em}
+.api-health .workers{
+  --employee-row-h:156px;
+  --employee-gap:9px;
+  grid-auto-rows:minmax(var(--employee-row-h),auto)!important;
+  max-height:calc(var(--employee-row-h) * 2 + var(--employee-gap) + 20px);
+  overflow-y:auto!important;
+  overflow-x:hidden!important;
+  align-content:start;
+  scrollbar-width:thin;
+  scrollbar-color:#286a9d #07182b;
+}
+.api-health .workers::-webkit-scrollbar{width:9px}
+.api-health .workers::-webkit-scrollbar-track{background:#07182b;border-radius:999px}
+.api-health .workers::-webkit-scrollbar-thumb{background:#286a9d;border-radius:999px;border:2px solid #07182b}
+.api-health .worker.employee-card{height:auto!important;min-height:var(--employee-row-h)!important;overflow:hidden!important;display:flex!important;flex-direction:column}
+.api-health .employee-task{display:block;white-space:normal;overflow:visible;overflow-wrap:anywhere;line-height:1.35}
+.api-health .worker.state-working{animation:tiq-worker-live 2.7s ease-in-out infinite}
+.api-health .metric{transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease}
+.api-health .metric:hover{transform:translateY(-2px)}
+.api-health .perf-rate i,.api-health .bar i{transition:width .5s ease;position:relative;overflow:hidden}
+.api-health .perf-rate i::after,.api-health .bar i::after{content:"";position:absolute;inset:0;width:36%;background:linear-gradient(90deg,transparent,rgba(255,255,255,.25),transparent);animation:tiq-bar-scan 3.2s ease-in-out infinite}
+.api-health .event{transition:background .18s ease,transform .18s ease}
+.api-health .event:hover{background:rgba(20,70,105,.12);transform:translateX(2px)}
+.api-health .event.recent-activity{animation:tiq-event-in .45s ease-out}
+.api-health .issue-indicator.has-issues{animation:tiq-alert-breathe 2.8s ease-in-out infinite}
+.api-health .wo-list,.api-health .work-list{display:grid;gap:10px;grid-template-columns:repeat(2,minmax(0,1fr));padding:10px;max-height:620px;overflow:auto}
+@keyframes tiq-worker-live{0%,100%{box-shadow:0 0 0 rgba(70,212,143,0)}50%{box-shadow:0 0 22px rgba(70,212,143,.08)}}
+@keyframes tiq-bar-scan{0%,35%{transform:translateX(-160%)}75%,100%{transform:translateX(360%)}}
+@keyframes tiq-event-in{from{opacity:.45;transform:translateY(-5px)}to{opacity:1;transform:translateY(0)}}
+@keyframes tiq-alert-breathe{0%,100%{box-shadow:0 0 0 rgba(255,94,109,0)}50%{box-shadow:0 0 16px rgba(255,94,109,.14)}}
+@media(max-width:1200px){.api-health .wo-list,.api-health .work-list{grid-template-columns:1fr}}
+@media(max-width:720px){
+  .api-health .sync-status{display:none}
+  .api-health .workers{--employee-row-h:164px}
+}
+@media(prefers-reduced-motion:reduce){
+  .work-row,.wo-card,.work-row.status-working,.wo-card.status-working,
+  .work-row .progress-fill::after,.wo-card .wo-fill::after,
+  .api-health .worker.state-working,.api-health .perf-rate i::after,.api-health .bar i::after,
+  .api-health .event.recent-activity,.api-health .issue-indicator.has-issues{
+    animation:none!important;
+    transition:none!important;
+  }
+}
+
+/* #3918 runtime-gate bootstrap release marker; no visual override. */
+
+/* #3918 detached-main release repair marker; no visual override. */
+
+/* #3918 exact-remote-main release marker; no visual override. */
+
+/* #3918 typed release attestation R4 marker; no visual override. */
+
+/* #3918 current LIVE shared-stylesheet release marker R5; no visual override. */
+
+/* #3918 API Health local final: shared Work card contract. */
+/* #3918 visual parity R2 — LIVE is the canonical Work Card appearance. */
+.work-row{
+  border-color:#234766;
+  background:
+    linear-gradient(90deg,rgba(88,166,255,.025),transparent 32%),
+    linear-gradient(180deg,#102139,#0b1829);
+}
+.work-row::before{width:4px;box-shadow:0 0 13px currentColor}
+.work-row.status-review,.work-row.status-waiting,.work-row.status-verify{
+  border-color:#5c4928;
+  background:linear-gradient(105deg,rgba(239,184,92,.075),transparent 28%),linear-gradient(180deg,#102139,#0b1829);
+}
+.work-row.status-working{
+  border-color:#285f49;
+  background:linear-gradient(105deg,rgba(70,212,143,.07),transparent 28%),linear-gradient(180deg,#102139,#0b1829);
+}
+.work-row.status-blocked,.work-row.status-owner_gate{
+  border-color:#693842;
+  background:linear-gradient(105deg,rgba(255,116,126,.075),transparent 28%),linear-gradient(180deg,#102139,#0b1829);
+}
+.work-row.status-queued{
+  border-color:#31577d;
+  background:linear-gradient(105deg,rgba(88,166,255,.075),transparent 28%),linear-gradient(180deg,#102139,#0b1829);
+}
+.work-row.status-done{
+  border-color:#24645d;
+  background:linear-gradient(105deg,rgba(88,216,198,.06),transparent 28%),linear-gradient(180deg,#102139,#0b1829);
+}
+.work-row .state{box-shadow:inset 0 0 13px rgba(255,255,255,.025)}
+.work-row .state.review,.work-row .state.waiting,.work-row .state.verify{box-shadow:0 0 0 1px rgba(239,184,92,.08),0 0 13px rgba(239,184,92,.10),inset 0 0 10px rgba(239,184,92,.08)}
+.work-row .state.working{box-shadow:0 0 0 1px rgba(70,212,143,.08),0 0 13px rgba(70,212,143,.10),inset 0 0 10px rgba(70,212,143,.07)}
+.work-row .state.blocked,.work-row .state.owner_gate{box-shadow:0 0 0 1px rgba(255,116,126,.08),0 0 13px rgba(255,116,126,.10),inset 0 0 10px rgba(255,116,126,.07)}
+.work-row .priority.p0{box-shadow:0 0 11px rgba(255,183,223,.10)}
+.work-row .rank{background:linear-gradient(145deg,#1a4775,#14345a);box-shadow:inset 0 0 10px rgba(88,166,255,.14)}
+.work-row .work-title{font-size:14px;font-weight:850;color:#f7fbff;text-shadow:0 1px 0 rgba(0,0,0,.2)}
+.work-row .work-summary{color:#b5c9dc}
+.work-next,.work-blocker{font-size:10.75px;line-height:1.4;margin-top:4px;color:#8fa5bc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.work-next b{color:#bcd0e4}.work-blocker{color:#ff9fa7}.work-blocker b{color:#ffb8bf}
+.progress.unverified{color:#71849a}.progress.unverified .progress-track{background:repeating-linear-gradient(90deg,#16283b 0 12px,#1b3047 12px 20px)}.progress.unverified .progress-fill{display:none}.progress.unverified .progress-text{min-width:78px;color:#91a4ba}
+.work-row.status-review .progress,.work-row.status-waiting .progress,.work-row.status-verify .progress{color:var(--tiq-review)}
+.work-row.status-review .progress-fill,.work-row.status-waiting .progress-fill,.work-row.status-verify .progress-fill{background:linear-gradient(90deg,#c58c37,#efb85c)}
+.work-row.status-working .progress-fill{background:linear-gradient(90deg,#2cab6e,#46d48f)}
+.work-row.status-queued .progress-fill{background:linear-gradient(90deg,#347bc5,#58a6ff)}
+.work-row.status-blocked .progress-fill,.work-row.status-owner_gate .progress-fill{background:linear-gradient(90deg,#c54f5a,#ff747e)}
+.api-health .work-row{min-height:170px;padding:11px 12px}
+.api-health .work-list{align-items:stretch}
+.api-health .wo-filters{background:linear-gradient(180deg,rgba(13,37,64,.52),rgba(7,22,39,.18))}
+.api-health .wo-filter{transition:transform .16s ease,border-color .16s ease,box-shadow .16s ease}
+.api-health .wo-filter:hover{transform:translateY(-1px);border-color:#3b79aa}
+.api-health .wo-filter.on{box-shadow:0 0 15px rgba(63,143,221,.08),inset 0 0 12px rgba(255,255,255,.025)}
+
+
+/* #3918 vivid API Health Work-card pass — stronger semantic contrast, still shared-contract compatible. */
+.api-health .work-row{
+  border-width:1px;
+  border-left-width:4px;
+  box-shadow:0 10px 24px rgba(0,0,0,.20),inset 0 1px 0 rgba(255,255,255,.018);
+}
+.api-health .work-row::before{display:none}
+.api-health .work-row.status-review,.api-health .work-row.status-waiting,.api-health .work-row.status-verify{
+  border-color:#8b6426;
+  border-left-color:#f0b94d;
+  background:linear-gradient(100deg,rgba(240,185,77,.12),transparent 28%),linear-gradient(180deg,#102139,#0b1829);
+}
+.api-health .work-row.status-working{
+  border-color:#287453;
+  border-left-color:#47db91;
+  background:linear-gradient(100deg,rgba(71,219,145,.11),transparent 28%),linear-gradient(180deg,#102139,#0b1829);
+}
+.api-health .work-row.status-queued{
+  border-color:#3a6fa2;
+  border-left-color:#61adff;
+  background:linear-gradient(100deg,rgba(97,173,255,.11),transparent 28%),linear-gradient(180deg,#102139,#0b1829);
+}
+.api-health .work-row.status-blocked,.api-health .work-row.status-owner_gate{
+  border-color:#87434d;
+  border-left-color:#ff6f7c;
+  background:linear-gradient(100deg,rgba(255,111,124,.12),transparent 28%),linear-gradient(180deg,#102139,#0b1829);
+}
+.api-health .work-row.status-done{
+  border-color:#2b776d;
+  border-left-color:#5be0cd;
+  background:linear-gradient(100deg,rgba(91,224,205,.10),transparent 28%),linear-gradient(180deg,#102139,#0b1829);
+}
+.api-health .work-row.status-system{
+  border-color:#4d6072;
+  border-left-color:#7f93a7;
+}
+.api-health .work-row .state{
+  gap:5px;
+  padding:5px 9px;
+  font-size:9.5px;
+  letter-spacing:.02em;
+  text-transform:uppercase;
+}
+.api-health .work-row .state::before{
+  content:"";
+  width:6px;height:6px;border-radius:50%;
+  background:currentColor;
+  box-shadow:0 0 9px currentColor;
+  flex:none;
+}
+.api-health .work-row .state.review,
+.api-health .work-row .state.waiting,
+.api-health .work-row .state.verify{
+  color:#ffd57f;
+  border-color:#ad7b27;
+  background:linear-gradient(180deg,#4a3518,#342512);
+  box-shadow:0 0 16px rgba(240,185,77,.18),inset 0 0 12px rgba(240,185,77,.08);
+}
+.api-health .work-row .state.working{
+  color:#98f0bd;
+  border-color:#2c8a61;
+  background:linear-gradient(180deg,#123e2d,#0c2d21);
+  box-shadow:0 0 16px rgba(71,219,145,.15),inset 0 0 12px rgba(71,219,145,.07);
+}
+.api-health .work-row .state.queued{
+  color:#b7ddff;
+  border-color:#3a79b8;
+  background:linear-gradient(180deg,#153d63,#102c48);
+  box-shadow:0 0 16px rgba(97,173,255,.14),inset 0 0 12px rgba(97,173,255,.06);
+}
+.api-health .work-row .state.blocked,
+.api-health .work-row .state.owner_gate{
+  color:#ffc1c7;
+  border-color:#a34d58;
+  background:linear-gradient(180deg,#4a2228,#35191e);
+  box-shadow:0 0 16px rgba(255,111,124,.15),inset 0 0 12px rgba(255,111,124,.06);
+}
+.api-health .work-row .state.done{
+  color:#a5f3e7;
+  border-color:#2f877d;
+  background:linear-gradient(180deg,#123e38,#0c2d29);
+}
+.api-health .work-row .priority.p0{background:#4a173a;border-color:#a53b7d;color:#ffc6e6;box-shadow:0 0 12px rgba(255,116,197,.12)}
+.api-health .work-row .priority.p1{background:#312357;border-color:#7657b2;color:#dbc8ff}
+.api-health .work-row .rank{color:#e7f3ff;background:linear-gradient(145deg,#24558b,#17385f);border:1px solid #2f669d}
+.api-health .work-row .work-nv{color:#c2d4e6}
+.api-health .work-row .work-title{font-size:14.5px;line-height:1.34;margin-top:9px}
+.api-health .work-row .progress{margin-top:10px}
+.api-health .work-row .progress-track{height:8px;background:#13283c}
+.api-health .work-row .work-summary{margin-top:7px;color:#b9cadc}
+.api-health .work-row .work-next{margin-top:5px;color:#91a9c1}
+.api-health .work-row:hover{transform:translateY(-2px);box-shadow:0 13px 30px rgba(0,0,0,.28),0 0 20px rgba(70,140,200,.07)}
+.api-health .work-row.status-review .state.review::before,
+.api-health .work-row.status-working .state.working::before{
+  animation:tiq-status-pulse 1.9s ease-in-out infinite;
+}
+@keyframes tiq-status-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.72)}}
+@media(prefers-reduced-motion:reduce){
+  .api-health .work-row .state::before{animation:none!important}
+}
+
+/* #3918 three-card work grid */
+.api-health .wo-list,.api-health .work-list{grid-template-columns:repeat(3,minmax(0,1fr))!important}
+@media(max-width:1500px){.api-health .wo-list,.api-health .work-list{grid-template-columns:repeat(2,minmax(0,1fr))!important}}
+@media(max-width:980px){.api-health .wo-list,.api-health .work-list{grid-template-columns:1fr!important}}
+.progress.stage .progress-track{background:repeating-linear-gradient(90deg,#14283c 0 14px,#1b3550 14px 24px);position:relative;overflow:hidden}
+.progress.stage .progress-fill{display:block!important;width:38%!important;background:linear-gradient(90deg,transparent,currentColor,transparent);animation:tiq-stage-scan 1.9s ease-in-out infinite;opacity:.45}
+.progress.stage .progress-text{min-width:68px;color:currentColor!important;text-transform:uppercase}
+.progress.checks .progress-fill{background:linear-gradient(90deg,#2f86d5,#58a6ff)}
+@keyframes tiq-stage-scan{0%{transform:translateX(-130%)}100%{transform:translateX(340%)}}
+@media(prefers-reduced-motion:reduce){.progress.stage .progress-fill{animation:none!important;opacity:.25}}
+
+
+/* #3918 4K Health layout pass */
+.api-health .brand-health{display:flex;align-items:center;gap:8px;margin-right:auto;letter-spacing:-.4px}
+.api-health .brand-health .brand-icon{font-size:22px;filter:drop-shadow(0 0 8px rgba(44,188,255,.25))}
+.api-health .brand-health .brand-product{
+  font-size:10px;
+  line-height:1;
+  letter-spacing:.11em;
+  font-weight:900;
+  color:#7ed9ff;
+  border:1px solid #205c83;
+  background:#0a2038;
+  border-radius:999px;
+  padding:4px 7px;
+  text-shadow:none;
+}
+.api-health .live-indicator.offline{color:#ff7d89;border-color:#8b3d4a;background:#32151b}
+.api-health .layout{grid-template-columns:minmax(0,3.55fr) minmax(285px,.82fr);gap:12px}
+.api-health .side{gap:10px}
+.api-health .side .panel{border-radius:13px}
+.api-health .side .panel-h{padding:10px 11px}
+.api-health .side .panel-h h2{font-size:14px}
+.api-health .side .panel-h small{font-size:9.5px}
+.api-health .side .chart{height:196px;padding:9px 10px}
+.api-health .side .chartbox{height:136px}
+.api-health .side .legend{font-size:9px;gap:8px;margin-top:5px;flex-wrap:wrap}
+.api-health .side .events{max-height:330px}
+.api-health .side .event{grid-template-columns:28px 1fr auto;gap:7px;padding:8px 9px}
+.api-health .side .event .ico{width:24px;height:24px}
+.api-health .side .event b{font-size:10.5px}
+.api-health .side .event small{font-size:9.5px}
+.api-health .side .tag{font-size:8.5px;padding:2px 5px}
+.api-health .side .perf-row{font-size:9px}
+.api-health .side .perf-name{font-size:9px}
+.api-health .side .perf-provider{font-size:9px}
+.api-health .side .perf-ok,.api-health .side .perf-fail,.api-health .side .perf-lat{font-size:8.5px}
+
+/* 4K / wide-desktop density */
+@media(min-width:1800px){
+  .api-health .app{max-width:none;width:100%;padding-left:16px;padding-right:16px}
+  .api-health .layout{grid-template-columns:minmax(0,4fr) minmax(300px,.78fr)}
+  .api-health .workers{grid-template-columns:repeat(6,minmax(0,1fr))!important}
+  .api-health .wo-list,.api-health .work-list{grid-template-columns:repeat(4,minmax(0,1fr))!important}
+  .api-health .worker.employee-card{padding:8px}
+  .api-health .work-row{min-height:160px;padding:10px}
+}
+@media(min-width:1400px) and (max-width:1799px){
+  .api-health .workers{grid-template-columns:repeat(4,minmax(0,1fr))!important}
+  .api-health .wo-list,.api-health .work-list{grid-template-columns:repeat(3,minmax(0,1fr))!important}
+}
+@media(max-width:1399px){
+  .api-health .layout{grid-template-columns:minmax(0,2.7fr) minmax(280px,.9fr)}
+  .api-health .workers{grid-template-columns:repeat(3,minmax(0,1fr))!important}
+  .api-health .wo-list,.api-health .work-list{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+}
+@media(max-width:980px){
+  .api-health .layout{grid-template-columns:1fr}
+  .api-health .workers{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+  .api-health .wo-list,.api-health .work-list{grid-template-columns:1fr!important}
+  .api-health .side{grid-template-columns:1fr}
+}
+
+
+/* #3918 window-responsive density pass — tuned for common 1906x1045 @125% window (~1525 CSS px). */
+@media(min-width:1450px){
+  .api-health .app{max-width:none;width:100%;padding-left:14px;padding-right:14px}
+  .api-health .layout{grid-template-columns:minmax(0,4.25fr) minmax(270px,.78fr);gap:10px}
+  .api-health .workers{grid-template-columns:repeat(6,minmax(0,1fr))!important}
+  .api-health .wo-list,.api-health .work-list{grid-template-columns:repeat(4,minmax(0,1fr))!important}
+  .api-health .panel-h{padding:12px 14px}
+  .api-health .workers{padding:8px;gap:8px}
+  .api-health .wo-list,.api-health .work-list{padding:8px;gap:8px}
+  .api-health .worker.employee-card{padding:8px}
+  .api-health .work-row{min-height:152px;padding:9px}
+  .api-health .work-row .work-title{font-size:13.5px}
+  .api-health .work-row .work-summary,.api-health .work-row .work-next{font-size:10px}
+  .api-health .side{gap:8px}
+  .api-health .side .panel-h{padding:9px 10px}
+  .api-health .side .panel-h h2{font-size:13.5px}
+  .api-health .side .panel-h small{font-size:9px}
+  .api-health .side .chart{height:188px;padding:8px 9px}
+  .api-health .side .chartbox{height:130px}
+  .api-health .side .events{max-height:318px}
+  .api-health .side .event{padding:7px 8px}
+}
+@media(min-width:1200px) and (max-width:1449px){
+  .api-health .app{max-width:none;width:100%;padding-left:12px;padding-right:12px}
+  .api-health .layout{grid-template-columns:minmax(0,3.3fr) minmax(265px,.88fr);gap:10px}
+  .api-health .workers{grid-template-columns:repeat(4,minmax(0,1fr))!important}
+  .api-health .wo-list,.api-health .work-list{grid-template-columns:repeat(3,minmax(0,1fr))!important}
+}
+@media(min-width:900px) and (max-width:1199px){
+  .api-health .layout{grid-template-columns:minmax(0,2.4fr) minmax(250px,.95fr)}
+  .api-health .workers{grid-template-columns:repeat(3,minmax(0,1fr))!important}
+  .api-health .wo-list,.api-health .work-list{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+}
+@media(max-width:899px){
+  .api-health .layout{grid-template-columns:1fr}
+  .api-health .workers{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+  .api-health .wo-list,.api-health .work-list{grid-template-columns:1fr!important}
+  .api-health .side{grid-template-columns:1fr}
+}
+
+
+/* #3918 Work-card detail parity with LIVE + subtle title color */
+.api-health .work-row{cursor:pointer}
+.api-health .work-row:focus-visible{outline:2px solid #58a6ff;outline-offset:2px}
+.api-health .work-row.status-working .work-title{color:#b8f4d0}
+.api-health .work-row.status-review .work-title,
+.api-health .work-row.status-waiting .work-title,
+.api-health .work-row.status-verify .work-title{color:#ffe0a3}
+.api-health .work-row.status-queued .work-title{color:#c7e4ff}
+.api-health .work-row.status-blocked .work-title,
+.api-health .work-row.status-owner_gate .work-title{color:#ffc1c7}
+.api-health .work-row.status-done .work-title{color:#b8f5eb}
+.api-health .work-row.status-goal .work-title{color:#dfd0ff}
+.api-health .work-row.status-system .work-title{color:#ced7e0}
+
+.work-detail-backdrop{position:fixed;inset:0;background:rgba(2,8,16,.58);backdrop-filter:blur(4px);z-index:90;display:none;align-items:center;justify-content:center;padding:16px}
+.work-detail-backdrop.open{display:flex}
+.work-detail-modal{width:min(780px,calc(100vw - 32px));height:min(760px,calc(100dvh - 32px));background:linear-gradient(180deg,#0c1d33,#081423);border:1px solid #285175;border-radius:18px;box-shadow:0 28px 80px rgba(0,0,0,.55);display:flex;flex-direction:column;overflow:hidden;animation:tiq-work-detail-in .18s ease-out}
+.work-detail-head{padding:16px;border-bottom:1px solid #203953;display:flex;gap:10px;align-items:flex-start}
+.work-detail-head-main{min-width:0;flex:1}
+.work-detail-kicker{font-size:11px;color:#91a4ba;font-weight:850}
+.work-detail-title{font-size:18px;line-height:1.3;font-weight:850;margin-top:6px;color:#f2f7fd}
+.work-detail-close{border:1px solid #34516e;background:#102139;color:#dce8f4;border-radius:9px;width:34px;height:34px;font-size:20px;cursor:pointer}
+.work-detail-body{padding:14px 16px;overflow:auto;display:grid;gap:12px}
+.work-detail-section{border:1px solid #1d3b59;background:#0b1829;border-radius:12px;padding:11px 12px}
+.work-detail-section h3{font-size:11px;margin:0 0 8px;color:#8fc8ff;text-transform:uppercase;letter-spacing:.04em}
+.work-detail-row{display:grid;grid-template-columns:90px 1fr;gap:8px;font-size:11px;line-height:1.5;margin-top:5px}
+.work-detail-row span:first-child{color:#839ab2}
+.work-detail-row span:last-child{color:#d9e6f2;overflow-wrap:anywhere}
+.work-detail-actions{margin-top:auto;padding:12px 16px max(12px,env(safe-area-inset-bottom));border-top:1px solid #203953;display:grid;grid-template-columns:1.35fr 1fr 1fr .8fr;gap:8px}
+.work-detail-btn{display:flex;align-items:center;justify-content:center;min-height:42px;border-radius:10px;border:1px solid #315578;background:#0d2037;color:#dcecff;font:800 12px/1 inherit;cursor:pointer;text-decoration:none}
+.work-detail-btn.primary{background:#136ac8;border-color:#2f8feb;color:white}
+.work-detail-btn.ask-vy{background:#3a235d;border-color:#7654a9;color:#eadcff}
+.work-detail-btn.fallback-chat{background:#111d2b;color:#b9c9da}
+.work-detail-btn[hidden]{display:none}
+body.work-detail-open{overflow:hidden}
+@keyframes tiq-work-detail-in{from{opacity:.55;transform:translateY(12px) scale(.985)}to{opacity:1;transform:none}}
+@media(max-width:700px){
+  .work-detail-modal{width:100%;height:min(100dvh,760px);border-radius:14px}
+  .work-detail-actions{grid-template-columns:1fr 1fr}
+}
+@media(prefers-reduced-motion:reduce){.work-detail-modal{animation:none!important}}
+
+
+/* #3918 live-system activity pass */
+.api-health::before{
+  content:"";
+  position:fixed;
+  inset:-40% 0 auto 0;
+  height:34%;
+  pointer-events:none;
+  z-index:0;
+  opacity:.028;
+  background:linear-gradient(180deg,transparent,rgba(104,210,255,.55),transparent);
+  animation:tiq-page-scan 15s linear infinite;
+}
+.api-health .app{position:relative;z-index:1}
+.api-health .live-indicator{gap:6px}
+.api-health .live-indicator small{font-size:8.5px;font-weight:800;color:#8fb8d7;white-space:nowrap}
+.api-health .live-indicator.degraded{border-color:#8a6525;background:#332713;color:#ffd474}
+.api-health .live-indicator.degraded .dot{background:#ffc04f;box-shadow:0 0 10px #ffc04f}
+.api-health .live-indicator.offline .dot{background:#ff6976;box-shadow:0 0 10px #ff6976}
+.api-health .workforce-panel .panel-h h2{
+  color:#79dcff;
+  text-shadow:0 0 16px rgba(63,196,255,.16);
+}
+.api-health .work-panel .panel-h h2{
+  color:#c8afff;
+  text-shadow:0 0 16px rgba(151,111,255,.16);
+}
+.api-health .api-perf-panel .panel-h h2{
+  color:#83f0cf;
+  text-shadow:0 0 16px rgba(64,220,175,.14);
+}
+.api-health .activity-panel .panel-h h2{
+  color:#77cfff;
+  text-shadow:0 0 16px rgba(77,176,255,.14);
+}
+.api-health .alert-panel .panel-h h2{
+  color:#aebfd0;
+  transition:color .2s ease,text-shadow .2s ease;
+}
+.api-health .alert-panel.has-alerts .panel-h h2{
+  color:#ffc76b;
+  text-shadow:0 0 16px rgba(255,185,71,.18);
+}
+.api-health .panel-h small[id$="Meta"]{font-weight:750}
+.api-health .workforce-panel .panel-h small{color:#79abc7}
+.api-health .work-panel .panel-h small{color:#9e8fc7}
+.api-health .activity-panel .panel-h small{color:#80abc5}
+.api-health .alert-panel .panel-h small{color:#9aa9b7}
+
+.api-health .employee-card{
+  position:relative;
+  isolation:isolate;
+  transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease,background .18s ease;
+}
+.api-health .employee-card::after{
+  content:"";
+  position:absolute;
+  inset:0;
+  pointer-events:none;
+  border-radius:inherit;
+  opacity:0;
+  background:radial-gradient(circle at 15% 20%,rgba(112,197,255,.11),transparent 38%);
+  transition:opacity .2s ease;
+}
+.api-health .employee-card:hover{transform:translateY(-2px)}
+.api-health .employee-card:hover::after{opacity:1}
+.api-health .employee-card.state-working{
+  border-color:#258a61;
+  background:linear-gradient(115deg,rgba(55,224,145,.09),transparent 32%),#0b1d31;
+  box-shadow:0 0 0 1px rgba(55,224,145,.06),0 0 22px rgba(55,224,145,.07);
+}
+.api-health .employee-card.state-ready{
+  border-color:#28735f;
+}
+.api-health .employee-card.state-waiting{
+  border-color:#8a6424;
+  background:linear-gradient(115deg,rgba(240,185,77,.075),transparent 35%),#0b1d31;
+  animation:tiq-worker-wait 4.2s ease-in-out infinite;
+}
+.api-health .employee-card.state-attention{
+  border-color:#94424f;
+  background:linear-gradient(115deg,rgba(255,103,119,.08),transparent 35%),#0b1d31;
+}
+.api-health .employee-avatar{position:relative}
+.api-health .state-working .employee-avatar::after{
+  content:"";
+  position:absolute;
+  inset:-5px;
+  border-radius:16px;
+  border:1px solid rgba(72,225,151,.45);
+  border-top-color:transparent;
+  animation:tiq-avatar-orbit 2.4s linear infinite;
+}
+.api-health .employee-live-line{
+  margin-top:auto;
+  padding-top:7px;
+  border-top:1px solid rgba(73,111,145,.34);
+  display:flex;
+  align-items:center;
+  gap:6px;
+  min-height:20px;
+  color:#7f9db9;
+  font-size:9.5px;
+  font-weight:700;
+}
+.api-health .employee-live-dot{
+  width:6px;height:6px;border-radius:50%;
+  flex:none;
+  background:#71849a;
+  box-shadow:0 0 8px currentColor;
+}
+.api-health .state-working .employee-live-line{color:#72dfaa}
+.api-health .state-working .employee-live-dot{background:#44dc92;animation:tiq-heartbeat 1.45s ease-in-out infinite}
+.api-health .state-ready .employee-live-line{color:#75cbb0}
+.api-health .state-ready .employee-live-dot{background:#55d3aa;animation:tiq-heartbeat 3.6s ease-in-out infinite}
+.api-health .state-waiting .employee-live-line{color:#d5ae60}
+.api-health .state-waiting .employee-live-dot{background:#e3b34e}
+.api-health .state-attention .employee-live-line{color:#ef8f99}
+.api-health .state-attention .employee-live-dot{background:#ff6c79}
+.api-health .employee-card.changed{animation:tiq-worker-change .8s ease-out 1}
+.api-health .event.recent-activity{animation:tiq-event-in .6s ease-out,tiq-event-glow 1.2s ease-out}
+.api-health .activity-panel .event:first-child .ico{box-shadow:0 0 11px rgba(95,196,255,.15)}
+.api-health .perf-rate i::after{animation-iteration-count:1}
+.api-health .sync-status{transition:border-color .2s ease,box-shadow .2s ease}
+.api-health .sync-status:hover{box-shadow:0 0 14px rgba(80,190,255,.08)}
+
+@keyframes tiq-page-scan{from{transform:translateY(-120vh)}to{transform:translateY(420vh)}}
+@keyframes tiq-avatar-orbit{to{transform:rotate(360deg)}}
+@keyframes tiq-heartbeat{0%,70%,100%{opacity:.55;transform:scale(.85)}78%{opacity:1;transform:scale(1.2)}84%{opacity:.7;transform:scale(.95)}90%{opacity:1;transform:scale(1.1)}}
+@keyframes tiq-worker-wait{0%,100%{box-shadow:0 0 0 rgba(240,185,77,0)}50%{box-shadow:0 0 18px rgba(240,185,77,.07)}}
+@keyframes tiq-worker-change{0%{box-shadow:0 0 0 1px rgba(95,196,255,.5),0 0 26px rgba(95,196,255,.22)}100%{box-shadow:inherit}}
+@keyframes tiq-event-glow{0%{background:rgba(65,174,240,.16)}100%{background:transparent}}
+@media(prefers-reduced-motion:reduce){
+  .api-health::before,
+  .api-health .state-working .employee-avatar::after,
+  .api-health .employee-live-dot,
+  .api-health .employee-card.state-waiting,
+  .api-health .employee-card.changed,
+  .api-health .event.recent-activity{
+    animation:none!important;
+  }
+}
+
+/* #3918 clipping audit fix */
+.api-health .employee-name,
+.api-health .employee-task,
+.api-health .employee-live-line span:last-child,
+.api-health .panel-h h2,
+.api-health .panel-h small{
+  overflow-wrap:anywhere;
+}
+.api-health .employee-live-line{flex-shrink:0}
+.api-health .panel-h{min-width:0}
+.api-health .panel-h>div{min-width:0}
+
+/* #3918 final visual audit cleanup */
+.api-health .work-next{
+  white-space:normal;
+  overflow:visible;
+  text-overflow:clip;
+  overflow-wrap:anywhere;
+}
+.api-health .side .chart{
+  height:auto!important;
+  min-height:220px;
+  overflow:visible;
+}
+.api-health .metrics-lower .metric{
+  min-height:132px;
+  height:auto;
+  overflow:visible;
+}
+.api-health .metrics-lower .metric .k,
+.api-health .metrics-lower .metric .s{
+  white-space:normal;
+  overflow:visible;
+  overflow-wrap:anywhere;
+}
+
+
+/* #3918 final viewport-fit + responsive rail */
+html,body.api-health,body.api-health{max-width:100%;overflow-x:hidden!important}
+.api-health *{box-sizing:border-box}
+.api-health .app{
+  width:100%!important;
+  max-width:100vw!important;
+  min-width:0!important;
+  overflow-x:hidden!important;
+}
+.api-health .layout,
+.api-health .layout>main,
+.api-health .side,
+.api-health .panel,
+.api-health .workers,
+.api-health .wo-list,
+.api-health .work-list,
+.api-health .side .panel,
+.api-health .side .chart,
+.api-health .side .events,
+.api-health .side .event,
+.api-health .perf-row{
+  min-width:0!important;
+  max-width:100%;
+}
+.api-health .layout{
+  width:100%;
+  grid-template-columns:minmax(0,1fr) minmax(260px,300px)!important;
+  gap:10px!important;
+}
+.api-health .side{
+  width:100%!important;
+  min-width:0!important;
+}
+.api-health .side .event b,
+.api-health .side .event small,
+.api-health .side .tag,
+.api-health .side .perf-provider,
+.api-health .side .perf-name{
+  min-width:0;
+  overflow-wrap:anywhere;
+}
+@media(min-width:1800px){
+  .api-health .layout{grid-template-columns:minmax(0,1fr) minmax(290px,330px)!important}
+  .api-health .workers{grid-template-columns:repeat(6,minmax(0,1fr))!important}
+  .api-health .wo-list,.api-health .work-list{grid-template-columns:repeat(4,minmax(0,1fr))!important}
+}
+@media(min-width:1450px) and (max-width:1799px){
+  .api-health .layout{grid-template-columns:minmax(0,1fr) minmax(270px,300px)!important}
+  .api-health .workers{grid-template-columns:repeat(6,minmax(0,1fr))!important}
+  .api-health .wo-list,.api-health .work-list{grid-template-columns:repeat(4,minmax(0,1fr))!important}
+}
+@media(min-width:1200px) and (max-width:1449px){
+  .api-health .layout{grid-template-columns:minmax(0,1fr) minmax(250px,280px)!important}
+  .api-health .workers{grid-template-columns:repeat(4,minmax(0,1fr))!important}
+  .api-health .wo-list,.api-health .work-list{grid-template-columns:repeat(3,minmax(0,1fr))!important}
+}
+@media(min-width:900px) and (max-width:1199px){
+  .api-health .layout{grid-template-columns:minmax(0,1fr) minmax(235px,260px)!important}
+  .api-health .workers{grid-template-columns:repeat(3,minmax(0,1fr))!important}
+  .api-health .wo-list,.api-health .work-list{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+}
+@media(max-width:899px){
+  .api-health .layout{grid-template-columns:1fr!important}
+  .api-health .workers{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+  .api-health .wo-list,.api-health .work-list{grid-template-columns:1fr!important}
+}
+
+/* #3918 performance-card numeric columns */
+.api-health .side .perf-row{
+  grid-template-columns:42px minmax(64px,1fr) 48px 46px 54px!important;
+  gap:5px!important;
+}
+.api-health .side .perf-provider{min-width:0!important}
+.api-health .side .perf-rate{width:72%!important;max-width:92px}
+.api-health .side .perf-ok,
+.api-health .side .perf-fail,
+.api-health .side .perf-lat{
+  min-width:0;
+  white-space:nowrap;
+  overflow:visible;
+}
+@media(max-width:1799px){
+  .api-health .side .perf-row{
+    grid-template-columns:38px minmax(54px,1fr) 44px 42px 50px!important;
+    gap:4px!important;
+    font-size:9px!important;
+  }
+  .api-health .side .perf-rate{width:62%!important;max-width:72px}
+}
+
+
+/* #3918 semantic status filters + interactive cursor affordance */
+.api-health .wo-filter{cursor:pointer!important}
+.api-health .wo-filter.action{color:#ff9ba7;border-color:#7e3c49;background:rgba(180,55,72,.12)}
+.api-health .wo-filter.owner{color:#d6b7ff;border-color:#664b8e;background:rgba(118,78,170,.12)}
+.api-health .wo-filter.running{color:#7ff0c0;border-color:#27785b;background:rgba(46,183,125,.12)}
+.api-health .wo-filter.review{color:#ffd27a;border-color:#8c6727;background:rgba(218,158,43,.12)}
+.api-health .wo-filter.waiting{color:#ff9c75;border-color:#874d36;background:rgba(211,91,47,.12)}
+.api-health .wo-filter.system{color:#8fd0ff;border-color:#315f8b;background:rgba(56,126,190,.12)}
+.api-health .wo-filter.done{color:#7ce6d4;border-color:#287468;background:rgba(46,174,153,.11)}
+.api-health .wo-filter.action.on{background:rgba(180,55,72,.26);box-shadow:0 0 16px rgba(255,91,112,.13)}
+.api-health .wo-filter.owner.on{background:rgba(118,78,170,.26);box-shadow:0 0 16px rgba(173,116,255,.13)}
+.api-health .wo-filter.running.on{background:rgba(46,183,125,.25);box-shadow:0 0 16px rgba(65,225,155,.13)}
+.api-health .wo-filter.review.on{background:rgba(218,158,43,.25);box-shadow:0 0 16px rgba(255,190,67,.14)}
+.api-health .wo-filter.waiting.on{background:rgba(211,91,47,.25);box-shadow:0 0 16px rgba(255,123,76,.14)}
+.api-health .wo-filter.system.on{background:rgba(56,126,190,.25);box-shadow:0 0 16px rgba(86,172,255,.13)}
+.api-health .wo-filter.done.on{background:rgba(46,174,153,.24);box-shadow:0 0 16px rgba(67,224,195,.12)}
+.api-health .wo-filter.running:not(.on) b:not(:empty){text-shadow:0 0 8px rgba(85,235,167,.45)}
+.api-health a[href],
+.api-health button:not(:disabled),
+.api-health [role="button"],
+.api-health [onclick],
+.api-health .filter,
+.api-health .wo-filter,
+.api-health .top-indicator,
+.api-health #navHealth,
+.api-health #navWork,
+.api-health .employee-card[tabindex],
+.api-health .work-row[tabindex]{
+  cursor:pointer!important;
+}
+.api-health button:disabled,.api-health [aria-disabled="true"]{cursor:not-allowed!important}
+
+
+/* Canonical API Health status palette: one semantic color per state across filters, cards and progress. */
+.api-health{
+  --status-working:#47db91;
+  --status-review:#f0b94d;
+  --status-waiting:#f0b94d;
+  --status-queued:#61adff;
+  --status-blocked:#ff747e;
+  --status-owner:#ff747e;
+  --status-done:#55d8c4;
+  --status-system:#8796a6;
+}
+.api-health .wo-filter.running{color:var(--status-working);border-color:#287453;background:rgba(71,219,145,.10)}
+.api-health .wo-filter.review,.api-health .wo-filter.waiting{color:var(--status-review);border-color:#8b6426;background:rgba(240,185,77,.10)}
+.api-health .wo-filter.action,.api-health .wo-filter.owner{color:var(--status-blocked);border-color:#87434d;background:rgba(255,116,126,.10)}
+.api-health .wo-filter.system{color:var(--status-system);border-color:#526170;background:rgba(135,150,166,.10)}
+.api-health .wo-filter.done{color:var(--status-done);border-color:#287468;background:rgba(85,216,196,.10)}
+.api-health .wo-filter.running.on{background:rgba(71,219,145,.23);box-shadow:0 0 16px rgba(71,219,145,.13)}
+.api-health .wo-filter.review.on,.api-health .wo-filter.waiting.on{background:rgba(240,185,77,.23);box-shadow:0 0 16px rgba(240,185,77,.13)}
+.api-health .wo-filter.action.on,.api-health .wo-filter.owner.on{background:rgba(255,116,126,.22);box-shadow:0 0 16px rgba(255,116,126,.13)}
+.api-health .wo-filter.system.on{background:rgba(135,150,166,.20);box-shadow:0 0 16px rgba(135,150,166,.10)}
+.api-health .wo-filter.done.on{background:rgba(85,216,196,.22);box-shadow:0 0 16px rgba(85,216,196,.12)}
+.api-health .work-row.status-working{border-left-color:var(--status-working)}
+.api-health .work-row.status-review,.api-health .work-row.status-waiting,.api-health .work-row.status-verify{border-left-color:var(--status-review)}
+.api-health .work-row.status-queued{border-left-color:var(--status-queued)}
+.api-health .work-row.status-blocked,.api-health .work-row.status-owner_gate{border-left-color:var(--status-blocked)}
+.api-health .work-row.status-done{border-left-color:var(--status-done)}
+.api-health .work-row.status-system{border-left-color:var(--status-system)}
+
+
+/* #3918 Work list viewport: show two rows, then scroll internally to keep the right rail visually balanced. */
+.api-health .work-list,.api-health .wo-list{
+  max-height:calc((152px * 2) + 24px)!important;
+  overflow-y:auto!important;
+  align-content:start;
+  scrollbar-width:thin;
+  scrollbar-color:#286a9d #07182b;
+}
+.api-health .work-list::-webkit-scrollbar,.api-health .wo-list::-webkit-scrollbar{width:9px}
+.api-health .work-list::-webkit-scrollbar-track,.api-health .wo-list::-webkit-scrollbar-track{background:#07182b;border-radius:999px}
+.api-health .work-list::-webkit-scrollbar-thumb,.api-health .wo-list::-webkit-scrollbar-thumb{background:#286a9d;border-radius:999px;border:2px solid #07182b}
+@media(min-width:1450px){
+  .api-health .work-list,.api-health .wo-list{max-height:calc((152px * 2) + 24px)!important}
+}
+
+
+/* #3918 vertical balance: Work panel bottom aligns with Current Alerts panel bottom at desktop widths. */
+@media(min-width:1450px){
+  .api-health .layout{align-items:stretch}
+  .api-health .work-panel{height:100%;display:flex;flex-direction:column;min-height:0}
+  .api-health .work-panel .work-list,.api-health .work-panel .wo-list{
+    flex:1 1 auto;
+    max-height:none!important;
+    min-height:0;
+    overflow-y:auto!important;
+    align-content:start;
+  }
+}
+
+
+/* #3918 exact-height follow-up: keep Work filters in normal flow; only card grid flexes/scrolls. */
+@media(min-width:1450px){
+  .api-health .work-panel{overflow:hidden!important}
+  .api-health .wo-filters{flex:0 0 auto;position:relative;z-index:2}
+  .api-health .work-panel .work-list,.api-health .work-panel .wo-list{
+    flex:1 1 0!important;
+    height:auto!important;
+    overflow-y:auto!important;
+    padding-top:10px!important;
+  }
+}
+
+
+/* #4383 truthful Work-card live motion V2 */
+.api-health .work-row.status-working{
+  animation:tiq-work-card-working 2.6s ease-in-out infinite;
+}
+.api-health .work-row.status-review,
+.api-health .work-row.status-verify{
+  animation:tiq-work-card-review 5.2s ease-in-out infinite;
+}
+.api-health .work-row.status-waiting{
+  animation:tiq-work-card-waiting 5.8s ease-in-out infinite;
+}
+.api-health .work-row.status-blocked,
+.api-health .work-row.status-owner_gate{
+  animation:tiq-work-card-attention 6.4s ease-in-out infinite;
+}
+.api-health .work-row.status-queued,
+.api-health .work-row.status-open{
+  animation:none;
+}
+
+/* Unverified stage bars remain indeterminate: motion communicates phase, never a percentage. */
+.api-health .progress.stage-working .progress-fill{animation-duration:1.55s;opacity:.62}
+.api-health .progress.stage-review .progress-fill,
+.api-health .progress.stage-verify .progress-fill{animation-duration:2.6s;opacity:.44}
+.api-health .progress.stage-waiting .progress-fill{animation-duration:3.25s;opacity:.34}
+.api-health .progress.stage-blocked .progress-fill,
+.api-health .progress.stage-owner_gate .progress-fill{animation-duration:4.8s;opacity:.28}
+.api-health .progress.stage-queued .progress-fill,
+.api-health .progress.stage-open .progress-fill{animation:none;opacity:.22;transform:translateX(30%)}
+
+/* Verified fills may flow inside their real width; this never changes the measured width. */
+.api-health .work-row.status-working .progress:not(.stage) .progress-fill::after,
+.api-health .work-row.status-review .progress:not(.stage) .progress-fill::after,
+.api-health .work-row.status-verify .progress:not(.stage) .progress-fill::after,
+.api-health .work-row.status-waiting .progress:not(.stage) .progress-fill::after{
+  content:"";
+  position:absolute;
+  inset:0;
+  width:34%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.24),transparent);
+  transform:translateX(-150%) skewX(-16deg);
+  animation:tiq-verified-progress-flow 3.1s ease-in-out infinite;
+}
+.api-health .work-row.status-review .progress:not(.stage) .progress-fill::after,
+.api-health .work-row.status-verify .progress:not(.stage) .progress-fill::after{animation-duration:4.1s}
+.api-health .work-row.status-waiting .progress:not(.stage) .progress-fill::after{animation-duration:5.2s;opacity:.7}
+
+@keyframes tiq-work-card-working{
+  0%,100%{box-shadow:0 10px 24px rgba(0,0,0,.20),inset 0 1px 0 rgba(255,255,255,.018)}
+  50%{box-shadow:0 10px 26px rgba(0,0,0,.22),0 0 0 1px rgba(71,219,145,.12),0 0 24px rgba(71,219,145,.10),inset 0 1px 0 rgba(255,255,255,.024)}
+}
+@keyframes tiq-work-card-review{
+  0%,100%{box-shadow:0 10px 24px rgba(0,0,0,.20),inset 0 1px 0 rgba(255,255,255,.018)}
+  50%{box-shadow:0 10px 25px rgba(0,0,0,.22),0 0 18px rgba(240,185,77,.075),inset 0 1px 0 rgba(255,255,255,.022)}
+}
+@keyframes tiq-work-card-waiting{
+  0%,100%{box-shadow:0 10px 24px rgba(0,0,0,.20),inset 0 1px 0 rgba(255,255,255,.018)}
+  50%{box-shadow:0 10px 24px rgba(0,0,0,.22),0 0 14px rgba(240,185,77,.055),inset 0 1px 0 rgba(255,255,255,.020)}
+}
+@keyframes tiq-work-card-attention{
+  0%,100%{box-shadow:0 10px 24px rgba(0,0,0,.20),inset 0 1px 0 rgba(255,255,255,.018)}
+  50%{box-shadow:0 10px 25px rgba(0,0,0,.22),0 0 16px rgba(255,116,126,.065),inset 0 1px 0 rgba(255,255,255,.020)}
+}
+@keyframes tiq-verified-progress-flow{
+  0%,34%{transform:translateX(-150%) skewX(-16deg)}
+  72%,100%{transform:translateX(390%) skewX(-16deg)}
+}
+
+@media(prefers-reduced-motion:reduce){
+  .api-health .work-row.status-working,
+  .api-health .work-row.status-review,
+  .api-health .work-row.status-verify,
+  .api-health .work-row.status-waiting,
+  .api-health .work-row.status-blocked,
+  .api-health .work-row.status-owner_gate,
+  .api-health .progress.stage .progress-fill,
+  .api-health .progress:not(.stage) .progress-fill::after{
+    animation:none!important;
+    transition:none!important;
+  }
+}
+
+
+/* TIGERIQ_HEALTH_LIVE_PARITY_V3: unmistakable LIVE visual parity; API Health only. */
+.api-health{
+  --health-card-working:#10d994;
+  --health-card-ready:#27c9ae;
+  --health-card-waiting:#f2b854;
+  --health-card-attention:#ff7287;
+  --health-card-idle:#6395c8;
+}
+.api-health .topbar{
+  position:relative;
+  background:linear-gradient(100deg,#102a48 0%,#0a1c32 62%,#092440 100%);
+  border-bottom:2px solid #35aaf5;
+  box-shadow:0 9px 27px rgba(0,77,141,.30);
+}
+.api-health .brand-product{
+  color:#ddf6ff;
+  background:#104269;
+  border:1px solid #4abfff;
+  box-shadow:0 0 16px rgba(50,174,255,.22);
+}
+.api-health .panel{
+  border:1px solid #27638e;
+  background:linear-gradient(160deg,#102843,#07192c 65%,#0a2036);
+  box-shadow:0 10px 30px rgba(0,0,0,.26),inset 0 1px 0 rgba(130,206,255,.06);
+}
+.api-health .panel-h{
+  position:relative;
+  background:linear-gradient(92deg,rgba(35,105,165,.34),rgba(15,46,81,.22));
+  border-bottom:1px solid #3176a8;
+  box-shadow:inset 0 -2px 0 rgba(57,166,234,.12);
+}
+.api-health .workforce-panel .panel-h{
+  background:linear-gradient(92deg,rgba(113,69,200,.27),rgba(25,53,91,.18));
+  border-bottom-color:#6e59b4;
+}
+.api-health .activity-panel .panel-h{border-bottom-color:#2e98d0}
+.api-health .alert-panel .panel-h{border-bottom-color:#b28539}
+.api-health .panel-h h2{font-weight:900;letter-spacing:.038em;text-shadow:0 0 13px rgba(92,174,255,.22)}
+.api-health .worker.employee-card{
+  --health-card-accent:var(--health-card-idle);
+  background:linear-gradient(158deg,#183651 0%,#0d2239 70%,#0a1b2f 100%);
+  border:1px solid var(--health-card-accent);
+  border-radius:11px;
+  position:relative;
+  box-shadow:0 7px 22px rgba(0,0,0,.28),0 0 0 1px rgba(70,165,248,.06);
+  transition:transform .16s ease,border-color .16s ease,box-shadow .16s ease;
+}
+.api-health .worker.employee-card.state-working{--health-card-accent:var(--health-card-working);background:linear-gradient(145deg,#144339,#0c2b34 55%,#0b1e32)}
+.api-health .worker.employee-card.state-ready{--health-card-accent:var(--health-card-ready)}
+.api-health .worker.employee-card.state-waiting{--health-card-accent:var(--health-card-waiting)}
+.api-health .worker.employee-card.state-attention{--health-card-accent:var(--health-card-attention)}
+.api-health .worker.employee-card.state-unknown{--health-card-accent:#8399b2}
+.api-health .worker.employee-card::before{
+  content:"";
+  position:absolute;
+  top:0;left:8px;right:8px;height:3px;
+  background:var(--health-card-accent);
+  border-radius:0 0 6px 6px;
+  box-shadow:0 0 12px var(--health-card-accent);
+  pointer-events:none;
+  opacity:.92;
+}
+.api-health .worker.employee-card .employee-id{
+  color:#ebd4ff;
+  background:#3c2958;
+  border:1px solid #815bb4;
+  text-shadow:0 1px 3px rgba(0,0,0,.45);
+}
+.api-health .worker.employee-card .employee-name{color:#f5faff;font-weight:900}
+.api-health .worker.employee-card .employee-task{color:#b9dff9}
+.api-health .worker.employee-card.state-working .employee-state{
+  color:#9cf8ca;border-color:var(--health-card-working);
+  background:rgba(16,185,129,.18);
+}
+.api-health .worker.employee-card.state-working .employee-live-dot{
+  background:var(--health-card-working);
+  box-shadow:0 0 8px var(--health-card-working);
+}
+.api-health .worker.employee-card:hover,.api-health .worker.employee-card:focus-visible{
+  transform:translateY(-2px);
+  box-shadow:0 15px 28px rgba(0,0,0,.34),0 0 20px rgba(64,158,235,.16);
+}
+.api-health .work-row{
+  --health-work-accent:#8096ad;
+  position:relative;
+  border:1px solid var(--health-work-accent);
+  background:linear-gradient(160deg,#183451,#0a1f35 70%,#09192b);
+  box-shadow:0 7px 25px rgba(0,0,0,.25);
+  transition:transform .16s ease,box-shadow .16s ease;
+}
+.api-health .work-row.status-working{--health-work-accent:#10d994}
+.api-health .work-row.status-review,.api-health .work-row.status-waiting,.api-health .work-row.status-verify{--health-work-accent:#f2b854}
+.api-health .work-row.status-queued{--health-work-accent:#5aaeff}
+.api-health .work-row.status-blocked,.api-health .work-row.status-owner_gate{--health-work-accent:#ff7287}
+.api-health .work-row.status-done{--health-work-accent:#4cd9ca}
+.api-health .work-row::before{
+  display:block;
+  content:"";
+  position:absolute;
+  top:0;left:0;right:0;bottom:auto;
+  width:auto;height:3px;
+  background:var(--health-work-accent);
+  opacity:.94;
+  box-shadow:0 0 9px var(--health-work-accent);
+  pointer-events:none;
+}
+.api-health .work-row .work-title{font-weight:900;text-shadow:0 1px 2px rgba(0,0,0,.28)}
+.api-health .work-row:hover,.api-health .work-row:focus-visible{
+  transform:translateY(-2px);
+  box-shadow:0 15px 30px rgba(0,0,0,.34),0 0 20px rgba(71,164,232,.12);
+}
+.api-health .wo-filter.on,.api-health .filter.on{box-shadow:0 0 0 1px rgba(84,173,243,.19),0 0 13px rgba(44,168,245,.12)}
+@media(prefers-reduced-motion:reduce){
+  .api-health .worker.employee-card,.api-health .work-row,.api-health .panel{
+    transition:none!important;
+  }
+  .api-health .worker.employee-card:hover,.api-health .worker.employee-card:focus-visible,
+  .api-health .work-row:hover,.api-health .work-row:focus-visible{
+    transform:none!important;
+  }
+  .api-health .worker.employee-card.state-working,.api-health .work-row.status-working{
+    animation:none!important;
+  }
+}
+
+
+/* TIGERIQ_HEALTH_WORKLIST_LIVE_PARITY_P0 — card structure mirrors the LIVE work-list only. */
+.api-health .work-panel .wo-filters{
+  display:flex;flex-wrap:wrap;overflow-x:visible;gap:6px;padding:9px 11px;
+  border-bottom:1px solid #1f4769;flex:0 0 auto;
+}
+.api-health .work-panel .wo-filter{
+  border-radius:999px;padding:6px 9px;font-size:10px;white-space:nowrap;
+  border:1px solid #36526b;background:#0d1c2c;color:#a6bed3;
+}
+.api-health .work-panel .wo-filter b{font-weight:900;margin-left:4px;color:inherit}
+.api-health .work-panel .wo-filter.owner{color:#c7a8ff;border-color:#6a5092}
+.api-health .work-panel .wo-filter.running{color:#63eab0;border-color:#227a58}
+.api-health .work-panel .wo-filter.review{color:#70b4ff;border-color:#275fb0}
+.api-health .work-panel .wo-filter.verify{color:#70e3d5;border-color:#187d74}
+.api-health .work-panel .wo-filter.ready{color:#b2d2ec;border-color:#385e7f}
+.api-health .work-panel .wo-filter.waiting{color:#ffd07d;border-color:#99651b}
+.api-health .work-panel .wo-filter.blocked{color:#ff899c;border-color:#9d2d4d}
+.api-health .work-panel .wo-filter.paused{color:#8a9eb2;border-color:#45576c}
+.api-health .work-panel .wo-filter.system{color:#9daec0;border-color:#4f6174}
+.api-health .work-panel .wo-filter.done{color:#3ad8e3;border-color:#177b84}
+.api-health .work-panel .wo-filter.on{
+  background:color-mix(in srgb,currentColor 13%,#081826);
+  box-shadow:0 0 0 1px color-mix(in srgb,currentColor 25%,transparent);
+}
+.api-health .work-panel .wo-list.work-list{
+  display:grid!important;grid-template-columns:repeat(5,minmax(0,1fr))!important;
+  gap:13px 9px!important;padding:11px 9px 15px!important;
+  align-content:start;grid-auto-rows:minmax(264px,auto);
+  overflow-x:hidden!important;overflow-y:auto!important;min-height:0!important;
+}
+.api-health .work-panel .work-row.health-live-work-card{
+  --status-color:#64748B;display:block!important;position:relative!important;
+  min-width:0!important;min-height:0!important;padding:0!important;
+  border:0!important;background:transparent!important;border-radius:0!important;
+  box-shadow:none!important;overflow:visible!important;isolation:isolate;
+  animation:none!important;transform:none;
+}
+.api-health .work-panel .work-row.health-live-work-card::before{content:none!important;display:none!important}
+.api-health .work-panel .health-live-work-card>.work-id,
+.api-health .work-panel .health-live-work-card>.priority{
+  display:flex!important;align-items:center!important;justify-content:center!important;
+  position:absolute!important;top:0!important;height:29px!important;z-index:4!important;
+  padding:0 11px!important;border-radius:9px 9px 0 0!important;
+  line-height:1!important;font-size:16px!important;font-weight:900!important;
+  margin:0!important;border:0!important;text-shadow:0 1px 2px #0009!important;
+}
+.api-health .work-panel .health-live-work-card>.work-id{
+  left:0!important;color:#fff!important;background:var(--status-color,#64748B)!important;
+}
+.api-health .work-panel .health-live-work-card>.priority{right:0!important;color:#fff!important}
+.api-health .work-panel .health-live-work-card>.priority.p0{background:#ef4444!important}
+.api-health .work-panel .health-live-work-card>.priority.p1{background:#f97316!important}
+.api-health .work-panel .health-live-work-card>.priority.p2{background:#f59e0b!important;color:#071321!important}
+.api-health .work-panel .health-live-work-card>.priority.p3{background:#3b82f6!important}
+.api-health .work-panel .health-live-work-card>.priority.p4{background:#8b5cf6!important}
+.api-health .work-panel .health-live-work-card>.priority.p5,
+.api-health .work-panel .health-live-work-card>.priority.meta{background:#64748b!important}
+.api-health .work-panel .health-live-work-card .work-main{
+  position:relative!important;margin-top:29px!important;
+  min-width:0!important;min-height:calc(100% - 29px)!important;
+  padding:10px 10px 11px!important;
+  display:flex;flex-direction:column;gap:0;
+  border:1px solid var(--status-color,#64748B)!important;
+  border-radius:0 0 12px 12px!important;background:#10243a!important;
+  box-shadow:0 8px 24px #0004!important;
+  transition:box-shadow .17s ease!important;
+}
+.api-health .work-panel .health-live-work-card:hover,.api-health .work-panel .health-live-work-card:focus-visible{transform:translateY(-2px)!important}
+.api-health .work-panel .health-live-work-card:hover .work-main,.api-health .work-panel .health-live-work-card:focus-visible .work-main{
+  box-shadow:0 12px 28px #0008,0 0 11px color-mix(in srgb,var(--status-color) 17%,transparent)!important;
+}
+.api-health .work-panel .health-live-work-card .work-top{
+  display:flex;align-items:center;gap:5px;flex-wrap:nowrap;min-width:0;
+}
+.api-health .work-panel .health-live-work-card .rank{
+  width:25px;height:24px;font-weight:900;font-size:11px;border-radius:5px;
+  flex:none;background:#214765;border:1px solid #4b7497;color:#eef8ff;
+}
+.api-health .work-panel .health-live-work-card .work-nv{
+  font-size:9px;max-width:65px;font-weight:800;color:#aabdd0;
+  overflow:hidden;white-space:nowrap;text-overflow:ellipsis;
+}
+.api-health .work-panel .health-live-work-card .state{
+  margin-left:auto;display:inline-flex;align-items:center;gap:4px;
+  border:none!important;background:transparent!important;
+  box-shadow:none!important;color:var(--status-color)!important;
+  padding:2px 0!important;font-size:9px!important;font-weight:850;
+  border-radius:0!important;white-space:nowrap;animation:none!important;
+}
+.api-health .work-panel .health-live-status-icon{height:15px;width:15px;flex:none;stroke:currentColor}
+.api-health .work-panel .health-live-work-card .work-hierarchy,
+.api-health .work-panel .health-live-work-card .work-parent{
+  font-size:10px;line-height:1.35;color:#79cfff;margin-top:8px;
+  overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
+  overflow-wrap:anywhere;
+}
+.api-health .work-panel .health-live-work-card .work-parent{margin-top:1px;font-size:9px;color:#9fb6cc}
+.api-health .work-panel .health-live-work-card .work-title{
+  color:#f4f8ff!important;font-size:12px!important;line-height:1.32!important;
+  font-weight:900!important;min-height:2.64em;margin:7px 0 0!important;
+  display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;
+  overflow:hidden;overflow-wrap:anywhere;text-shadow:none!important;
+}
+.api-health .work-panel .health-live-work-card .work-quick{
+  display:flex;align-items:flex-start;gap:5px;min-height:0;
+  color:#b6d9f2;font-size:10px;line-height:1.35;margin-top:6px;
+}
+.api-health .work-panel .health-live-work-card .work-quick span{
+  display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;
+  overflow:hidden;overflow-wrap:anywhere;min-width:0;
+}
+.api-health .work-panel .health-live-work-card .work-quick.blocked{color:#ff9fa7}
+.api-health .work-panel .health-live-work-card .next-step-icon{flex:none;stroke:#58b7ff;margin-top:1px}
+.api-health .work-panel .health-live-work-card .work-progress-bottom{margin-top:auto;padding-top:8px}
+.api-health .work-panel .health-live-work-card .work-step-summary{
+  display:flex;align-items:flex-end;justify-content:space-between;gap:3px;
+  font-size:9px;font-weight:800;color:#86c9ff;margin-bottom:5px;
+}
+.api-health .work-panel .health-live-work-card .work-step-summary.unverified{color:#8ea7be;font-weight:650}
+.api-health .work-panel .health-live-work-card .step-remaining{color:#ffd073;text-align:right}
+.api-health .work-panel .health-live-work-card .progress{
+  display:flex;align-items:center;gap:5px;margin:0;color:var(--status-color);
+}
+.api-health .work-panel .health-live-work-card .progress-track{
+  height:7px;min-width:0;flex:1;overflow:hidden;background:#0c1e30;border-radius:999px;
+}
+.api-health .work-panel .health-live-work-card .progress-fill{
+  height:100%;background:#4a9cff;position:relative;
+  border-radius:999px;transition:width .25s ease;
+}
+.api-health .work-panel .health-live-work-card .progress-text{
+  white-space:nowrap;min-width:27px;font-size:9px;font-weight:850;color:var(--status-color);
+}
+.api-health .work-panel .health-live-work-card .progress.indeterminate .progress-fill{
+  width:30%;background:linear-gradient(90deg,transparent,#4a9cff,transparent);
+  animation:tiq-health-live-stage 1.8s ease-in-out infinite;
+}
+.api-health .work-panel .health-live-work-card .progress.indeterminate .progress-text{
+  min-width:0;color:#90a8c0;
+}
+.api-health .work-panel .health-live-work-card.recently-updated .work-main{
+  animation:tiq-health-live-flash .8s ease-out 1;
+}
+@keyframes tiq-health-live-stage{0%{transform:translateX(-115%)}100%{transform:translateX(350%)}}
+@keyframes tiq-health-live-flash{0%{box-shadow:0 0 0 1px #58a6ff,0 0 22px #58a6ff55}100%{box-shadow:0 8px 24px #0004}}
+@media(min-width:2000px){.api-health .work-panel .wo-list.work-list{grid-template-columns:repeat(5,minmax(0,1fr))!important}}
+@media(max-width:1399px){.api-health .work-panel .wo-list.work-list{grid-template-columns:repeat(4,minmax(0,1fr))!important}}
+@media(max-width:1099px){.api-health .work-panel .wo-list.work-list{grid-template-columns:repeat(3,minmax(0,1fr))!important}}
+@media(max-width:760px){.api-health .work-panel .wo-list.work-list{grid-template-columns:repeat(2,minmax(0,1fr))!important}}
+@media(max-width:540px){.api-health .work-panel .wo-list.work-list{grid-template-columns:minmax(0,1fr)!important}}
+@media(prefers-reduced-motion:reduce){
+ .api-health .work-panel .health-live-work-card,.api-health .work-panel .health-live-work-card .work-main,
+ .api-health .work-panel .health-live-work-card .progress-fill{transition:none!important;animation:none!important}
+ .api-health .work-panel .health-live-work-card .progress.indeterminate .progress-fill{animation:none!important;transform:none!important}
+ .api-health .work-panel .health-live-work-card:hover{transform:none!important}
+}
+
+
+/* TIGERIQ_HEALTH_WORKLIST_COMPACT_P0: avoid empty vertical space in LIVE-parity Health cards. */
+.api-health .work-panel .wo-list.work-list{
+  grid-auto-rows:max-content!important;
+  align-items:start!important;
+  row-gap:10px!important;
+}
+.api-health .work-panel .work-row.health-live-work-card{
+  align-self:start!important;
+  height:auto!important;
+}
+.api-health .work-panel .health-live-work-card .work-main{
+  min-height:0!important;
+  height:auto!important;
+}
+.api-health .work-panel .health-live-work-card .work-title{
+  min-height:0!important;
+}
+.api-health .work-panel .health-live-work-card .work-progress-bottom{
+  margin-top:8px!important;
+  padding-top:0!important;
+}
+
+
+/* Work Center V1 — shared rendering primitives; scoped, mobile-first, low-impact. */
+.tiq-work-card{cursor:pointer;max-width:100%;min-width:0}
+.tiq-work-card .work-top{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.tiq-work-card .work-id{font-size:1.04em;font-weight:900;color:#e7f7ff}
+.tiq-work-card .work-nv{color:#9ab9cf;font-weight:700}
+.tiq-work-card .state{display:inline-flex;gap:5px;align-items:center;margin-left:auto}
+.tiq-work-card .work-title{font-size:clamp(14px,1.5vw,18px);line-height:1.35;margin:8px 0 5px;font-weight:780;overflow-wrap:anywhere}
+.tiq-work-card .work-hierarchy{color:#93bad3;font-size:12px;margin-top:8px;overflow-wrap:anywhere}
+.tiq-work-card .work-quick{margin:6px 0;color:#a9c7dc;font-size:12px;line-height:1.4;overflow-wrap:anywhere}
+.tiq-work-card .tiq-steps{display:inline-block;color:#99c4e8;font-size:12px;margin-right:8px}
+.tiq-work-card .work-progress-bottom{margin-top:10px}
+.tiq-work-times{display:flex;flex-wrap:wrap;gap:4px 14px;color:#9cb0c5;font-size:11px;padding-top:9px;margin-top:auto}
+.tiq-compact .work-hierarchy{display:none}
+.tiq-compact .work-title{font-size:14px}
+.tiq-compact .work-main{min-width:0}
+.tiq-work-card:focus-visible{outline:2px solid #67c9ff;outline-offset:2px}
+.tiq-floating-reload{position:fixed;right:max(18px,env(safe-area-inset-right));bottom:calc(20px + env(safe-area-inset-bottom));z-index:65;display:grid;place-items:center;width:56px;height:56px;border-radius:50%;border:1px solid #81c9ff;background:linear-gradient(135deg,#168cff,#005ccc);color:white;box-shadow:0 12px 28px #0009,0 0 0 4px #0b1934c7;cursor:pointer;touch-action:manipulation}
+.tiq-floating-reload svg{width:26px;height:26px}
+.tiq-floating-reload:active{transform:scale(.94)}
+.tiq-floating-reload:focus-visible{outline:3px solid #9defff;outline-offset:4px}
+.drawer-open .tiq-floating-reload,.work-detail-open .tiq-floating-reload{visibility:hidden;pointer-events:none}
+.tiq-audit-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.tiq-audit-grid>div{border:1px solid #2b4967;border-radius:8px;padding:9px;display:grid;gap:3px;min-width:0}
+.tiq-audit-grid small,.tiq-audit-timeline small{color:#91a8be;font-size:11px}
+.tiq-audit-grid strong{font-size:12px;overflow-wrap:anywhere}
+.tiq-audit-timeline{list-style:none;margin:8px 0 0;padding:0 0 0 15px;border-left:2px solid #2c668f}
+.tiq-audit-timeline li{padding:0 0 15px 13px;position:relative;font-size:12px;overflow-wrap:anywhere}
+.tiq-audit-timeline li::before{content:'';position:absolute;left:-20px;top:5px;width:8px;height:8px;background:#1aa3ea;border-radius:50%}
+.tiq-audit-timeline li>*{display:block;margin-bottom:3px}
+.tiq-audit-timeline li time{color:#84cfff;font-size:11px}
+.tiq-audit-timeline li a{color:#5fcfff}
+.tiq-audit-empty{font-size:12px;color:#a6bad0}
+.tiq-work-overlay{display:none;position:fixed;inset:0;z-index:1000;background:#000b;align-items:center;justify-content:center;padding:15px}
+.tiq-work-overlay.open{display:flex}
+.tiq-work-modal{width:min(560px,100%);max-height:85dvh;overflow-y:auto;border:1px solid #336c92;background:#0b1b2d;color:#eef7ff;border-radius:16px;padding:15px}
+.tiq-work-modal>header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.tiq-work-modal h2{font-size:16px;line-height:1.35}
+.tiq-modal-close{background:#183451;color:white;border:1px solid #3d6480;border-radius:10px;width:38px;height:38px;font-size:25px;cursor:pointer}
+.tiq-work-center .tiq-work-card{margin:8px 0}
+@media(max-width:430px){.tiq-floating-reload{right:16px;bottom:calc(18px + env(safe-area-inset-bottom))}.tiq-audit-grid{gap:6px}.tiq-work-card .work-nv{font-size:11px}}
+@media(prefers-reduced-motion:reduce){.tiq-floating-reload,.tiq-work-card{animation:none!important;transition:none!important}}
+
+
+/* Owner interaction V6: workforce cards are neutral; colors indicate status text/dot, not card chrome. */
+.api-health .worker.employee-card,
+.api-health .worker.employee-card.state-working,
+.api-health .worker.employee-card.state-ready,
+.api-health .worker.employee-card.state-ondemand,
+.api-health .worker.employee-card.state-waiting,
+.api-health .worker.employee-card.state-unknown,
+.api-health .worker.employee-card.state-attention,
+.api-health .worker.employee-card.state-paused{
+  background:#101c2e!important;
+  border:1px solid #344257!important;
+  box-shadow:none!important;
+  animation:none!important;
+  --health-card-accent:#344257;
+}
+.api-health .worker.employee-card::before,
+.api-health .worker.employee-card::after,
+.api-health .state-working .employee-avatar::after{display:none!important;}
+.api-health .worker.employee-card:hover,
+.api-health .worker.employee-card:focus-visible{
+  border-color:#718096!important;
+  box-shadow:0 0 0 1px #53657d44!important;
+  transform:none;
+}
+.api-health .worker.employee-card .employee-id{color:#e2e8f0;background:#19283a;border:1px solid #405069;box-shadow:none;text-shadow:none;}
+.api-health .worker.employee-card .employee-avatar{background:#17273a;border:1px solid #405069;box-shadow:none;}
+.api-health .worker.employee-card .employee-source{color:#a8b7c9;background:#172439;border-color:#405069;}
+.api-health .worker.employee-card .employee-name{color:#f1f5f9;text-shadow:none;}
+.api-health .worker.employee-card .employee-task{color:#b0bfd0;}
+.api-health .worker.employee-card .employee-state{background:none!important;border:0!important;padding:3px 0;color:var(--state-color,#94a3b8)!important;box-shadow:none;}
+.api-health .worker.employee-card.state-working{--state-color:#22c55e;}
+.api-health .worker.employee-card.state-ready{--state-color:#3b82f6;}
+.api-health .worker.employee-card.state-ondemand{--state-color:#a8b7c9;}
+.api-health .worker.employee-card.state-waiting{--state-color:#fbbf24;}
+.api-health .worker.employee-card.state-attention{--state-color:#fb7185;}
+.api-health .worker.employee-card.state-unknown,
+.api-health .worker.employee-card.state-paused{--state-color:#94a3b8;}
+.api-health .worker.employee-card .employee-live-dot{
+  background:#94a3b8!important;box-shadow:none!important;animation:none!important;
+}
+.api-health .worker.employee-card.state-ready .employee-live-dot{background:#3b82f6!important;box-shadow:none!important;animation:none!important;}
+.api-health .worker.employee-card.state-working .employee-live-dot{background:#22c55e!important;}
+.api-health .worker.employee-card.state-waiting .employee-live-dot{background:#fbbf24!important;}
+.api-health .worker.employee-card.state-attention .employee-live-dot{background:#fb7185!important;}
+.api-health .worker.employee-card .employee-live-line{color:#94a3b8!important;}
+.api-health .worker.employee-card.state-ready .employee-live-line{color:#3b82f6!important;}
+.api-health .worker.employee-card.changed{animation:none!important;}
+/* Workforce modal state coloring resides in work-center-visual.css. */
+/* NV filters match card semantics: working green, ready blue, mixed/source neutral. */
+.api-health .workforce-panel .filters .filter[data-filter="working"]{color:#22c55e!important;}
+.api-health .workforce-panel .filters .filter[data-filter="ready"]{color:#3b82f6!important;}
+.api-health .workforce-panel .filters .filter[data-filter="all"],.api-health .workforce-panel .filters .filter[data-filter="problem"],.api-health .workforce-panel .filters .filter[data-filter="local"],.api-health .workforce-panel .filters .filter[data-filter="cloud"],.api-health .workforce-panel .filters .filter[data-filter="manual"]{color:#cbd5e1!important;}
+.api-health .workforce-panel .filter-divider{display:inline-block;height:20px;width:1px;background:#405069;vertical-align:middle;}
+@media(max-width:700px){.api-health .workforce-panel .filter-divider{display:none;}}

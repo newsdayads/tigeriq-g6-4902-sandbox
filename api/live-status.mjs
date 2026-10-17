@@ -1,0 +1,2333 @@
+import { authorizedDevice } from './live-device-auth.mjs';
+import { parseExecutableIssue, safeAutoWorkAdmission } from '../apps/tigeriq-core/github-intake.mjs';
+import {validateWorkOrderLifecycleV2} from '../apps/tigeriq-core/work-order-lifecycle-v2.mjs';
+import {completionProof} from '../apps/shared/work-center-history.mjs';
+import { parseOwnerBacklogOrder, OWNER_BACKLOG_ISSUE } from '../apps/tigeriq-core/owner-backlog-order.mjs';
+import { parseCodingIssue } from '../apps/tigeriq-core/github-coding-intake.mjs';
+import { discoverNv03MilestoneQa } from '../apps/tigeriq-core/nv03-qa-milestone-inbox.mjs';
+import { hasTerminalBlockedLabel } from '../apps/tigeriq-core/github-lifecycle-label.mjs';
+import { loadSkillPromotionState } from '../apps/tigeriq-core/skill-promotion.mjs';
+import { githubRequestJson, githubTransportSnapshot } from '../apps/tigeriq-core/github-shared-client.mjs';
+import { localizeOwnerFacingText, ownerFacingWorkRow } from '../apps/tigeriq-core/owner-facing-vietnamese.mjs';
+import { annotatePortfolioRows, buildProjectPortfolio, buildPortfolioGroups, mergePortfolioWorkRows } from '../apps/tigeriq-core/project-portfolio.mjs';
+
+const EXTERNAL_ROLE_CLAIMED_LABEL='tigeriq:role-claimed';
+
+function issueLabelNames(issue){
+  return (Array.isArray(issue?.labels)?issue.labels:[])
+    .map((label)=>typeof label==='string'?label:String(label?.name||''))
+    .filter(Boolean);
+}
+
+export function hasRoleClaimedLabel(issue){
+  return issueLabelNames(issue).some((name)=>name.toLowerCase()===EXTERNAL_ROLE_CLAIMED_LABEL);
+}
+
+export function roleClaimedWorkerId(issue){
+  for(const name of issueLabelNames(issue)){
+    const match=String(name).toLowerCase().match(/^tigeriq:role-worker-(nv\d{2})$/);
+    if(match)return match[1].toUpperCase();
+  }
+  return null;
+}
+
+const REPO = process.env.TIGERIQ_REPO || 'newsdayads/tigeriq-ai-lab';
+const REGISTRY_ISSUE = 335;
+const FETCH_TIMEOUT_MS = 5000;
+const CACHE_MS = 3000;
+const STALE_RESPONSE_MS = 30 * 60 * 1000;
+const RUNTIME_POINTER_ISSUE = 1402;
+const RUNTIME_FETCH_TIMEOUT_MS = 4500;
+const POINTER_CACHE_MS = 10 * 60 * 1000;
+const GITHUB_PROJECTION_CACHE_MS = Math.max(30 * 1000, Number(process.env.TIGERIQ_GITHUB_PROJECTION_CACHE_MS || 30 * 1000));
+const DEPENDENCY_CACHE_MS = 60 * 1000;
+const QUEUE_LIMIT = 20;
+const RECENT_WORK_LIMIT = 50;
+const RECENT_WORK_CACHE_MS = 5 * 60 * 1000;
+const LIFECYCLE_COMMENT_CACHE_MS = 60 * 1000;
+const WORKING_HEARTBEAT_MAX_MS = 60 * 1000;
+let pointerCache = { at: 0, url: null };
+let cache = { at: 0, value: null };
+let runtimeCache = { at: 0, value: null };
+let githubProjectionCache = { at: 0, verifiedAt: null, data: null };
+let recentWorkCache = { at: 0, data: null };
+const dependencyCache = new Map();
+const lifecycleCommentCache = new Map();
+
+function json(res, status, body) {
+  res.statusCode = status;
+  res.setHeader('content-type', 'application/json; charset=utf-8');
+  res.setHeader('cache-control', 'no-store');
+  res.setHeader('x-content-type-options', 'nosniff');
+  res.end(JSON.stringify(body));
+}
+
+function repoParts() {
+  const [owner, repo] = REPO.split('/');
+  if (!owner || !repo) throw new Error('invalid_repo');
+  return { owner, repo };
+}
+
+async function gh(path, fetchImpl = fetch) {
+  const token = String(process.env.TIGERIQ_GITHUB_TOKEN || '').trim();
+  return githubRequestJson(fetchImpl,`https://api.github.com${path}`,token,{freshMs:Math.min(GITHUB_PROJECTION_CACHE_MS,60*1000),signal:AbortSignal.timeout(FETCH_TIMEOUT_MS)});
+}
+export function projectionTransportStale(before = {}, after = {}) {
+  return Number(after.staleHits || 0) > Number(before.staleHits || 0)
+    || Number(after.backoffHits || 0) > Number(before.backoffHits || 0);
+}
+export async function ghAllPages(path, fetchImpl = fetch, maxPages = 10) {
+  const rows = [];
+  for (let page = 1; page <= maxPages; page += 1) {
+    const joiner = path.includes('?') ? '&' : '?';
+    const pageArgs = /(?:^|[?&])per_page=/.test(path) ? 'page=' + page : 'per_page=100&page=' + page;
+    const batch = await gh(path + joiner + pageArgs, fetchImpl);
+    if (!Array.isArray(batch)) throw new Error('github_collection_invalid');
+    rows.push(...batch);
+    if (batch.length < 100) return { rows, complete: true };
+  }
+  return { rows, complete: false };
+}
+
+
+function cell(value = '') {
+  return String(value).replace(/`/g, '').replace(/\*\*/g, '').trim();
+}
+
+function workerIdFromText(value = '') {
+  const match = String(value).toUpperCase().match(/(?:^|[^A-Z0-9])(NV\d{2})(?=$|[^A-Z0-9])/);
+  return match?.[1] || null;
+}
+
+function cleanJobTitle(value = '', workerId = '') {
+  return String(value)
+    .replace(new RegExp(`^\\[${workerId}\\]\\s*`, 'i'), '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 180);
+}
+
+export function parseRegistryWorkers(body = '') {
+  const commandMap = new Map();
+  for (const match of String(body).matchAll(/(?:`)?(\d+)↔(NV\d{2})(?:`)?/gi)) {
+    commandMap.set(match[2].toUpperCase(), Number(match[1]));
+  }
+
+  const workers = [];
+  const seen = new Set();
+  for (const line of String(body).split(/\r?\n/)) {
+    if (!line.trim().startsWith('|')) continue;
+    const cells = line.split('|').slice(1, -1).map(cell);
+    const directId = String(cells[0] || '').match(/^NV\d{2}$/i)?.[0]?.toUpperCase();
+    const legacyId = String(cells[1] || '').match(/\bNV\d{2}\b/i)?.[0]?.toUpperCase();
+    const employeeId = directId || legacyId;
+    if (!employeeId || employeeId === 'NV00' || seen.has(employeeId)) continue;
+    seen.add(employeeId);
+
+    const label = directId ? (cells[1] || employeeId) : (cells[5] || cells[1] || employeeId);
+    const adminState = directId ? (cells[2] || '') : (cells[6] || cells[4] || '');
+    workers.push({
+      employeeId,
+      label,
+      command: commandMap.get(employeeId) || null,
+      adminState,
+    });
+  }
+  return workers;
+}
+
+function registryFallback(worker) {
+  const state = String(worker.adminState || '').toUpperCase();
+  if (/PAUSED|RETIRED/.test(state)) {
+    return { state: 'paused', status: 'TẠM NGƯNG', detail: 'Tạm ngưng theo Registry' };
+  }
+  if (/WAIT_KEY|BLOCKED/.test(state)) {
+    return { state: 'blocked', status: 'BỊ CHẶN', detail: 'Không sẵn sàng theo Registry' };
+  }
+  if (/RATE_LIMIT|COOLDOWN|429/.test(state)) {
+    return { state: 'waiting', status: 'CHỜ', detail: 'Đang chờ giới hạn tài nguyên' };
+  }
+  return { state: 'idle', status: 'RẢNH', detail: 'Không có việc GitHub đang chạy' };
+}
+
+function runUpdatedAt(run) {
+  return Date.parse(run?.updated_at || run?.run_started_at || run?.created_at || 0) || 0;
+}
+
+function prUpdatedAt(pr) {
+  return Date.parse(pr?.updated_at || pr?.created_at || 0) || 0;
+}
+
+function runWorker(run) {
+  return workerIdFromText([run?.display_title, run?.name, run?.head_branch].filter(Boolean).join(' '));
+}
+
+function prWorker(pr) {
+  return workerIdFromText([pr?.title, pr?.head?.ref].filter(Boolean).join(' '));
+}
+
+function statusForActiveRun(run) {
+  const status = String(run?.status || '').toLowerCase();
+  if (['queued', 'waiting', 'requested', 'pending'].includes(status)) return { state: 'waiting', status: 'CHỜ' };
+  return { state: 'working', status: 'ĐANG LÀM' };
+}
+
+function progressForBranch(runs, branch) {
+  const recent = runs.filter((run) => run?.head_branch === branch).sort((a, b) => runUpdatedAt(b) - runUpdatedAt(a));
+  const latestByWorkflow = new Map();
+  for (const run of recent) {
+    const key = String(run?.name || run?.workflow_id || run?.id);
+    if (!latestByWorkflow.has(key)) latestByWorkflow.set(key, run);
+  }
+  const batch = [...latestByWorkflow.values()];
+  const passed = batch.filter((run) => run.status === 'completed' && run.conclusion === 'success').length;
+  const failed = batch.filter((run) => run.status === 'completed' && !['success', 'skipped', 'neutral'].includes(String(run.conclusion || ''))).length;
+  const active = batch.filter((run) => run.status !== 'completed').length;
+  return {
+    total: batch.length,
+    passed,
+    failed,
+    active,
+    percent: batch.length ? Math.round((passed / batch.length) * 100) : null,
+    verified: true,
+  };
+}
+
+function sourceFromRun(run, owner, repo) {
+  const prNumber = Array.isArray(run?.pull_requests) ? run.pull_requests[0]?.number : null;
+  if (prNumber) return { type: 'PR', number: prNumber, url: `https://github.com/${owner}/${repo}/pull/${prNumber}` };
+  return { type: 'Workflow', number: run?.run_number || null, url: run?.html_url || null };
+}
+
+export async function buildLiveStatus(fetchImpl = fetch) {
+  const { owner, repo } = repoParts();
+  const [registry, runPayload, pulls] = await Promise.all([
+    gh(`/repos/${owner}/${repo}/issues/${REGISTRY_ISSUE}`, fetchImpl),
+    gh(`/repos/${owner}/${repo}/actions/runs?per_page=100`, fetchImpl),
+    gh(`/repos/${owner}/${repo}/pulls?state=open&sort=updated&direction=desc&per_page=100`, fetchImpl),
+  ]);
+
+  const workers = parseRegistryWorkers(registry.body || '');
+  const runs = Array.isArray(runPayload?.workflow_runs) ? runPayload.workflow_runs : [];
+  const openPulls = Array.isArray(pulls) ? pulls : [];
+
+  const rows = workers.map((worker) => {
+    const workerRuns = runs.filter((run) => runWorker(run) === worker.employeeId).sort((a, b) => runUpdatedAt(b) - runUpdatedAt(a));
+    const activeRuns = workerRuns.filter((run) => run?.status !== 'completed');
+    const workerPulls = openPulls.filter((pr) => prWorker(pr) === worker.employeeId).sort((a, b) => prUpdatedAt(b) - prUpdatedAt(a));
+    const newestActive = activeRuns[0] || null;
+
+    if (newestActive) {
+      const state = statusForActiveRun(newestActive);
+      const progress = progressForBranch(workerRuns, newestActive.head_branch);
+      const source = sourceFromRun(newestActive, owner, repo);
+      if (progress.failed > 0 && progress.active === 0) {
+        state.state = 'blocked';
+        state.status = 'BỊ CHẶN';
+      }
+      return {
+        ...worker,
+        ...state,
+        job: cleanJobTitle(newestActive.display_title || newestActive.name || 'GitHub workflow', worker.employeeId),
+        detail: progress.total
+          ? `${progress.passed}/${progress.total} luồng đạt · ${progress.active} đang chạy${progress.failed ? ` · ${progress.failed} lỗi` : ''}`
+          : 'Workflow đang chạy',
+        updatedAt: newestActive.updated_at || newestActive.run_started_at || newestActive.created_at || null,
+        progress,
+        source,
+      };
+    }
+
+    const openPr = workerPulls[0] || null;
+    if (openPr) {
+      return {
+        ...worker,
+        state: 'waiting',
+        status: 'CHỜ',
+        job: cleanJobTitle(openPr.title || 'Pull request đang mở', worker.employeeId),
+        detail: `PR #${openPr.number} đang mở · chờ kiểm tra/gộp`,
+        updatedAt: openPr.updated_at || openPr.created_at || null,
+        progress: null,
+        source: { type: 'PR', number: openPr.number, url: openPr.html_url || null },
+      };
+    }
+
+    const fallback = registryFallback(worker);
+    const latest = workerRuns[0] || null;
+    return {
+      ...worker,
+      ...fallback,
+      job: fallback.state === 'idle' ? 'Không có việc đang chạy' : fallback.detail,
+      detail: fallback.detail,
+      updatedAt: latest?.updated_at || registry.updated_at || null,
+      progress: null,
+      source: latest ? sourceFromRun(latest, owner, repo) : null,
+    };
+  });
+
+  const order = { working: 0, blocked: 1, waiting: 2, idle: 3, paused: 4 };
+  rows.sort((a, b) => (order[a.state] ?? 9) - (order[b.state] ?? 9) || a.employeeId.localeCompare(b.employeeId));
+
+  const summary = {
+    working: rows.filter((row) => row.state === 'working').length,
+    waiting: rows.filter((row) => row.state === 'waiting').length,
+    blocked: rows.filter((row) => row.state === 'blocked').length,
+    idle: rows.filter((row) => row.state === 'idle').length,
+    paused: rows.filter((row) => row.state === 'paused').length,
+    total: rows.length,
+  };
+
+  return buildWorkSections({
+    ok: true,
+    generatedAt: new Date().toISOString(),
+    refreshSeconds: 10,
+    source: {
+      repository: REPO,
+      registryIssue: REGISTRY_ISSUE,
+      registryUpdatedAt: registry.updated_at || null,
+    },
+    summary,
+    workers: rows.map(ownerFacingWorkRow),
+    liveConnected: false,
+  }, fetchImpl, { runs, pulls: openPulls });
+}
+
+export function parseRuntimeBridgeUrl(body = '') {
+  const match = String(body).match(/^LIVE_STATUS_BRIDGE_URL=(https:\/\/\S+)$/mi);
+  if (!match) throw new Error('runtime_bridge_pointer_missing');
+  const url = new URL(match[1].trim());
+  if (url.protocol !== 'https:' || url.username || url.password) throw new Error('runtime_bridge_pointer_invalid');
+  const host = url.hostname.toLowerCase();
+  if (!(host.endsWith('.trycloudflare.com') || host.endsWith('.ts.net'))) throw new Error('runtime_bridge_host_not_allowed');
+  return url.origin;
+}
+
+function cleanText(value, max = 220) {
+  return String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+function sanitizeRuntimeWorker(worker = {}) {
+  const allowedStates = new Set(['working', 'waiting', 'blocked', 'idle', 'unknown', 'paused']);
+  const employeeId = String(worker.employeeId || '').toUpperCase();
+  if (!/^NV\d{2}$/.test(employeeId)) return null;
+  const state = allowedStates.has(worker.state) ? worker.state : 'unknown';
+  return {
+    employeeId,
+    label: cleanText(worker.label || employeeId, 80),
+    kind: worker.kind === 'ui' ? 'ui' : 'api',
+    state,
+    // UI presence is independent of Work Order acceptance. Retain the bounded,
+    // original Chrome Controller UI phase before the job-evidence gate demotes
+    // an unassigned working chat to UNKNOWN.
+    uiSessionState: worker.kind === 'ui' ? state : null,
+    status: cleanText(worker.status || 'CHƯA RÕ', 32),
+    job: cleanText(worker.job || 'Không có dữ liệu việc hiện tại', 220),
+    detail: cleanText(worker.detail || '', 220),
+    updatedAt: typeof worker.updatedAt === 'string' ? worker.updatedAt.slice(0, 64) : null,
+    heartbeatAt: typeof worker.heartbeatAt === 'string' ? worker.heartbeatAt.slice(0, 64) : null,
+    currentJobId: worker.currentJobId ? cleanText(worker.currentJobId, 100) : null,
+    prNumber: Number.isInteger(worker.prNumber) ? worker.prNumber : null,
+    provider: worker.provider ? cleanText(worker.provider, 64) : null,
+    model: worker.model ? cleanText(worker.model, 100) : null,
+    cooldownUntil: typeof worker.cooldownUntil === 'string' ? worker.cooldownUntil.slice(0, 64) : null,
+    lastError: worker.lastError ? cleanText(worker.lastError, 80) : null,
+    source: 'PC01 live runtime',
+  };
+}
+
+export function normalizeRuntimeWorkerActivity(worker, referenceAt = Date.now()) {
+  if (!worker || worker.state !== 'working') return worker;
+  const heartbeatAt = Date.parse(worker.heartbeatAt || '');
+  const heartbeatAge = Number.isFinite(heartbeatAt) ? Math.max(0, referenceAt - heartbeatAt) : Number.POSITIVE_INFINITY;
+  const hasCurrentJob = Boolean(worker.currentJobId);
+  const heartbeatFresh = heartbeatAge <= WORKING_HEARTBEAT_MAX_MS;
+  if (hasCurrentJob && heartbeatFresh) return worker;
+  const reason = [
+    !hasCurrentJob ? 'thiếu mã việc đang chạy' : '',
+    !heartbeatFresh ? 'heartbeat quá 60 giây' : '',
+  ].filter(Boolean).join(' · ');
+  return {
+    ...worker,
+    state: 'unknown',
+    status: 'CHƯA RÕ',
+    detail: cleanText([worker.detail, reason].filter(Boolean).join(' · '), 220),
+  };
+}
+
+
+export function parseIssueNumber(...values) {
+  for (const value of values) {
+    const text = String(value || '');
+    const match = text.match(/(?:GH-|#|issues\/)(\d{1,6})(?!\d)/i);
+    if (match) return Number(match[1]);
+  }
+  return null;
+}
+
+function bodyValue(body, key) {
+  const escaped = String(key).replace(/[.*+?^$()|[\]\\{}]/g, '\\$&');
+  return String(body || '').match(new RegExp('^' + escaped + '=(.+)$', 'mi'))?.[1]?.trim() || '';
+}
+
+function firstBodyField(body, keys = []) {
+  const wanted = new Set((Array.isArray(keys) ? keys : [keys]).map((key) => String(key || '').trim().toUpperCase()).filter(Boolean));
+  if (!wanted.size) return null;
+  for (const line of String(body || '').split(/\r?\n/)) {
+    const match = line.match(/^([A-Z0-9_]+)=(.*)$/i);
+    if (!match) continue;
+    const key = String(match[1] || '').toUpperCase();
+    if (!wanted.has(key)) continue;
+    return { key, value: String(match[2] || '').trim() };
+  }
+  return null;
+}
+
+function firstBodyValue(body, keys = []) {
+  return firstBodyField(body, keys)?.value || '';
+}
+
+function issueIsAppChromeControlPlane(issue) {
+  const text = [issue?.title, issue?.body].filter(Boolean).join('\n');
+  return /(?:\bAPP[-_ ]CHROME\b|apps\/chrome-controller\/|RESOURCE_SCOPE=APP_CHROME_)/i.test(text);
+}
+
+function bodyFlag(body, key, value = 'true') {
+  return bodyValue(body, key).toLowerCase() === String(value).toLowerCase();
+}
+
+function safeEvidenceUrl(value = '') {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === 'https:' ? parsed.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+function safeEvidenceTimestamp(value = '') {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+}
+
+function commentField(body, key) {
+  const direct = bodyValue(body, key);
+  if (direct) return direct;
+  const wanted = String(key || '').trim().toUpperCase();
+  for (const line of String(body || '').split(/\r?\n/)) {
+    const parts = line.split('|');
+    if (parts.length < 2) continue;
+    if (String(parts.shift() || '').trim().toUpperCase() !== wanted) continue;
+    return parts.join('|').trim();
+  }
+  return '';
+}
+
+function ownerResultField(body = '', labels = []) {
+  const wanted = (Array.isArray(labels) ? labels : [labels]).map((value) => String(value || '').trim()).filter(Boolean);
+  const specials = '\\.^$*+?()[]{}|';
+  for (const line of String(body || '').split(/\r?\n/)) {
+    const normalized = line.replace(/^\s*[-*]\s*/, '').trim();
+    for (const label of wanted) {
+      const escaped = [...label].map((char) => specials.includes(char) ? '\\' + char : char).join('');
+      const match = normalized.match(new RegExp('^' + escaped + '\\s*(?:=|:|\\|)\\s*(.+)$', 'i'));
+      if (match?.[1]) return match[1].trim();
+    }
+  }
+  return '';
+}
+
+function firstHttpsUrl(value = '') {
+  const match = String(value || '').match(/https:\/\/[^\s)>\]}]+/i);
+  return match ? safeEvidenceUrl(match[0].replace(/[.,;]+$/, '')) : null;
+}
+
+export function parseOwnerResultComment(comment = {}) {
+  const body = String(comment?.body || '');
+  const marker = /(?:✅\s*)?\[KẾT QUẢ THỰC TẾ\]\s*/giu;
+  const matches = [...body.matchAll(marker)];
+  if (!matches.length) return [];
+  const rows = [];
+  for (let index = 0; index < matches.length; index += 1) {
+    const match = matches[index];
+    const start = Number(match.index || 0) + match[0].length;
+    const end = index + 1 < matches.length ? Number(matches[index + 1].index || body.length) : body.length;
+    const block = body.slice(start, end).trim();
+    const lines = block.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const header = lines[0] || '';
+    const identity = header.match(/^#(\d+)\s*-\s*(.+)$/u);
+    if (!identity) continue;
+
+    const resultField = ownerResultField(block, ['RESULT']);
+    const narrativeLine = lines.find((line) => /(?:✅\s*)?\[KẾT QUẢ\]/iu.test(line)) || '';
+    const narrative = narrativeLine.replace(/^.*?(?:✅\s*)?\[KẾT QUẢ\]\s*/iu, '').trim();
+    const result = localizeOwnerFacingText(cleanText(resultField || narrative || 'Đã hoàn tất', 420));
+
+    const explicitVerification = ownerResultField(block, ['VERIFICATION', 'VERIFY', 'XÁC MINH']);
+    const completionState = /Trạng thái\s*:\s*(?:HOÀN TẤT|COMPLETED|DONE)/iu.test(block);
+    const verification = localizeOwnerFacingText(cleanText(
+      explicitVerification || (/^(?:PASS|ĐẠT)$/iu.test(resultField) ? resultField : completionState ? 'HOÀN TẤT' : 'CHƯA XÁC MINH'),
+      120,
+    ));
+
+    const liveLocation = cleanText(ownerResultField(block, ['LIVE URL/location', 'LIVE URL', 'LIVE_URL', 'LIVE_LOCATION', 'LOCATION']), 320) || null;
+    const evidence = cleanText(ownerResultField(block, ['Evidence', 'Bằng chứng']), 420) || null;
+    const source = cleanText(ownerResultField(block, ['Nguồn', 'SOURCE']), 420) || null;
+    const completedRaw = ownerResultField(block, ['Completed at', 'COMPLETED_AT', 'COMPLETED']);
+    const completedAt = safeEvidenceTimestamp(completedRaw)
+      || safeEvidenceTimestamp(comment?.created_at)
+      || safeEvidenceTimestamp(comment?.updated_at)
+      || null;
+
+    rows.push({
+      workOrderNumber: Number(identity[1]),
+      workOrder: '#' + identity[1] + ' - ' + cleanText(identity[2], 220),
+      title: cleanText(identity[2], 220),
+      result,
+      verification,
+      liveLocation,
+      liveUrl: firstHttpsUrl(liveLocation),
+      evidence,
+      evidenceUrl: firstHttpsUrl(evidence),
+      workOrderUrl: firstHttpsUrl(source),
+      completedAt,
+      commentId: Number(comment?.id) || null,
+      sourceCommentUrl: safeEvidenceUrl(comment?.html_url || ''),
+    });
+  }
+  return rows;
+}
+
+export function projectOwnerResultInbox(issue = {}, comments = []) {
+  const rows = (Array.isArray(comments) ? comments : [])
+    .flatMap((comment) => parseOwnerResultComment(comment))
+    .sort((a, b) => Date.parse(b.completedAt || 0) - Date.parse(a.completedAt || 0) || Number(b.commentId || 0) - Number(a.commentId || 0));
+  return {
+    ownerResultInbox: bodyFlag(issue?.body || '', 'RESULT_INBOX'),
+    ownerResultsStatus: 'ready',
+    ownerResultCount: rows.length,
+    ownerResults: rows,
+  };
+}
+
+async function ownerResultInboxProjection(openIssues, owner, repo, fetchImpl = fetch) {
+  const issue = (Array.isArray(openIssues) ? openIssues : []).find((item) => bodyFlag(item?.body || '', 'RESULT_INBOX'));
+  if (!issue) return null;
+  const issueNumber = Number(issue.number);
+  try {
+    const comments = await gh('/repos/' + owner + '/' + repo + '/issues/' + issueNumber + '/comments?per_page=100', fetchImpl);
+    return { issueNumber, ...projectOwnerResultInbox(issue, comments) };
+  } catch (error) {
+    return {
+      issueNumber,
+      ownerResultInbox: true,
+      ownerResultsStatus: 'unavailable',
+      ownerResultCount: null,
+      ownerResults: [],
+      ownerResultsError: cleanText(String(error instanceof Error ? error.message : error), 120),
+    };
+  }
+}
+
+export function parseStructuredLifecycleComment(comment = {}) {
+  const body = String(comment?.body || '');
+  const state = (commentField(body, 'CURRENT_STATE') || commentField(body, 'STATE')).trim();
+  const step = (commentField(body, 'CURRENT_STEP') || commentField(body, 'ACTION')).trim();
+  const nextStep = (commentField(body, 'NEXT') || commentField(body, 'NEXT_ACTION')).trim();
+  const blocker = (commentField(body, 'BLOCKER') || commentField(body, 'BLOCKED_REASON')).trim();
+  const mutationOwner = commentField(body, 'MUTATION_OWNER').trim();
+  const doneRaw = commentField(body, 'DONE').trim().toLowerCase();
+  if (!state && !step && !nextStep && !blocker && !doneRaw) return null;
+  return {
+    state: state ? state.toUpperCase() : null,
+    blocker: blocker || null,
+    blockerCleared: Boolean(blocker && /^none(?:\b|\s|$)/i.test(blocker)),
+    step: step || null,
+    nextStep: nextStep || null,
+    mutationOwner: mutationOwner || null,
+    done: ['true','1','yes'].includes(doneRaw),
+    createdAt: comment?.created_at || comment?.updated_at || null,
+  };
+}
+
+export function parseClearedBlockerLifecycleComment(comment = {}) {
+  const parsed = parseStructuredLifecycleComment(comment);
+  if (!parsed?.state || !parsed.blockerCleared) return null;
+  return {
+    ...parsed,
+    step: parsed.nextStep || parsed.step || null,
+  };
+}
+
+function statusFromLifecycleState(state = '') {
+  const value = String(state || '').toUpperCase();
+  if (!value) return null;
+  // A composite state like OPEN_BLOCKED_*_LIVE_ACCEPTANCE remains blocked,
+  // not verified/pending just because it names a future acceptance stage.
+  if (/(?:^|_)(?:BLOCKED|ERROR|FAILED)(?:_|$)/.test(value)) return 'BLOCKED';
+  if (/REBOOT_NEXT|WAIT|PENDING|HOLD/.test(value)) return 'WAITING';
+  if (/REVIEW|VERIFY/.test(value)) return 'REVIEW';
+  if (/INSTALL|UPDATE|APPLY|RUNNING|WORKING|IN_PROGRESS|EXECUTING|CODING_LANE_ACTIVE|(?:^|_)ACTIVE(?:_|$)/.test(value)) return 'WORKING';
+  if (/READY|QUEUED/.test(value)) return 'QUEUED';
+  return 'OPEN';
+}
+
+function issuePriority(issue) {
+  const body = String(issue?.body || '');
+  return bodyValue(body, 'PRIORITY').match(/^P[0-5]$/i)?.[0]?.toUpperCase()
+    || String(issue?.title || '').match(/^\[(P[0-5])\]/i)?.[1]?.toUpperCase()
+    || null;
+}
+
+function issueEmployeeId(issue) {
+  const body = String(issue?.body || '');
+  const authority = firstBodyField(body, [
+    'MUTATION_OWNER',
+    'ASSIGNED_EXECUTOR',
+    'EXECUTOR',
+    'TARGET_EMPLOYEE',
+    'PRIMARY_EMPLOYEE',
+    'IMPLEMENTER',
+    'PREFERRED_REVIEWER',
+    'REVIEWER',
+  ]);
+  if (authority) {
+    const id = workerIdFromText(authority.value);
+    if (id) return id;
+    if (['MUTATION_OWNER','ASSIGNED_EXECUTOR','EXECUTOR'].includes(authority.key)) return null;
+  }
+  if (issueIsAppChromeControlPlane(issue)) return null;
+  return workerIdFromText(issue?.title || '');
+}
+
+function issueIsTerminal(issue) {
+  if (!issue || issue.pull_request || issue.state !== 'open') return true;
+  const body = String(issue.body || '');
+  const state = firstBodyValue(body, ['CURRENT_STATE', 'STATE']).toUpperCase();
+  return ['CLOSED', 'DONE', 'COMPLETED', 'SUPERSEDED', 'CANCELLED'].includes(state)
+    || /^SUPERSEDED(?:_BY)?=/mi.test(body);
+}
+
+function issueIsTerminalOrExcluded(issue) {
+  if (issueIsTerminal(issue)) return true;
+  const body = String(issue.body || '');
+  const state = bodyValue(body, 'STATE').toUpperCase();
+  return state === 'EXCLUDED' || bodyFlag(body, 'EXCLUDED') || bodyValue(body, 'AUTO_QUEUE').toUpperCase() === 'EXCLUDED';
+}
+
+
+function firstWorkflowRef(body = '', key = '') {
+  const raw = bodyValue(body, key);
+  const match = String(raw || '').match(/#?(\d{1,8})(?!\d)/);
+  return match ? Number(match[1]) : null;
+}
+
+function workflowRefList(body = '', key = '') {
+  const raw = bodyValue(body, key);
+  return [...new Set((String(raw || '').match(/#?\d{1,8}/g) || [])
+    .map((value) => Number(value.replace('#', '')))
+    .filter(Boolean))].slice(0, 16);
+}
+
+export function workflowRelationsForIssue(issue) {
+  const body = String(issue?.body || '');
+  return {
+    parentNumber: firstWorkflowRef(body, 'PARENT'),
+    sourceNumber: firstWorkflowRef(body, 'SOURCE'),
+    targetPrNumber: firstWorkflowRef(body, 'TARGET_PR'),
+    sourcePrNumber: firstWorkflowRef(body, 'SOURCE_PR'),
+    dependsOn: workflowRefList(body, 'DEPENDS_ON'),
+    supersedesNumbers: workflowRefList(body, 'SUPERSEDES'),
+    capability: bodyValue(body, 'CAPABILITY').trim().toLowerCase() || null,
+    reviewOnly: bodyFlag(body, 'REVIEW_ONLY'),
+  };
+}
+
+export function parseRecentCompletedIssue(issue, now = Date.now()) {
+  if (!issue || issue.pull_request || issue.state !== 'closed') return null;
+  if (String(issue.state_reason || '').toLowerCase() !== 'completed') return null;
+  const proof=completionProof(issue);
+  if (!proof.verified) return null;
+  const body = String(issue.body || '');
+  const acceptance = ownerAcceptancePolicy(body);
+  if (acceptance.required && !acceptance.accepted) return null;
+  const terminalState = bodyValue(body, 'STATE').toUpperCase();
+  if (['CANCELLED', 'CANCELED', 'SUPERSEDED', 'NOT_PLANNED'].includes(terminalState)) return null;
+  if (/^SUPERSEDED(?:_BY)?=/mi.test(body)) return null;
+  const completedAt = issue.closed_at || issue.updated_at || null;
+  const completedMs = Date.parse(completedAt || '');
+  if (!Number.isFinite(completedMs) || completedMs > now) return null;
+  const classification = classifyOpenIssue(issue);
+  if (classification.workKind !== 'WORK') return null;
+  const priority = issuePriority(issue);
+  const relations = workflowRelationsForIssue(issue);
+  const assignedEmployee=issueEmployeeId(issue);
+  const hasNv02CompletionProof=issueLabelNames(issue).some(label=>label.toLowerCase()==='tigeriq:completed-by-nv02');
+  const completedEmployee=hasNv02CompletionProof&&(!assignedEmployee||assignedEmployee==='NV02')?'NV02':assignedEmployee;
+  return {
+    number: Number(issue.number),
+    title: String(issue.title || ''),
+    priority,
+    effectivePriority: priority,
+    sourcePriority: priority,
+    employeeId: completedEmployee,
+    status: 'DONE',
+    workKind: 'WORK',
+    ...relations,
+    progressPercent: 100,
+    progressSource: 'terminal',
+    progressDetail: 'Đã nghiệm thu đủ các bước và biên nhận V2',
+    progressChecklistVerified: true,
+    progressDone: proof.checkedSteps,
+    progressTotal: proof.checkedSteps,
+    lifecycleTiming: proof.timing,
+    lifecycleContract: proof.contract,
+    completionVerified: true,
+    completedAt,
+    updatedAt: completedAt,
+    url: issue.html_url || null,
+  };
+}
+
+export function parseRecentClosedIssue(issue, now = Date.now()) {
+  const verified = parseRecentCompletedIssue(issue, now);
+  if (verified) return verified;
+  if (!issue || issue.pull_request || issue.state !== 'closed') return null;
+  const reason = String(issue.state_reason || '').toLowerCase();
+  if (reason === 'not_planned' || reason === 'duplicate') return null;
+  const body = String(issue.body || '');
+  if (['CANCELLED','CANCELED','SUPERSEDED','NOT_PLANNED'].includes(bodyValue(body,'STATE').toUpperCase()) ||
+      /^SUPERSEDED(?:_BY)?=/mi.test(body)) return null;
+  const closedAt = issue.closed_at || issue.updated_at || null;
+  const ms = Date.parse(closedAt || '');
+  if (!Number.isFinite(ms) || ms > now) return null;
+  const classification = classifyOpenIssue(issue);
+  if (classification.workKind !== 'WORK') return null;
+  const priority = issuePriority(issue);
+  return {
+    number: Number(issue.number), title: String(issue.title || ''),
+    priority, effectivePriority: priority, sourcePriority: priority,
+    employeeId: issueEmployeeId(issue),
+    status: 'CLOSED_UNVERIFIED', workKind: 'WORK',
+    ...workflowRelationsForIssue(issue),
+    progressPercent: null, progressSource: 'closed_unverified',
+    progressDetail: 'Đã đóng trên GitHub; chưa xác minh nghiệm thu',
+    completionVerified: false,
+    lifecycleTiming: validateWorkOrderLifecycleV2(issue).timestamps,
+    closedAt, updatedAt: closedAt, url: issue.html_url || null,
+  };
+}
+
+async function recentCompletedWork(owner, repo, fetchImpl = fetch) {
+  const now = Date.now();
+  if (recentWorkCache.data && now - recentWorkCache.at < RECENT_WORK_CACHE_MS) {
+    return recentWorkCache.data;
+  }
+  try {
+    const pageSet = await ghAllPages('/repos/' + owner + '/' + repo + '/issues?state=closed&per_page=100&sort=updated&direction=desc', fetchImpl, 10);
+    const candidates = (Array.isArray(pageSet.rows) ? pageSet.rows : [])
+      .map((issue) => parseRecentClosedIssue(issue, now))
+      .filter((row) => row && String(row.priority || '').toUpperCase() !== 'P5')
+      .sort((a, b) => Date.parse(b.closedAt || b.completedAt || 0) - Date.parse(a.closedAt || a.completedAt || 0));
+    const rows = candidates.slice(0, RECENT_WORK_LIMIT);
+    const boundedScopeComplete = pageSet.complete === true || rows.length === RECENT_WORK_LIMIT;
+    const value = {
+      rows,
+      completedCount: rows.filter((row)=>row.completionVerified===true).length,
+      archivedCount: rows.filter((row)=>row.status==='CLOSED_UNVERIFIED').length,
+      complete: boundedScopeComplete,
+      stale: false,
+      scope: 'recent_' + RECENT_WORK_LIMIT + '_completed_plus_current_open',
+    };
+    recentWorkCache = { at: now, data: value };
+    return value;
+  } catch {
+    if (recentWorkCache.data) return { ...recentWorkCache.data, complete: false, stale: true };
+    return { rows: [], completedCount: 0, archivedCount: 0, complete: false, stale: true, scope: 'recent_' + RECENT_WORK_LIMIT + '_completed_plus_current_open' };
+  }
+}
+
+function queueWaitReason(issue) {
+  const body = String(issue?.body || '');
+  const state = bodyValue(body, 'STATE').toUpperCase();
+  if (bodyFlag(body, 'OWNER_HOLD') || state === 'OWNER_HOLD' || state === 'MANUAL_HOLD') return 'OWNER_HOLD';
+  if (state.includes('BLOCKED')) return bodyValue(body, 'BLOCKER') || bodyValue(body, 'BLOCKED_REASON') || state;
+  if (/^(?:WAIT|PENDING)/.test(state)) return state;
+  return null;
+}
+
+function queueDependencies(issue) {
+  const raw = bodyValue(issue?.body || '', 'DEPENDS_ON');
+  return [...new Set((raw.match(/#?\d+/g) || []).map((value) => Number(value.replace('#', ''))).filter(Boolean))].slice(0, 16);
+}
+
+
+const COMPLETION_SCOPE_REF_KEYS = /^(?:PARENT|DEPENDS_ON|CHILD(?:_[A-Z0-9]+)?|FINAL_ACCEPTANCE|BLOCKER|CURRENT_BLOCKER|ACTIVE_CHILD)$/i;
+export function completionScopeReferenceNumbers(body = '') {
+  const refs = new Set();
+  for (const line of String(body || '').split(/\r?\n/)) {
+    const match = line.match(/^([A-Z0-9_]+)=(.*)$/i);
+    if (!match || !COMPLETION_SCOPE_REF_KEYS.test(String(match[1] || ''))) continue;
+    for (const token of String(match[2] || '').matchAll(/#(\d{1,8})(?!\d)/g)) refs.add(Number(token[1]));
+  }
+  return [...refs];
+}
+
+async function scopedCompletedWork(openIssues, openRows, owner, repo, issueMap, fetchImpl = fetch) {
+  const currentOpen = new Set((Array.isArray(openRows) ? openRows : [])
+    .filter((row) => row?.workKind === 'WORK' && String(row.priority || row.effectivePriority || '').toUpperCase() !== 'P5')
+    .map((row) => Number(row.number)).filter(Boolean));
+  const sourceIssues = (Array.isArray(openIssues) ? openIssues : []).filter((issue) => currentOpen.has(Number(issue?.number)));
+  const refs = new Set(sourceIssues.flatMap((issue) => completionScopeReferenceNumbers(issue?.body || '')));
+  for (const number of currentOpen) refs.delete(number);
+  if (refs.size > 100) return { rows: [], complete: false, reason: 'scope_reference_limit', referenced: refs.size };
+  const resolved = await Promise.all([...refs].map(async (number) => {
+    const issue = await githubIssue(owner, repo, number, issueMap, fetchImpl);
+    return { number, issue };
+  }));
+  if (resolved.some(({ issue }) => !issue)) {
+    return { rows: [], complete: false, reason: 'scope_reference_unresolved', referenced: refs.size };
+  }
+  const rows = resolved
+    .map(({ issue }) => parseRecentCompletedIssue(issue))
+    .filter((row) => row && !currentOpen.has(Number(row.number)))
+    .sort((a, b) => Date.parse(b.completedAt || 0) - Date.parse(a.completedAt || 0));
+  return {
+    rows,
+    complete: true,
+    referenced: refs.size,
+    completedItems: rows.length,
+    scope: 'current_open_plus_structural_references',
+  };
+}
+
+export function parseQueueIssue(issue) {
+  if (issueIsTerminalOrExcluded(issue)) return null;
+  const coreSpec = parseExecutableIssue(issue);
+  const codingSpec = parseCodingIssue(issue);
+  if (!coreSpec && !codingSpec) return null;
+  const terminalBlocked = hasTerminalBlockedLabel(issue);
+  const roleClaimed = hasRoleClaimedLabel(issue);
+  const holdReason = terminalBlocked ? 'TigerIQ terminal BLOCKED' : roleClaimed ? 'External role claim' : queueWaitReason(issue);
+  const effectivePriority = codingSpec?.priority || coreSpec?.priority || issuePriority(issue) || 'P3';
+  const sourcePriority = codingSpec?.sourcePriority || coreSpec?.sourcePriority || issuePriority(issue) || effectivePriority;
+  return {
+    number: Number(issue.number),
+    title: String(issue.title || ''),
+    priority: effectivePriority,
+    effectivePriority,
+    sourcePriority,
+    ownerControlled: Boolean(codingSpec?.ownerControlled ?? coreSpec?.ownerControlled ?? false),
+    ownerDirect: Boolean(codingSpec?.ownerDirect ?? coreSpec?.ownerDirect ?? bodyFlag(issue?.body || '', 'OWNER_DIRECT')),
+    route: codingSpec ? 'CODING' : (coreSpec?.route || coreSpec?.dispatchLane || null),
+    resourceScope: codingSpec?.scopeLease?.resourceScope || coreSpec?.resourceScope || bodyValue(issue?.body || '', 'RESOURCE_SCOPE') || null,
+    status: terminalBlocked || (holdReason && /BLOCKED/.test(holdReason)) ? 'BLOCKED' : holdReason ? 'WAITING' : 'QUEUED',
+    waitReason: holdReason,
+    dependencies: codingSpec?.dependsOn || queueDependencies(issue),
+    updatedAt: issue.updated_at || null,
+    url: issue.html_url || null,
+  };
+}
+
+function queuePriority(row) {
+  return String(row?.effectivePriority || row?.priority || 'P3').toUpperCase();
+}
+
+export function queueRowEligibleNow(row) {
+  return String(row?.status || '').toUpperCase() === 'QUEUED' && /^P[1-5]$/.test(queuePriority(row));
+}
+
+export function compareQueueRows(a, b) {
+  const aEligible = queueRowEligibleNow(a);
+  const bEligible = queueRowEligibleNow(b);
+  if (aEligible !== bEligible) return aEligible ? -1 : 1;
+  const rank = { P0: 0, P1: 1, P2: 2, P3: 3, P4: 4, P5: 5 };
+  const aPriorityRank = !aEligible && queuePriority(a) === 'P0' ? 6 : (rank[queuePriority(a)] ?? rank.P3);
+  const bPriorityRank = !bEligible && queuePriority(b) === 'P0' ? 6 : (rank[queuePriority(b)] ?? rank.P3);
+  const delta = aPriorityRank - bPriorityRank;
+  if (delta) return delta;
+  if (aEligible && bEligible && Boolean(a?.ownerDirect) !== Boolean(b?.ownerDirect)) return a?.ownerDirect ? -1 : 1;
+  const waitRank = { WAITING: 0, BLOCKED: 1, QUEUED: 2 };
+  const waitDelta = (waitRank[String(a?.status || '').toUpperCase()] ?? 3) - (waitRank[String(b?.status || '').toUpperCase()] ?? 3);
+  if (waitDelta) return waitDelta;
+  return Number(a?.number || 0) - Number(b?.number || 0);
+}
+
+export function rankQueueRows(rows = []) {
+  let dispatchRank = 0;
+  return (Array.isArray(rows) ? rows : []).map((row) => {
+    const priority = queuePriority(row);
+    const p0Waiting = String(row?.status || '').toUpperCase() === 'QUEUED' && priority === 'P0';
+    const normalized = p0Waiting
+      ? { ...row, status: 'WAITING', waitReason: row.waitReason || 'P0 chờ Owner/assignment' }
+      : row;
+    return normalized;
+  }).sort(compareQueueRows).map((row) => {
+    const eligibleNow = queueRowEligibleNow(row);
+    return {
+      ...row,
+      eligibleNow,
+      dispatchRank: eligibleNow ? ++dispatchRank : null,
+    };
+  });
+}
+
+function runtimeState(state) {
+  if (state === 'working') return 'WORKING';
+  if (state === 'blocked') return 'BLOCKED';
+  if (state === 'waiting') return 'WAITING';
+  return null;
+}
+
+function normalizedRuntimeTitle(value = '') {
+  return String(value || '')
+    .replace(/\s+\[(?:sửa lần|repair|retry)\s+\d+\]\s*$/iu, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// NV02 self-pull leases have a two-hour TTL. Labels are projections, not
+// perpetual proof: a stale/missing GitHub update must not keep NV02 WORKING.
+export function projectExternalRoleClaims(base = {}, issues = [], nowMs = Date.now()) {
+  const claims = new Map();
+  for (const issue of (Array.isArray(issues) ? issues : [])) {
+    if (!issue || issue.pull_request || issue.state !== 'open' || !hasRoleClaimedLabel(issue)) continue;
+    const workerId = roleClaimedWorkerId(issue);
+    if (!/^NV(?:02|03|04)$/.test(String(workerId || ''))) continue;
+    if (workerId === 'NV02') {
+      const claimAt=Date.parse(issue.updated_at || '');
+      if (!Number.isFinite(claimAt) || claimAt > nowMs + 60_000 || nowMs - claimAt >= 2 * 60 * 60 * 1000) continue;
+    }
+    const previous = claims.get(workerId);
+    const currentAt = Date.parse(issue.updated_at || '') || 0;
+    const previousAt = Date.parse(previous?.updated_at || '') || 0;
+    if (!previous || currentAt >= previousAt) claims.set(workerId, issue);
+  }
+  if (!claims.size) return base;
+
+  const workers = (Array.isArray(base?.workers) ? base.workers : []).map((worker) => {
+    const issue = claims.get(String(worker?.employeeId || '').toUpperCase());
+    if (!issue) return worker;
+    return {
+      ...worker,
+      state: 'working',
+      status: 'ĐANG LÀM',
+      job: `#${issue.number} - ${String(issue.title || '')}`,
+      detail: 'Đã có nhân sự ngoài Core nhận việc · nhãn GitHub canonical',
+      currentJobId: `GH-${issue.number}`,
+      updatedAt: issue.updated_at || worker?.updatedAt || null,
+      source: 'GitHub external role claim',
+    };
+  });
+  const summary = {
+    ...(base?.summary || {}),
+    working: workers.filter((w) => w?.state === 'working').length,
+    waiting: workers.filter((w) => w?.state === 'waiting').length,
+    blocked: workers.filter((w) => w?.state === 'blocked').length,
+    idle: workers.filter((w) => w?.state === 'idle').length,
+    unknown: workers.filter((w) => w?.state === 'unknown').length,
+    paused: workers.filter((w) => w?.state === 'paused').length,
+    total: workers.length,
+  };
+  return { ...base, workers, summary };
+}
+
+export function runtimeWorkRows(workers = [], issues = []) {
+  const rows = [];
+  const seen = new Set();
+  const openIssues = (Array.isArray(issues) ? issues : []).filter((issue) => issue && !issue.pull_request && issue.state === 'open');
+  for (const worker of workers) {
+    const status = runtimeState(worker?.state);
+    if (!status) continue;
+    let issueNumber = parseIssueNumber(worker?.currentJobId, worker?.job, worker?.detail);
+    if (!issueNumber) {
+      const jobTitle = normalizedRuntimeTitle(worker?.job);
+      if (jobTitle) {
+        const matches = openIssues.filter((issue) => normalizedRuntimeTitle(issue?.title) === jobTitle);
+        if (matches.length === 1) issueNumber = Number(matches[0].number);
+      }
+    }
+    if (!issueNumber) continue;
+    const key = issueNumber + ':' + String(worker?.employeeId || '');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rows.push({
+      issueNumber,
+      employeeId: worker.employeeId || null,
+      runtimeStatus: status,
+      currentStep: cleanText(worker.detail || worker.job || '', 220) || null,
+      updatedAt: worker.heartbeatAt || worker.updatedAt || null,
+      prNumber: Number.isInteger(worker.prNumber) ? worker.prNumber : null,
+      source: 'PC01 live runtime',
+    });
+  }
+  return rows;
+}
+
+function pullMentionsIssue(pull, issueNumber) {
+  const n = String(issueNumber);
+  const text = [pull?.title, pull?.body, pull?.head?.ref].filter(Boolean).join('\n');
+  return new RegExp('(?:#|GH-|issue[-_/ ])' + n + '(?!\\d)', 'i').test(text);
+}
+
+function summarizeChecks(runs, pull) {
+  if (!pull) return null;
+  const branch = pull?.head?.ref;
+  const branchRuns = (Array.isArray(runs) ? runs : []).filter((run) => run?.head_branch === branch);
+  const latest = new Map();
+  for (const run of branchRuns.sort((a, b) => runUpdatedAt(b) - runUpdatedAt(a))) {
+    const key = String(run?.name || run?.workflow_id || run?.id);
+    if (!latest.has(key)) latest.set(key, run);
+  }
+  const batch = [...latest.values()];
+  if (!batch.length) return null;
+  const active = batch.filter((run) => run?.status !== 'completed').length;
+  const failed = batch.filter((run) => run?.status === 'completed' && !['success', 'neutral', 'skipped'].includes(String(run?.conclusion || ''))).length;
+  const passed = batch.filter((run) => run?.status === 'completed' && run?.conclusion === 'success').length;
+  return { state: failed ? 'LỖI' : active ? 'ĐANG CHẠY' : 'ĐẠT', passed, total: batch.length, active, failed };
+}
+
+async function dependencyStates(rows, owner, repo, fetchImpl) {
+  const deps = [...new Set(rows.flatMap((row) => row.dependencies || []))];
+  const results = new Map();
+  const now = Date.now();
+  await Promise.all(deps.map(async (number) => {
+    const cached = dependencyCache.get(number);
+    if (cached && now - cached.at < DEPENDENCY_CACHE_MS) {
+      results.set(number, cached.value);
+      return;
+    }
+    try {
+      const dep = await gh('/repos/' + owner + '/' + repo + '/issues/' + number, fetchImpl);
+      const value = { state: dep?.state || 'unknown', isPull: Boolean(dep?.pull_request) };
+      dependencyCache.set(number, { at: now, value });
+      results.set(number, value);
+    } catch {
+      const value = cached?.value || { state: 'unknown' };
+      results.set(number, value);
+    }
+  }));
+  return results;
+}
+
+function issueCanonicalState(issue) {
+  const body = String(issue?.body || '');
+  return firstBodyValue(body, ['CURRENT_STATE', 'STATE']).toUpperCase();
+}
+
+async function latestStructuredLifecycleOverrides(issues, owner, repo, fetchImpl = fetch) {
+  const candidates = (Array.isArray(issues) ? issues : [])
+    .filter((issue) => issue && !issue.pull_request && issue.state === 'open'
+      && /^P[0-5]$/.test(String(issuePriority(issue) || ''))
+)
+    .sort((a, b) => Date.parse(b?.updated_at || 0) - Date.parse(a?.updated_at || 0))
+    .slice(0, Math.max(QUEUE_LIMIT, 40));
+  const pairs = await Promise.all(candidates.map(async (issue) => {
+    const number = Number(issue.number);
+    const now = Date.now();
+    const cached = lifecycleCommentCache.get(number);
+    if (cached && cached.issueUpdatedAt === issue?.updated_at && now - cached.at < LIFECYCLE_COMMENT_CACHE_MS) {
+      return [number, cached.value];
+    }
+    let value = null;
+    try {
+      const commentsCount = Math.max(0, Number(issue?.comments || 0));
+      if (commentsCount > 0) {
+        const lastPage = Math.max(1, Math.ceil(commentsCount / 100));
+        const comments = await gh('/repos/' + owner + '/' + repo + '/issues/' + number + '/comments?per_page=100&page=' + lastPage, fetchImpl);
+        const rows = Array.isArray(comments) ? comments : [];
+        const latest = rows.filter((comment) => Number.isFinite(Date.parse(comment?.created_at || '')))
+          .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0];
+        const issueAt = Date.parse(issue?.updated_at || '') || 0;
+        let structured = null;
+        for (let i = rows.length - 1; i >= 0; i -= 1) {
+          const parsed = parseStructuredLifecycleComment(rows[i]);
+          if (!parsed) continue;
+          const commentAt = Date.parse(parsed.createdAt || '') || 0;
+          if (issueAt && commentAt && commentAt + 60_000 < issueAt) break;
+          structured = parsed;
+          break;
+        }
+        // Recorded GitHub comment != verified AI execution/transition. It is
+        // still a real timestamped activity entry in the Owner audit journal.
+        if (latest) value = {
+          ...(structured || {}),
+          lastActivityAt: latest.created_at,
+          lastActivitySource: 'github_issue_comment',
+          lastActivitySummary: String(latest.body || '').replace(/\s+/g, ' ').trim().slice(0, 180),
+          lastActivityAuthor: String(latest.user?.login || '').slice(0, 65),
+          lastActivityUrl: /^https:\/\/github\.com\/newsdayads\/tigeriq-ai-lab\/issues\/\d+#issuecomment-\d+$/.test(String(latest.html_url || ''))
+            ? latest.html_url : null,
+        };
+        else value = structured;
+      }
+    } catch {
+      // Keep canonical body truth if comment readback is unavailable.
+    }
+    lifecycleCommentCache.set(number, { at: now, issueUpdatedAt: issue?.updated_at || null, value });
+    return [number, value];
+  }));
+  return new Map(pairs.filter(([, value]) => value));
+}
+
+function ownerAcceptancePolicy(body = '') {
+  const required = bodyFlag(body, 'OWNER_ACCEPTANCE_REQUIRED')
+    || bodyFlag(body, 'NEW_CAPABILITY_OWNER_ACCEPTANCE_REQUIRED');
+  const accepted = bodyFlag(body, 'OWNER_ACCEPTED')
+    || bodyFlag(body, 'OWNER_ACCEPTANCE_ACCEPTED');
+  return { required, accepted };
+}
+
+function ownerAcceptancePhase(phase = '') {
+  return /(?:OWNER_REVIEW_REQUIRED|WAIT_OWNER(?:_ACCEPTANCE|_REVIEW|_APPROVAL)?|READY_OWNER(?:_ACCEPTANCE|_REVIEW|_APPROVAL)?|WAIT_OWNER_APPROVAL|READY_FOR_OWNER_APPROVAL)/.test(String(phase || '').toUpperCase());
+}
+
+export function optionalBodyNumber(body = '', keys = []) {
+  for (const key of (Array.isArray(keys) ? keys : [keys])) {
+    const raw = bodyValue(body, key);
+    if (/^\d+$/.test(raw)) return Number(raw);
+  }
+  return null;
+}
+
+function ownerGateTechnicalComplete(body = '', phase = '') {
+  const technical = bodyValue(body, 'TECHNICAL_ACCEPTANCE').toUpperCase();
+  if (technical && technical !== 'PASS') return false;
+  const finalAcceptance = bodyValue(body, 'FINAL_ACCEPTANCE_2828').toUpperCase();
+  const realDataAcceptance = bodyValue(body, 'REAL_DATA_LIVE_ACCEPTANCE').toUpperCase();
+  const liveDataApi = bodyValue(body, 'LIVE_DATA_API').toUpperCase();
+  return technical === 'PASS'
+    || /TECHNICAL_PASS/.test(finalAcceptance)
+    || realDataAcceptance === 'PASS'
+    || liveDataApi === 'PASS';
+}
+
+function issueDisplayOwner(issue) {
+  const body = String(issue?.body || '');
+  const classification = classifyOpenIssue(issue);
+  if (classification.workKind === 'GOAL') return null;
+
+  if (issueIsAppChromeControlPlane(issue)) {
+    const authority = firstBodyField(body, ['MUTATION_OWNER', 'ASSIGNED_EXECUTOR', 'ACTIVE_OWNER']);
+    const owner = String(authority?.value || '');
+    if (/^(?:NV\d{2}|CODEX)$/i.test(owner)) return owner.toUpperCase();
+    return null;
+  }
+
+  const employee = issueEmployeeId(issue);
+  if (employee) return employee;
+  const owner = firstBodyValue(body, ['MUTATION_OWNER', 'ACTIVE_OWNER']);
+  if (/^(?:NV\d{2}|CODEX|AUTO)$/i.test(owner)) return owner.toUpperCase();
+  const phase = issueCanonicalState(issue);
+  const activeCodeObject = bodyValue(body, 'ACTIVE_CODEOBJ');
+  if (/^CORE_DYNAMIC_LEASE$/i.test(owner) && activeCodeObject && /(?:CODING_LANE_ACTIVE|(?:^|_)ACTIVE(?:_|$))/.test(phase)) return 'CORE';
+  if (/^VY_DIRECT_GITHUB$/i.test(owner)) return 'VY';
+  return null;
+}
+
+export function classifyOpenIssue(issue) {
+  const title = String(issue?.title || '');
+  const body = String(issue?.body || '');
+  const phase = issueCanonicalState(issue);
+  const acceptance = ownerAcceptancePolicy(body);
+
+  const systemReference = /\[(?:QUẢN TRỊ|REGISTRY|STATE|CENTRAL|TÀI NGUYÊN|RESULTS|POLICY|SOT)\]/i.test(title)
+    || bodyValue(body, 'RESOURCE_SCOPE').toUpperCase().startsWith('SYSTEM_')
+    || bodyFlag(body, 'RESULT_INBOX')
+    || bodyFlag(body, 'CANONICAL_POLICY')
+    || bodyFlag(body, 'REFERENCE_ONLY');
+
+  const phaseOwnerGate = /(?:^|_)(?:BLOCKED_OWNER|WAIT_OWNER|OWNER_APPROVAL_REQUIRED|OWNER_GATE|READY_FOR_OWNER_APPROVAL)(?:_|$)/.test(phase);
+  const legacyOwnerGate = !phase && (
+    bodyFlag(body, 'OWNER_APPROVAL_REQUIRED')
+    || bodyFlag(body, 'OWNER_GATE')
+    || bodyFlag(body, 'OWNER_HOLD')
+    || (acceptance.required && !acceptance.accepted)
+  );
+  const ownerGate = phase ? phaseOwnerGate : legacyOwnerGate;
+
+  const objective = /\[OWNER\]/i.test(title) && bodyFlag(body, 'TIGERIQ_EXECUTABLE', 'false') && !ownerGate;
+
+  return {
+    workKind: systemReference ? 'SYSTEM' : objective ? 'GOAL' : 'WORK',
+    ownerGate,
+    ownerApprovalRequired: ownerGate && acceptance.required && !acceptance.accepted,
+    ownerAccepted: acceptance.accepted,
+  };
+}
+
+// Presentation only: NV02 is an external UI worker that self-pulls GitHub.
+// This marker never enables Core dispatch or bypasses OS/security action gates.
+function nv02LocalSelfPullEligible(issue) {
+  if (!issue || issue.state !== 'open' || issue.pull_request) return false;
+  const title=String(issue.title||'');
+  if (/\[P0\]/i.test(title) || hasTerminalBlockedLabel(issue)) return false;
+  const active=String(issue.body||'').split(/\r?\n(?=#{1,6}\s+\S)/)[0];
+  const v=(key)=>bodyValue(active,key).trim().toUpperCase();
+  if (!/^P[1-5]$/.test(v('PRIORITY'))) return false;
+  if (v('NV02_LOCAL_GITHUB_SELF_PULL')!=='P1_P5_ONLY'
+    || v('ASSIGNED_EXECUTOR')!=='NV02'
+    || v('EXECUTION_SURFACE')!=='UI'
+    || v('OWNER_POLICY')!=='AUTO'
+    || v('TIGERIQ_EXECUTABLE')!=='TRUE'
+    || v('AUTO_QUEUE')!=='INCLUDED'
+    || v('MUTATION_OWNER')!=='NONE'
+    || !v('RESOURCE_SCOPE')
+    || !/^READY_NV02_/.test(v('CURRENT_STATE'))) return false;
+  const restrictions=['NO_RDC','NO_PC01_SHELL','NO_CODEX','NO_DIRECT_MAIN',
+    'NO_PRODUCTION_RELEASE','NO_PAID_COST','NO_CREDENTIAL_CHANGE',
+    'NO_SECURITY_BOUNDARY_CHANGE','NO_DESTRUCTIVE'];
+  if (!restrictions.every((key)=>v(key)==='TRUE') || v('APP_CHROME_MUTATION')!=='FORBIDDEN') return false;
+  if (['OWNER_HOLD','OWNER_GATE','OWNER_APPROVAL_REQUIRED','OWNER_REVIEW_REQUIRED',
+    'OWNER_ACCEPTANCE_REQUIRED','MANUAL_GATE'].some((key)=>bodyFlag(active,key))) return false;
+  if (v('BLOCKED_BY')&&!['NONE','NO','CLEARED'].includes(v('BLOCKED_BY'))) return false;
+  const contract=validateWorkOrderLifecycleV2(issue);
+  if(contract.required&&!contract.valid)return false;
+  return true;
+}
+
+export function executionEligibilityForIssue(issue, overlays = {}) {
+  if (!issue || issue.pull_request || issue.state !== 'open') return 'TERMINAL';
+  const body = String(issue.body || '');
+  const phase = issueCanonicalState(issue);
+  const priority = issuePriority(issue);
+  const classification = classifyOpenIssue(issue);
+
+  if (['CLOSED', 'DONE', 'COMPLETED', 'SUPERSEDED', 'CANCELLED'].includes(phase)
+    || /^SUPERSEDED(?:_BY)?=/mi.test(body)) return 'TERMINAL';
+
+  const hardGateState = /(?:OWNER(?:_|$)|PRODUCTION|PAID|FINANCIAL|CREDENTIAL|SECRET|SECURITY|PERMISSION|DESTRUCTIVE|IRREVERSIBLE|PHYSICAL_OWNER)/.test(phase)
+    && /(?:WAIT|BLOCKED|HOLD|GATE|REQUIRED|PENDING)/.test(phase);
+  if (classification.ownerGate
+    || priority === 'P0'
+    || bodyFlag(body, 'OWNER_HOLD')
+    || bodyFlag(body, 'OWNER_GATE')
+    || bodyFlag(body, 'OWNER_APPROVAL_REQUIRED')
+    || bodyFlag(body, 'OWNER_REVIEW_REQUIRED')
+    || bodyFlag(body, 'OWNER_ACCEPTANCE_REQUIRED')
+    || bodyFlag(body, 'MANUAL_GATE')
+    || hardGateState) return 'HARD_GATE';
+
+  const blockedBy = bodyValue(body, 'BLOCKED_BY').trim().toUpperCase();
+  const dependencyStatus = bodyValue(body, 'DEPENDENCY_STATUS').trim().toUpperCase();
+  const dependencyWait = /(?:DEPENDENCY|PARENT_GATE)/.test(phase)
+    && /(?:WAIT|BLOCKED|PENDING|HOLD)/.test(phase);
+  if (dependencyWait
+    || (blockedBy && !['NONE','NO','CLEAR','CLEARED'].includes(blockedBy))
+    || (dependencyStatus && !['PASS','DONE','COMPLETED','SATISFIED','CLEAR','CLEARED'].includes(dependencyStatus))) {
+    return 'PARKED_DEPENDENCY';
+  }
+
+  const waitText = [
+    phase,
+    bodyValue(body, 'WAIT_REASON'),
+    bodyValue(body, 'BLOCKER'),
+    bodyValue(body, 'BLOCKED_REASON'),
+    bodyValue(body, 'REARM_ONLY'),
+    bodyValue(body, 'REARM_REASON'),
+    bodyValue(body, 'AUTO_QUEUE'),
+  ].join(' ').toUpperCase();
+  if (/(?:NO_AI_RESOURCE_AVAILABLE|REVIEW_RESOURCE|REVIEWER|RESOURCE_STATE|PROVIDER|COOLDOWN|RATE_LIMIT|RESOURCE_UNAVAILABLE)/.test(waitText)) {
+    return 'ELIGIBLE_AFTER_RESOURCE';
+  }
+
+  // Invalid V2 cards remain parked even if a stale queue projection says READY.
+  const lifecycleGate=validateWorkOrderLifecycleV2(issue);
+  if(lifecycleGate.required&&!lifecycleGate.valid)return 'PARKED_DEPENDENCY';
+
+  if (overlays.active?.live === true && overlays.active?.employeeId) return 'READY';
+  if (overlays.queued?.eligibleNow === true) return 'READY';
+
+  if (nv02LocalSelfPullEligible(issue)) return 'READY';
+
+  const admission = safeAutoWorkAdmission(issue);
+  if (admission.eligible) return 'READY';
+
+  const admissionReason = String(admission.reason || '').toUpperCase();
+  if (admissionReason === 'TERMINAL_BLOCKED') return 'TERMINAL';
+
+  if ([
+    'P0_OR_INVALID_PRIORITY',
+    'OWNER_POLICY_NOT_AUTO',
+    'OWNER_OR_HOLD_GATE',
+    'OWNER_WAIT_STATE',
+    'OWNER_OR_UI_ROUTE',
+    'HARD_GATE_SAFETY_FLAGS_INCOMPLETE',
+    'DIRECT_MAIN_GUARD_REQUIRED',
+    'APP_CHROME_EXCLUDED',
+    'ANDROID_PRODUCT_OWNER_DIRECT',
+  ].includes(admissionReason)) return 'HARD_GATE';
+
+  if ([
+    'DEPENDENCY_BLOCKED',
+    'NON_EXECUTABLE_STATE',
+    'MUTATION_OWNER_CONFLICT',
+    'RESOURCE_SCOPE_REQUIRED',
+    'PUBLIC_EVIDENCE_KEYS_UNSUPPORTED',
+    'LIFECYCLE_V2_CONTRACT_INVALID',
+    'SPECIALIST_CONTRACT_REQUIRED',
+    'EXPLICIT_EXECUTION_DISABLED',
+    'AUTO_QUEUE_EXCLUDED',
+  ].includes(admissionReason)) return 'PARKED_DEPENDENCY';
+
+  // Unknown policy exclusions fail closed as a hard gate instead of being mislabeled as dependency wait.
+  return 'HARD_GATE';
+}
+
+function actionableStatus(issue, overlays = {}) {
+  const body = String(issue?.body || '');
+  const lifecycle = overlays.lifecycle || null;
+  const phase = String(lifecycle?.state || issueCanonicalState(issue)).toUpperCase();
+  const classification = classifyOpenIssue(issue);
+
+  if (classification.workKind === 'SYSTEM') return 'SYSTEM';
+  if (classification.ownerGate) return 'OWNER_GATE';
+
+  const active = overlays.active || null;
+  const queued = overlays.queued || null;
+  const activeAt = Date.parse(active?.updatedAt || '') || 0;
+  const queuedAt = Date.parse(queued?.updatedAt || '') || 0;
+  const lifecycleAt = Date.parse(lifecycle?.createdAt || '') || 0;
+  const issueAt = Date.parse(issue?.updated_at || '') || 0;
+  const canonicalBlocked = /BLOCKED/.test(issueCanonicalState(issue));
+  const terminalBlocked = hasTerminalBlockedLabel(issue);
+  const canonicalActive = /(?:CODING_LANE_ACTIVE|(?:^|_)ACTIVE(?:_|$))/.test(phase)
+    && Boolean(bodyValue(body, 'ACTIVE_CODEOBJ') || bodyFlag(body, 'TIGERIQ_EXECUTABLE'));
+
+  if (terminalBlocked && (canonicalBlocked || issueAt >= Math.max(activeAt, queuedAt, lifecycleAt))) return 'BLOCKED';
+  if (canonicalActive) return 'WORKING';
+  if (active?.status && activeAt >= Math.max(queuedAt, lifecycleAt)) return String(active.status).toUpperCase();
+  if (queued?.status && queuedAt >= Math.max(activeAt, lifecycleAt)) return String(queued.status).toUpperCase();
+  if (lifecycle?.blockerCleared) return statusFromLifecycleState(phase) || 'OPEN';
+  if (active?.status) return String(active.status).toUpperCase();
+  if (queued?.status) return String(queued.status).toUpperCase();
+  if (terminalBlocked) return 'BLOCKED';
+
+  if (classification.workKind === 'GOAL') return 'GOAL';
+  // A canonical BLOCKED phase takes precedence over a future LIVE_ACCEPTANCE
+  // word in the same phase; the current source must not be labeled VERIFY.
+  if (/(?:^|_)BLOCKED(?:_|$)/.test(phase)) return 'BLOCKED';
+  if (/(?:READY_(?:LIVE_)?ACCEPTANCE|READY_VERIFY|WAIT_VERIFY|LIVE_ACCEPTANCE)/.test(phase)) return 'VERIFY';
+  if (/(?:WAIT|PENDING|HOLD)/.test(phase)) return 'WAITING';
+  if (/(?:REVIEW|VERIFY)/.test(phase)) return overlays.hasPull ? 'REVIEW' : 'UNKNOWN';
+  if (/(?:WORKING|RUNNING|IN_PROGRESS|IMPLEMENT)/.test(phase)) return 'UNKNOWN';
+  return 'OPEN';
+}
+
+export function checklistForIssue(issue) {
+  const body = String(issue?.body || '');
+  const source = bodyValue(body, 'PROGRESS_SOURCE').toUpperCase();
+  const verified = bodyFlag(body, 'PROGRESS_VERIFIED')
+    || source === 'VERIFIED' || source === 'VERIFIED_CHECKLIST';
+  const items = [];
+  // Use only the first canonical checklist section, not historical duplicates.
+  // Legacy cards without that heading retain only checkboxes before the first
+  // history separator. A later current V2 section is permitted (GH-4709).
+  const lines = body.split(/\r?\n/);
+  const sectionStart = lines.findIndex((line) => /^##\s+STRUCTURED_PROGRESS_CHECKLIST\b/i.test(line));
+  const firstDivider = lines.findIndex((line) => /^ {0,3}---+\s*$/.test(line));
+  let checklistLines;
+  if (sectionStart >= 0) {
+    let sectionEnd = lines.findIndex((line, index) =>
+      index > sectionStart && (/^##\s+\S/.test(line) || /^ {0,3}---+\s*$/.test(line)));
+    if (sectionEnd < 0) sectionEnd = lines.length;
+    checklistLines = lines.slice(sectionStart + 1, sectionEnd);
+  } else {
+    checklistLines = lines.slice(0, firstDivider < 0 ? lines.length : firstDivider);
+  }
+  let fenced = false;
+  for (const line of checklistLines) {
+    if (/^\s*(?:```|~~~)/.test(line)) { fenced = !fenced; continue; }
+    if (fenced) continue;
+    const match = line.match(/^\s*[-*]\s+\[([ xX])\]\s+(.+)$/);
+    if (!match) continue;
+    const rawLabel = match[2].trim();
+    const attachment = rawLabel.match(/\[[^\]]+\]\((https:\/\/[^\s)]+)\)/);
+    const href = attachment ? safeEvidenceUrl(attachment[1]) : null;
+    const title = rawLabel.replace(/\[([^\]]+)\]\(https:\/\/[^\s)]+\)/g, '$1').slice(0, 300).trim();
+    items.push({ title: title || 'Bước chưa đặt tên', done: /x/i.test(match[1]), evidenceUrl: href });
+  }
+  if (items.length < 2) return { steps: [], done: 0, total: 0, remaining: 0, verified: false };
+  return {
+    steps: items,
+    done: items.filter((item) => item.done).length,
+    total: items.length,
+    remaining: items.filter((item) => !item.done).length,
+    verified,
+  };
+}
+
+// Actionable, source-grounded plan only. Never equate an action plan with verified progress.
+export function executionPlanForIssue(issue, currentNext = '') {
+  const body = String(issue?.body || '');
+  const lines = body.split(/\r?\n/);
+  const firstHeading = lines.findIndex((line) => /^#{1,3}\s+\S/.test(line));
+  const from = firstHeading < 0 ? 0 : firstHeading + 1;
+  const nextHeading = lines.findIndex((line, index) => index >= from && /^#{1,3}\s+\S/.test(line));
+  const activeBlock = lines.slice(from, nextHeading < 0 ? from + 250 : nextHeading).join('\n');
+  const action = String(currentNext || firstBodyValue(activeBlock, ['NEXT', 'NEXT_ACTION', 'CURRENT_STEP']) || '').trim();
+  if (!action) return { steps: [], source: null };
+  const seen = new Set();
+  const parts = action.split(/\s*;\s*|\s+(?:->|→)\s+/).map((part) => part.trim())
+    .filter((part) => part.length > 5 && !/^(?:no\b|never\b|do not\b|until\b|không\b|cấm\b)/i.test(part))
+    .slice(0, 8);
+  const steps = [];
+  for (const part of parts) {
+    const title = part.slice(0, 300);
+    const key = title.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    steps.push({ title, done: false, evidenceUrl: null });
+  }
+  return { steps, source: steps.length ? 'GITHUB_CURRENT_NEXT' : null };
+}
+
+export function githubMilestoneSpec(issue) {
+  const body=String(issue?.body||''),h=body.match(/^#{1,3}\s+[^\n]+/m);
+  if(!h||h.index>300)return null;
+  const rest=body.slice(h.index+h[0].length),next=rest.search(/^#{1,3}\s+\S/m),block=next<0?rest.slice(0,6000):rest.slice(0,next);
+  const field=(keys)=>{for(const k of keys){const m=block.match(new RegExp('^'+k+'=(.+)$','mi'));if(m)return m[1].trim();}return '';};
+  const ref=field(['PR_IN_PROGRESS','PR','TARGET_PR','SOURCE_PR','PR_URL','TARGET_PR_NUMBER']);
+  const prNumber=Number(ref.match(/(?:pull\/|#|^)(\d{2,8})\b/i)?.[1]||0);
+  const head=field(['TARGET_EXACT_HEAD','CURRENT_EXACT_HEAD','TARGET_HEAD','PR_HEAD','SOURCE_COMMIT','EXACT_HEAD']);
+  if(!prNumber||!/^[0-9a-f]{40}$/i.test(head))return null;
+  const runId=(keys)=>{const v=field(keys);return /^PASS(?:\||$)/i.test(v)?Number(v.match(/\bRUN_(\d{6,})\b/i)?.[1]||0)||null:null;};
+  return {prNumber,head:head.toLowerCase(),ciRunId:runId(['EXACT_HEAD_CI','CI_HEAD','SOURCE_CI','CI']),queueRunId:runId(['EXACT_HEAD_QUEUE_HYGIENE','QUEUE_HYGIENE','SOURCE_QUEUE_HYGIENE']),block};
+}
+export function githubMilestoneChecklist(issue,spec,proof={}){
+  if(!spec||!proof.pr||Number(proof.pr.number)!==spec.prNumber||String(proof.pr.head?.sha||'').toLowerCase()!==spec.head)return null;
+  const base='https://github.com/'+REPO,prUrl=base+'/pull/'+spec.prNumber;
+  const runOk=(run,id,ci)=>Boolean(id&&Number(run?.id)===id&&run?.status==='completed'&&run?.conclusion==='success'
+    &&String(run?.head_sha||'').toLowerCase()===spec.head
+    &&(ci?/^CI(?:\s|$)|CI Verify/i.test(String(run?.name||'')):/queue hygiene/i.test(String(run?.name||''))));
+  const ci=runOk(proof.ciRun,spec.ciRunId,true),queue=runOk(proof.queueRun,spec.queueRunId,false);
+  const author=String(proof.pr.user?.login||'').toLowerCase(),latest=new Map();
+  for(const r of (Array.isArray(proof.reviews)?proof.reviews:[])){
+    const user=String(r?.user?.login||'').toLowerCase(),at=Date.parse(r?.submitted_at||'')||0;
+    if(!user||user===author||String(r?.commit_id||'').toLowerCase()!==spec.head)continue;
+    if(!latest.has(user)||at>=latest.get(user).at)latest.set(user,{state:r.state,at,url:r.html_url});
+  }
+  const review=[...latest.values()].find(x=>x.state==='APPROVED');
+  const merged=proof.pr.merged===true&&Boolean(proof.pr.merge_commit_sha);
+  const doneIssue=issue?.state==='closed'&&/^true$/i.test(spec.block.match(/^DONE=(.+)$/mi)?.[1]?.trim()||'');
+  const steps=[
+    {title:'PR #'+spec.prNumber+' đúng HEAD',done:true,evidenceUrl:proof.pr.html_url||prUrl},
+    {title:'CI PASS đúng HEAD',done:ci,evidenceUrl:ci?base+'/actions/runs/'+spec.ciRunId:null},
+    {title:'Queue Hygiene PASS đúng HEAD',done:queue,evidenceUrl:queue?base+'/actions/runs/'+spec.queueRunId:null},
+    {title:'Reviewer độc lập APPROVED',done:Boolean(review),evidenceUrl:review?.url||null},
+    {title:'PR đã hợp nhất',done:merged,evidenceUrl:merged?prUrl:null},
+    {title:'Work Order đã đóng và DONE=true',done:doneIssue,evidenceUrl:doneIssue?base+'/issues/'+issue.number:null},
+  ];
+  const done=steps.filter(x=>x.done).length;
+  return {steps,done,total:steps.length,remaining:steps.length-done,verified:true,source:'GITHUB_VERIFIED_GATES'};
+}
+const githubMilestoneCache=new Map();
+export async function githubMilestonesForIssues(issues,owner,repo,fetchImpl=fetch){
+  const candidates=(Array.isArray(issues)?issues:[]).map(issue=>({issue,spec:githubMilestoneSpec(issue)})).filter(x=>x.spec);
+  const result=new Map(),root='/repos/'+owner+'/'+repo;
+  await Promise.all(candidates.map(async({issue,spec})=>{
+    const n=Number(issue.number),now=Date.now(),key=[issue.updated_at,spec.prNumber,spec.head,spec.ciRunId,spec.queueRunId].join('|');
+    const cached=githubMilestoneCache.get(n);
+    if(cached?.key===key&&now-cached.at<60000){if(cached.value)result.set(n,cached.value);return;}
+    let value=null;
+    try{
+      const [pr,ciRun,queueRun,reviews]=await Promise.all([
+        gh(root+'/pulls/'+spec.prNumber,fetchImpl),
+        spec.ciRunId?gh(root+'/actions/runs/'+spec.ciRunId,fetchImpl):Promise.resolve(null),
+        spec.queueRunId?gh(root+'/actions/runs/'+spec.queueRunId,fetchImpl):Promise.resolve(null),
+        gh(root+'/pulls/'+spec.prNumber+'/reviews?per_page=100',fetchImpl),
+      ]);
+      value=githubMilestoneChecklist(issue,spec,{pr,ciRun,queueRun,reviews});
+    }catch{/* Fail closed on unavailable GitHub evidence. */}
+    githubMilestoneCache.set(n,{at:now,key,value});
+    if(value)result.set(n,value);
+  }));
+  return result;
+}
+
+export function progressForIssue(issue, status = 'OPEN', checks = null, hasPull = false) {
+  const body = String(issue?.body || '');
+  const normalizedStatus = String(status || 'OPEN').toUpperCase();
+  const source = bodyValue(body, 'PROGRESS_SOURCE').toUpperCase();
+  const verified = bodyFlag(body, 'PROGRESS_VERIFIED')
+    || source === 'VERIFIED'
+    || source === 'VERIFIED_CHECKLIST';
+  if (!verified) return { percent: null, source: 'none', detail: null };
+
+  const acceptVerifiedPercent = (percent, progressSource, detail) => {
+    if (!Number.isFinite(percent) || percent < 0 || percent > 100) return null;
+    if (percent === 100 && normalizedStatus !== 'DONE') {
+      return { percent: null, source: 'non_terminal_100_rejected', detail: '100% chỉ dành cho công việc đã hoàn tất' };
+    }
+    return { percent, source: progressSource, detail };
+  };
+
+  // Checklist đã xác minh là cơ sở chính; tránh % khai báo khác với số bước thực tế.
+  const checklist = checklistForIssue(issue);
+  if (checklist.total >= 2 && checklist.verified) {
+    const completePercent = Math.round((checklist.done / checklist.total) * 100);
+    const percent = checklist.done < checklist.total ? Math.min(99, completePercent) : completePercent;
+    const accepted = acceptVerifiedPercent(percent, 'checklist_verified', checklist.done + '/' + checklist.total + ' bước xác minh');
+    if (accepted) return accepted;
+    // Nếu mọi checkbox được tích nhưng việc chưa DONE, không lấy % khai báo để thay thế.
+    if (checklist.done === checklist.total) return { percent: null, source: 'non_terminal_100_rejected', detail: 'Chờ xác minh điều kiện DONE' };
+  }
+
+  const explicitRaw = bodyValue(body, 'PROGRESS_PERCENT');
+  if (/^\d{1,3}$/.test(explicitRaw)) {
+    const explicit = Number(explicitRaw);
+    const accepted = acceptVerifiedPercent(explicit, 'explicit_verified', 'PROGRESS_PERCENT · verified');
+    if (accepted) return accepted;
+  }
+
+
+  return { percent: null, source: 'none', detail: null };
+}
+
+export function verifiedCompletionProgress(openRows = [], completedRows = [], options = {}) {
+  const open = (Array.isArray(openRows) ? openRows : []).filter((row) => row && row.workKind === 'WORK' && String(row.priority || row.effectivePriority || '').toUpperCase() !== 'P5');
+  const done = (Array.isArray(completedRows) ? completedRows : []).filter((row) => row && row.workKind === 'WORK' && String(row.priority || row.effectivePriority || '').toUpperCase() !== 'P5' && String(row.status || '').toUpperCase() === 'DONE');
+  const explicitCompleted = Number(options.completedCount);
+  const completedItems = Number.isFinite(explicitCompleted) && explicitCompleted >= 0 ? explicitCompleted : done.length;
+  const scopeItems = open.length + completedItems;
+  if (options.complete === false) {
+    return { percent: null, source: 'incomplete_enumeration', scopeItems, completedItems };
+  }
+  return {
+    percent: scopeItems ? Math.round((completedItems / scopeItems) * 100) : null,
+    source: 'terminal_completion',
+    scopeItems,
+    completedItems,
+    remainingItems: open.length,
+    basis: 'current_non_p5_open_plus_recent_' + RECENT_WORK_LIMIT + '_completed',
+  };
+}
+
+export function verifiedPortfolioProgress(rows = [], options = {}) {
+  const scope = (Array.isArray(rows) ? rows : []).filter((row) => row && row.workKind === 'WORK');
+  const verified = scope.filter((row) => ['explicit_verified','checklist_verified'].includes(String(row.progressSource || ''))
+    && Number.isFinite(Number(row.progressPercent)));
+  const scopeItems = scope.length;
+  const verifiedItems = verified.length;
+  const coveragePercent = scopeItems ? Math.round((verifiedItems / scopeItems) * 100) : null;
+  if (options.complete === false) {
+    return {
+      percent: null,
+      source: 'incomplete_enumeration',
+      scopeItems,
+      verifiedItems,
+      coveragePercent,
+    };
+  }
+  if (!scopeItems || verifiedItems !== scopeItems) {
+    return {
+      percent: null,
+      source: 'incomplete_verified_coverage',
+      scopeItems,
+      verifiedItems,
+      coveragePercent,
+    };
+  }
+  const percent = Math.round(verified.reduce((sum, row) => sum + Math.max(0, Math.min(100, Number(row.progressPercent))), 0) / scopeItems);
+  return {
+    percent,
+    source: 'verified_issue_average',
+    scopeItems,
+    verifiedItems,
+    coveragePercent: 100,
+  };
+}
+
+export function parseOpenWorkIssue(issue, overlays = {}) {
+  if (!issue || issue.pull_request || issue.state !== 'open') return null;
+  const number = Number(issue.number);
+  if (!number) return null;
+  const active = overlays.active || null;
+  const queued = overlays.queued || null;
+  const body = String(issue.body || '');
+  const lifecycle = overlays.lifecycle || null;
+  const lifecycleAt = Date.parse(lifecycle?.createdAt || '') || 0;
+  const issueAt = Date.parse(issue?.updated_at || '') || 0;
+  const lifecycleCurrent = Boolean(lifecycle && lifecycleAt && (!issueAt || lifecycleAt + 60_000 >= issueAt));
+  const currentLifecycle = lifecycleCurrent ? lifecycle : null;
+  const effectiveOverlays = currentLifecycle === lifecycle ? overlays : { ...overlays, lifecycle: null };
+  const classification = classifyOpenIssue(issue);
+  const canonicalPhase = issueCanonicalState(issue);
+  const phase = String(classification.ownerGate ? canonicalPhase : currentLifecycle?.state || canonicalPhase).toUpperCase();
+  let status = actionableStatus(issue, effectiveOverlays);
+  const admission = safeAutoWorkAdmission(issue);
+  const lifecycleContract=validateWorkOrderLifecycleV2(issue);
+  const rawExecutionEligibility = executionEligibilityForIssue(issue, effectiveOverlays);
+  const lifecycleDisplayStatus = currentLifecycle ? statusFromLifecycleState(phase) : null;
+  const lifecycleHasNoBlocker = Boolean(currentLifecycle && (!currentLifecycle.blocker || currentLifecycle.blockerCleared));
+  const lifecycleRunnable = lifecycleHasNoBlocker && ['WORKING','REVIEW','QUEUED'].includes(String(lifecycleDisplayStatus || '').toUpperCase());
+  const lifecycleAdmission = lifecycleRunnable
+    ? safeAutoWorkAdmission({
+        ...issue,
+        body: [
+          'CURRENT_STATE=' + String(currentLifecycle?.state || ''),
+          'TIGERIQ_EXECUTABLE=true',
+          'AUTO_QUEUE=INCLUDED',
+          body,
+        ].join('\n'),
+      })
+    : null;
+  const executionEligibility = rawExecutionEligibility === 'PARKED_DEPENDENCY' && lifecycleAdmission?.eligible === true
+    ? 'READY'
+    : rawExecutionEligibility;
+
+  // Source-first presentation: eligibility is NOT a worker lease or proof
+  // of execution. Never render a blocked device as VERIFY, or an unclaimed
+  // ready job as generic WAITING. Parked source work must not show as OPEN.
+  if (classification.workKind === 'WORK' && !classification.ownerGate && active?.live !== true) {
+    const explicitlyBlocked=/(?:^|_)BLOCKED(?:_|$)/.test(canonicalPhase)
+      && !(currentLifecycle?.blockerCleared === true);
+    if (explicitlyBlocked && (!active || issueAt >= (Date.parse(active?.updatedAt || '') || 0))) {
+      status='BLOCKED';
+    } else if (executionEligibility === 'READY' && ['OPEN','WAITING','UNKNOWN'].includes(status)) {
+      status='QUEUED';
+    } else if (['PARKED_DEPENDENCY','HARD_GATE','ELIGIBLE_AFTER_RESOURCE'].includes(executionEligibility)
+      && status === 'OPEN') {
+      status='WAITING';
+    }
+  }
+
+  const checks = classification.ownerGate ? null : active?.checks || null;
+  const hasPull = classification.ownerGate ? false : Boolean(active?.prNumber || overlays.hasPull);
+  const originalChecklist = classification.workKind === 'WORK' ? checklistForIssue(issue) : { steps: [], done: 0, total: 0, remaining: 0, verified: false };
+  const githubChecklist = originalChecklist.total < 2 ? overlays.githubMilestones || null : null;
+  const checklist = githubChecklist || originalChecklist;
+  const progress = classification.workKind === 'SYSTEM'
+    ? { percent: null, source: 'none', detail: null }
+    : githubChecklist && githubChecklist.verified
+      ? { percent:Math.min(status === 'DONE' ? 100 : 99,Math.round(githubChecklist.done / githubChecklist.total * 100)),
+          source:'github_gates_verified',detail:githubChecklist.done+'/'+githubChecklist.total+' cổng GitHub xác minh' }
+      : progressForIssue(issue, status, checks, hasPull);
+  const priority = issuePriority(issue);
+  const relations = workflowRelationsForIssue(issue);
+  const technicalComplete = classification.ownerGate && ownerGateTechnicalComplete(body, phase);
+  const currentStep = classification.ownerGate
+    ? technicalComplete
+      ? 'Đã xong kỹ thuật · chờ anh Sơn duyệt'
+      : bodyValue(body, 'CURRENT_STEP') || 'Chờ anh Sơn duyệt'
+    : active?.currentStep
+      || queued?.waitReason
+      || currentLifecycle?.step
+      || currentLifecycle?.nextStep
+      || bodyValue(body, 'CURRENT_STEP')
+      || null;
+  const latestCompletedStep = bodyValue(body, 'LAST_COMPLETED_STEP')
+    || bodyValue(body, 'LATEST_COMPLETED_STEP')
+    || bodyValue(body, 'LAST_DONE')
+    || (technicalComplete ? 'Đã xong kỹ thuật và có bằng chứng canonical' : null)
+    || (checks?.state === 'ĐẠT' ? 'Kiểm tra PR đã đạt' : null);
+  const nextStep = currentLifecycle?.nextStep
+    || bodyValue(body, 'NEXT')
+    || bodyValue(body, 'NEXT_ACTION')
+    || (classification.ownerGate ? 'Duyệt bản live' : null);
+  const executionPlan = classification.workKind === 'WORK' && checklist.total < 2
+    ? executionPlanForIssue(issue, nextStep || '')
+    : { steps: [], source: null };
+  const rawBlocker = currentLifecycle?.blocker ?? (bodyValue(body, 'BLOCKER') || bodyValue(body, 'BLOCKED_REASON') || '');
+  const blockerBodyCurrent = currentLifecycle ? !currentLifecycle.blockerCleared : true;
+  const blocker = status === 'BLOCKED' && blockerBodyCurrent && rawBlocker && !/^(?:NONE|NULL|N\/A|NO_BLOCKER|KHÔNG|KHONG)(?:\b|\s|$)/i.test(rawBlocker)
+    ? rawBlocker
+    : null;
+  const activeEvidenceUrl = classification.ownerGate
+    ? null
+    : safeEvidenceUrl(active?.evidenceUrl)
+      || safeEvidenceUrl(active?.prUrl)
+      || null;
+  const bodyEvidenceUrl = safeEvidenceUrl(bodyValue(body, 'EVIDENCE_URL'));
+  const canonicalOwnerEvidenceUrl = technicalComplete ? safeEvidenceUrl(issue.html_url || '') : null;
+  const evidenceUrl = activeEvidenceUrl || bodyEvidenceUrl || canonicalOwnerEvidenceUrl || null;
+  const evidenceAt = activeEvidenceUrl
+    ? safeEvidenceTimestamp(active?.updatedAt)
+    : bodyEvidenceUrl
+      ? safeEvidenceTimestamp(bodyValue(body, 'EVIDENCE_AT') || bodyValue(body, 'EVIDENCE_TIMESTAMP'))
+      : technicalComplete
+        ? safeEvidenceTimestamp(issue.updated_at)
+        : null;
+  const activeWorker = active?.live === true && active?.employeeId ? active.employeeId : null;
+  const activeLease = Boolean(activeWorker && ['WORKING','REVIEW','VERIFY'].includes(status));
+  const heartbeatFresh = active?.live === true ? true : null;
+  const waitReason = queued?.waitReason
+    || (['WAITING','BLOCKED'].includes(status) ? (rawBlocker || bodyValue(body, 'WAIT_REASON') || phase || null) : null);
+  const rearmCondition = firstBodyValue(body, ['REARM_CONDITION','REARM_ONLY','REPEAT_REQUIRES','NEXT_CONDITION']) || null;
+
+  return {
+    number,
+    title: String(issue.title || ''),
+    priority,
+    effectivePriority: priority,
+    sourcePriority: priority,
+    employeeId: issueIsAppChromeControlPlane(issue)
+      ? issueDisplayOwner(issue)
+      : classification.ownerGate
+        ? issueDisplayOwner(issue)
+        : active?.employeeId || queued?.targetWorker || issueDisplayOwner(issue),
+    status,
+    displayState: bodyValue(body, 'DISPLAY_STATE').trim().toUpperCase() || status,
+    executionEligibility,
+    lifecycleContract: {required:lifecycleContract.required,valid:lifecycleContract.valid,missing:lifecycleContract.missing,source:lifecycleContract.source},
+    lifecycleTiming:lifecycleContract.timestamps,
+    // Latest recorded event, not a proof of execution or a status transition.
+    // issue.updated_at is intentionally never used as a surrogate event time.
+    lastActivityAt: Number.isFinite(Date.parse(lifecycle?.lastActivityAt || ''))
+      ? lifecycle.lastActivityAt : (Number.isFinite(Date.parse(issue?.created_at || '')) ? issue.created_at : null),
+    lastActivitySource: lifecycle?.lastActivitySource || 'github_issue_created',
+    lastActivitySummary: lifecycle?.lastActivitySummary || 'Tạo hồ sơ',
+    lastActivityAuthor: lifecycle?.lastActivityAuthor || String(issue?.user?.login || ''),
+    lastActivityUrl: lifecycle?.lastActivityUrl || issue.html_url || null,
+    // Timestamp of the latest structured GitHub comment explicitly reporting
+    // the SAME effective display status; never infer from issue.updated_at.
+    // It is an observed status attestation, not necessarily a transition event.
+    statusEvidenceAt: currentLifecycle?.state
+      && lifecycleDisplayStatus===status
+      && Number.isFinite(Date.parse(currentLifecycle.createdAt||''))
+        ? currentLifecycle.createdAt : null,
+    statusEvidenceSource: currentLifecycle?.state
+      && lifecycleDisplayStatus===status
+      && Number.isFinite(Date.parse(currentLifecycle.createdAt||''))
+        ? 'github_structured_lifecycle_comment' : null,
+    // UI-only readiness: it is NOT a Core lease or proof NV02 is executing.
+    localSelfPullReady: executionEligibility === 'READY' && !activeLease && nv02LocalSelfPullEligible(issue),
+    executionEligibilityReason: executionEligibility === 'READY' ? null : (admission.reason || null),
+    waitReason: waitReason || (executionEligibility === 'READY' ? null : (admission.reason || null)),
+    rearmCondition: rearmCondition || (executionEligibility === 'PARKED_DEPENDENCY' ? 'SOURCE_STATE_OR_DEPENDENCY_CHANGE' : null),
+    activeLease,
+    activeWorker,
+    heartbeatFresh,
+    workKind: classification.workKind,
+    ...relations,
+    ownerGate: classification.ownerGate,
+    ownerApprovalRequired: classification.ownerApprovalRequired,
+    ownerApprovalPending: classification.ownerGate,
+    ownerAccepted: classification.ownerAccepted,
+    technicalComplete,
+    currentState: phase || null,
+    currentStep,
+    latestCompletedStep,
+    nextStep,
+    nextAction: nextStep,
+    blocker,
+    evidenceUrl,
+    evidenceAt,
+    latestEvidenceAt: evidenceAt,
+    progressPercent: progress.percent,
+    progressSource: progress.source,
+    progressDetail: progress.detail,
+    progressSteps: checklist.steps,
+    progressDone: checklist.done,
+    progressTotal: checklist.total,
+    progressRemaining: checklist.remaining,
+    progressChecklistVerified: checklist.verified,
+    executionSteps: executionPlan.steps,
+    executionPlanSource: executionPlan.source,
+    prNumber: classification.ownerGate ? null : active?.prNumber || null,
+    prUrl: classification.ownerGate ? null : active?.prUrl || null,
+    checks,
+    updatedAt: classification.ownerGate
+      ? issue.updated_at || null
+      : active?.updatedAt || queued?.updatedAt || currentLifecycle?.createdAt || issue.updated_at || null,
+    url: issue.html_url || null,
+    meta: !priority,
+  };
+}
+
+function githubActiveState(issue) {
+  const body = String(issue?.body || '');
+  const state = bodyValue(body, 'STATE').toUpperCase();
+  const owner = bodyValue(body, 'MUTATION_OWNER') || bodyValue(body, 'ASSIGNED_EXECUTOR') || bodyValue(body, 'ACTIVE_OWNER');
+  if (!owner) return null;
+  if (['WORKING', 'RUNNING', 'IN_PROGRESS'].includes(state)) return { status: 'WORKING', owner };
+  if (['REVIEW', 'VERIFY', 'REVIEWING'].includes(state)) return { status: 'REVIEW', owner };
+  if (state.includes('BLOCKED')) return { status: 'BLOCKED', owner };
+  if (state === 'WAITING') return { status: 'WAITING', owner };
+  return null;
+}
+
+async function githubIssue(owner, repo, number, issueMap, fetchImpl) {
+  if (issueMap.has(number)) return issueMap.get(number);
+  try { return await gh('/repos/' + owner + '/' + repo + '/issues/' + number, fetchImpl); } catch { return null; }
+}
+
+function skillPromotionSnapshot() {
+  try {
+    const state = loadSkillPromotionState();
+    return {
+      state: 'AVAILABLE',
+      summary: state.summary,
+      entries: state.queue.entries.map((entry) => ({
+        skillId: entry.skillId,
+        status: entry.status,
+        blocker: entry.blocker,
+        nextCondition: entry.nextCondition,
+        nextEligibleAt: entry.nextEligibleAt,
+        promotionEligible: entry.promotionEligible,
+      })),
+    };
+  } catch (error) {
+    return {
+      state: 'UNAVAILABLE',
+      summary: { active: 0, validatedWaiting: 0, validatedBlocked: 0, canaryReady: 0, canaryRunning: 0, promotionEligible: 0, tracked: 0 },
+      entries: [],
+      reason: String(error instanceof Error ? error.message : error).slice(0, 120),
+    };
+  }
+}
+
+export async function buildWorkSections(base, fetchImpl = fetch, known = {}) {
+  const { owner, repo } = repoParts();
+  let projectionStale = false;
+  let projectionReason = null;
+  let issues;
+  let pulls;
+  let runPayload;
+  let issuesComplete = true;
+  try {
+    const now = Date.now();
+    const cached = githubProjectionCache.data && now - githubProjectionCache.at < GITHUB_PROJECTION_CACHE_MS;
+    if (cached) {
+      ({ issues, pulls, runPayload, issuesComplete } = githubProjectionCache.data);
+      issuesComplete = issuesComplete === true;
+      if (githubProjectionCache.data?.projectionStale === true) {
+        projectionStale = true;
+        projectionReason = githubProjectionCache.data?.projectionReason || 'GitHub cached projection marked stale';
+      }
+    } else {
+      try {
+        const transportBefore = githubTransportSnapshot();
+        const [issuePages, openPullPayload, workflowPayload] = await Promise.all([
+          ghAllPages('/repos/' + owner + '/' + repo + '/issues?state=open&per_page=100&sort=updated&direction=desc', fetchImpl),
+          known.pulls ? Promise.resolve(known.pulls) : gh('/repos/' + owner + '/' + repo + '/pulls?state=open&sort=updated&direction=desc&per_page=100', fetchImpl),
+          known.runs ? Promise.resolve({ workflow_runs: known.runs }) : gh('/repos/' + owner + '/' + repo + '/actions/runs?per_page=100', fetchImpl),
+        ]);
+        issues = issuePages.rows;
+        issuesComplete = issuePages.complete;
+        pulls = openPullPayload;
+        runPayload = workflowPayload;
+        const transportAfter = githubTransportSnapshot();
+        if (projectionTransportStale(transportBefore, transportAfter)) {
+          projectionStale = true;
+          projectionReason = 'GitHub shared cache/backoff served stale data';
+          issuesComplete = false;
+        }
+        githubProjectionCache = {
+          at: now,
+          verifiedAt: new Date().toISOString(),
+          data: { issues, pulls, runPayload, issuesComplete, projectionStale, projectionReason },
+        };
+      } catch (error) {
+        if (!githubProjectionCache.data) throw error;
+        ({ issues, pulls, runPayload, issuesComplete } = githubProjectionCache.data);
+        issuesComplete = issuesComplete !== false;
+        projectionStale = true;
+        projectionReason = String(error instanceof Error ? error.message : error).slice(0, 120);
+      }
+    }
+    const openIssues = (Array.isArray(issues) ? issues : []).filter((issue) => !issue?.pull_request);
+    base = projectExternalRoleClaims(base, openIssues);
+    const openPulls = Array.isArray(pulls) ? pulls : [];
+    // Merged-PR milestone QA is separate from open PR QA. No claim or PASS here.
+    const preliminaryMilestoneQa = discoverNv03MilestoneQa(openIssues,{limit:3});
+    const receiptByIssue = new Map(), receiptCoverage = new Map();
+    await Promise.all(preliminaryMilestoneQa.filter(x=>x.sourceSha).map(async task=>{
+      if(receiptCoverage.has(task.issueNumber))return;
+      // Only a complete bounded issue comment history can prove no duplicate
+      // review of this milestone at the same immutable SHA.
+      receiptCoverage.set(task.issueNumber,'UNVERIFIED');
+      try{
+        const history=await ghAllPages('/repos/'+owner+'/'+repo+'/issues/'+task.issueNumber+'/comments?per_page=100',fetchImpl,4);
+        if(history.complete===true){
+          receiptByIssue.set(task.issueNumber,history.rows);
+          receiptCoverage.set(task.issueNumber,'COMPLETE');
+        }
+      }catch{/* No invented no-duplicate result under GitHub failures. */}
+    }));
+    const nv03MilestoneQaInbox = discoverNv03MilestoneQa(openIssues,{receiptsByIssue:receiptByIssue})
+      .map(task=>({...task,
+        receiptCoverage:receiptCoverage.get(task.issueNumber)||'UNVERIFIED',
+        proofStatus:task.proofStatus==='REVIEW_REQUEST_DISCOVERED'
+          &&receiptCoverage.get(task.issueNumber)!=='COMPLETE'
+          ?'REVIEW_RECEIPTS_UNVERIFIED':task.proofStatus,
+      }));
+    const runs = Array.isArray(runPayload?.workflow_runs) ? runPayload.workflow_runs : [];
+    const issueMap = new Map(openIssues.map((issue) => [Number(issue.number), issue]));
+    const ownerBacklogOrder = issuesComplete === true && !projectionStale
+      ? parseOwnerBacklogOrder(issueMap.get(OWNER_BACKLOG_ISSUE)?.body || '') : [];
+    const lifecycleOverrides = await latestStructuredLifecycleOverrides(openIssues, owner, repo, fetchImpl);
+    const activeRows = [];
+    const activeNumbers = new Set();
+
+    for (const row of runtimeWorkRows(base.workers || [], openIssues)) {
+      const issue = await githubIssue(owner, repo, row.issueNumber, issueMap, fetchImpl);
+      if (!issue || issue.pull_request || issue.state !== 'open') continue;
+      activeNumbers.add(row.issueNumber);
+      const pull = row.prNumber
+        ? openPulls.find((item) => Number(item.number) === row.prNumber)
+        : openPulls.find((item) => pullMentionsIssue(item, row.issueNumber));
+      const checks = summarizeChecks(runs, pull);
+      const liveStatus = checks?.state === 'LỖI' ? 'BLOCKED' : row.runtimeStatus === 'WAITING' && pull ? 'REVIEW' : row.runtimeStatus;
+      activeRows.push({
+        number: row.issueNumber,
+        title: String(issue.title || ''),
+        priority: issuePriority(issue),
+        employeeId: row.employeeId,
+        status: liveStatus,
+        currentStep: row.currentStep,
+        prNumber: pull?.number || row.prNumber || null,
+        prUrl: pull?.html_url || null,
+        checks,
+        evidenceUrl: pull?.html_url || issue.html_url || null,
+        updatedAt: row.updatedAt || issue.updated_at || null,
+        url: issue.html_url || null,
+        live: base.liveConnected === true,
+      });
+    }
+
+    for (const pull of openPulls) {
+      const issueNumber = parseIssueNumber(pull?.body, pull?.title, pull?.head?.ref);
+      if (!issueNumber || activeNumbers.has(issueNumber)) continue;
+      const issue = await githubIssue(owner, repo, issueNumber, issueMap, fetchImpl);
+      if (!issue || issue.pull_request || issue.state !== 'open' || issueIsTerminal(issue)) continue;
+      const checks = summarizeChecks(runs, pull);
+      activeNumbers.add(issueNumber);
+      activeRows.push({
+        number: issueNumber,
+        title: String(issue.title || ''),
+        priority: issuePriority(issue),
+        employeeId: bodyValue(issue.body || '', 'MUTATION_OWNER') || prWorker(pull) || null,
+        status: checks?.state === 'LỖI' ? 'BLOCKED' : 'REVIEW',
+        currentStep: checks?.state === 'LỖI' ? 'Kiểm tra PR đang lỗi'
+          : checks?.state === 'ĐANG CHẠY' ? 'Đang chạy kiểm tra PR'
+            : 'PR đang mở · chờ hoàn tất kiểm tra/rà soát',
+        prNumber: pull.number || null,
+        prUrl: pull.html_url || null,
+        checks,
+        evidenceUrl: pull.html_url || issue.html_url || null,
+        updatedAt: pull.updated_at || issue.updated_at || null,
+        url: issue.html_url || null,
+        live: false,
+      });
+    }
+
+    if (base.liveConnected !== true) {
+      for (const issue of openIssues) {
+        const issueNumber = Number(issue.number);
+        if (!issueNumber || activeNumbers.has(issueNumber) || issueIsTerminal(issue)) continue;
+        const explicit = githubActiveState(issue);
+        if (!explicit) continue;
+        const pull = openPulls.find((item) => pullMentionsIssue(item, issueNumber));
+        if (!pull) continue;
+        const checks = summarizeChecks(runs, pull);
+        const status = checks?.state === 'LỖI' ? 'BLOCKED' : 'REVIEW';
+        activeNumbers.add(issueNumber);
+        activeRows.push({
+          number: issueNumber,
+          title: String(issue.title || ''),
+          priority: issuePriority(issue),
+          employeeId: explicit.owner,
+          status,
+          currentStep: checks?.state === 'LỖI' ? 'Kiểm tra PR đang lỗi'
+            : checks?.state === 'ĐANG CHẠY' ? 'Đang chạy kiểm tra PR'
+              : 'PR đang mở · chờ hoàn tất kiểm tra/rà soát',
+          prNumber: pull?.number || null,
+          prUrl: pull?.html_url || null,
+          checks,
+          evidenceUrl: pull?.html_url || issue.html_url || null,
+          updatedAt: pull?.updated_at || issue.updated_at || null,
+          url: issue.html_url || null,
+          live: false,
+        });
+      }
+    }
+
+    if (!activeRows.length && base.liveConnected !== true) {
+      for (const worker of base.workers || []) {
+        const issueNumber = parseIssueNumber(worker?.job, worker?.source?.url);
+        if (!issueNumber || activeNumbers.has(issueNumber) || !['working', 'waiting', 'blocked'].includes(worker?.state)) continue;
+        const issue = issueMap.get(issueNumber);
+        if (!issue || issue.state !== 'open') continue;
+        const pull = openPulls.find((item) => Number(item.number) === Number(worker?.source?.number) || pullMentionsIssue(item, issueNumber));
+        const checks = summarizeChecks(runs, pull);
+        activeNumbers.add(issueNumber);
+        activeRows.push({
+          number: issueNumber,
+          title: String(issue.title || ''),
+          priority: issuePriority(issue),
+          employeeId: worker.employeeId || null,
+          status: worker.state === 'blocked' || checks?.state === 'LỖI' ? 'BLOCKED' : pull ? 'REVIEW' : worker.state === 'working' ? 'WORKING' : 'WAITING',
+          currentStep: cleanText(worker.detail || worker.job || '', 220) || null,
+          prNumber: pull?.number || null,
+          prUrl: pull?.html_url || null,
+          checks,
+          evidenceUrl: pull?.html_url || issue.html_url || null,
+          updatedAt: worker.updatedAt || issue.updated_at || null,
+          url: issue.html_url || null,
+          live: false,
+        });
+      }
+    }
+
+    const recentWorkSnapshot = await recentCompletedWork(owner, repo, fetchImpl);
+    const recentWork = annotatePortfolioRows(recentWorkSnapshot.rows);
+    const specs = openIssues.map(parseQueueIssue).filter(Boolean).filter((row) => !activeNumbers.has(row.number));
+    const depStates = await dependencyStates(specs, owner, repo, fetchImpl);
+    const resolvedQueue = specs.map((row) => {
+      if (row.status !== 'QUEUED') return row;
+      const waiting = (row.dependencies || []).filter((number) => {
+        const dep = depStates.get(number);
+        return !dep || dep.state !== 'closed' || dep.isPull === true;
+      });
+      if (!waiting.length) return row;
+      const unknown = waiting.filter((number) => depStates.get(number)?.state === 'unknown');
+      return {
+        ...row,
+        status: unknown.length ? 'BLOCKED' : 'WAITING',
+        waitReason: unknown.length
+          ? 'Chưa xác minh dependency ' + unknown.map((n) => '#' + n).join(', ')
+          : 'Chờ ' + waiting.map((n) => '#' + n).join(', '),
+      };
+    });
+    const rankedQueue = rankQueueRows(resolvedQueue);
+    const nextQueue = rankedQueue.slice(0, QUEUE_LIMIT);
+    const nextExecutable = rankedQueue.find((row) => row.eligibleNow) || null;
+
+    const activeMap = new Map(activeRows.map((row) => [Number(row.number), row]));
+    const queueMap = new Map(rankedQueue.map((row) => [Number(row.number), row]));
+    const [resultInboxProjection, githubMilestones] = await Promise.all([
+      ownerResultInboxProjection(openIssues, owner, repo, fetchImpl),
+      githubMilestonesForIssues(openIssues, owner, repo, fetchImpl),
+    ]);
+    const openWork = annotatePortfolioRows(openIssues.map((issue) => parseOpenWorkIssue(issue, {
+      githubMilestones: githubMilestones.get(Number(issue.number)) || null,
+      active: activeMap.get(Number(issue.number)) || null,
+      queued: queueMap.get(Number(issue.number)) || null,
+      lifecycle: lifecycleOverrides.get(Number(issue.number)) || null,
+      hasPull: openPulls.some((pull) => pullMentionsIssue(pull, Number(issue.number))),
+    })).filter(Boolean), openIssues).sort((a, b) => {
+      const actionRank = {
+        OWNER_GATE: 0,
+        WORKING: 1,
+        REVIEW: 2,
+        VERIFY: 3,
+        QUEUED: 4,
+        BLOCKED: 5,
+        WAITING: 6,
+        OPEN: 7,
+        GOAL: 8,
+        SYSTEM: 9,
+      };
+      const sa = actionRank[a.status] ?? 8;
+      const sb = actionRank[b.status] ?? 8;
+      if (sa !== sb) return sa - sb;
+      const priorityRank = { P0: 0, P1: 1, P2: 2, P3: 3, P4: 4, P5: 5 };
+      const pa = priorityRank[a.priority] ?? 9;
+      const pb = priorityRank[b.priority] ?? 9;
+      if (pa !== pb) return pa - pb;
+      return Date.parse(b.updatedAt || 0) - Date.parse(a.updatedAt || 0) || b.number - a.number;
+    });
+    if (resultInboxProjection) {
+      const inboxRow = openWork.find((row) => Number(row.number) === Number(resultInboxProjection.issueNumber));
+      if (inboxRow) Object.assign(inboxRow, resultInboxProjection);
+    }
+
+    const actionable = openWork.filter((row) => row.workKind === 'WORK');
+    const openSummary = {
+      open: openWork.length,
+      actionable: actionable.length,
+      owner: actionable.filter((row) => row.status === 'OWNER_GATE').length,
+      running: actionable.filter((row) => row.status === 'WORKING').length,
+      review: actionable.filter((row) => ['REVIEW','VERIFY'].includes(row.status)).length,
+      blocked: actionable.filter((row) => row.status === 'BLOCKED').length,
+      queued: actionable.filter((row) => row.status === 'QUEUED').length,
+      unknown: actionable.filter((row) => row.status === 'UNKNOWN').length,
+      waiting: actionable.filter((row) => ['QUEUED','WAITING','BLOCKED','UNKNOWN'].includes(row.status)).length,
+      system: openWork.filter((row) => row.workKind === 'SYSTEM').length,
+      done: recentWork.filter((row)=>row.completionVerified===true).length,
+      archived: recentWork.filter((row)=>row.status==='CLOSED_UNVERIFIED').length,
+    };
+    const portfolioProgress = verifiedPortfolioProgress(actionable, { complete: issuesComplete === true && !projectionStale });
+    const completionScope = await scopedCompletedWork(openIssues, actionable, owner, repo, issueMap, fetchImpl);
+    const completionProgress = verifiedCompletionProgress(actionable, completionScope.rows, {
+      complete: issuesComplete === true && !projectionStale && completionScope.complete === true,
+    });
+    completionProgress.scope = completionScope.scope || 'current_open_plus_structural_references';
+    completionProgress.referencedItems = completionScope.referenced || 0;
+    const stabilityIssue = openIssues.find((issue) => Number(issue?.number) === 2891) || null;
+    const stabilityBody = String(stabilityIssue?.body || '');
+    const apiWorkers = (Array.isArray(base?.workers) ? base.workers : []).filter((worker) => {
+      const n = Number(String(worker?.employeeId || '').replace(/\D/g, ''));
+      return n >= 11 && n <= 20 && Boolean(String(worker?.provider || '').trim());
+    });
+    const apiRuntimeVerified = base?.liveConnected === true && apiWorkers.length > 0;
+    const healthyProviders = new Set(apiRuntimeVerified
+      ? apiWorkers.filter((worker) => ['working','idle'].includes(String(worker?.state || '').toLowerCase()))
+        .map((worker) => String(worker?.provider || '').trim()).filter(Boolean)
+      : []);
+    const apiWorkforceSummary = {
+      verified: apiRuntimeVerified,
+      healthyProviders: apiRuntimeVerified ? healthyProviders.size : null,
+      healthyTarget: optionalBodyNumber(stabilityBody, ['REQUIRED_HEALTHY_PROVIDER_COUNT','HEALTHY_PROVIDER_COUNT']) ?? 3,
+      stabilityRounds: optionalBodyNumber(stabilityBody, 'STABILITY_ROUNDS_COUNTED'),
+      stabilityRoundsRequired: optionalBodyNumber(stabilityBody, 'ROUND_COUNT_REQUIRED') ?? 3,
+      realJobs: optionalBodyNumber(stabilityBody, ['REAL_JOBS_COMPLETED','REAL_JOBS_COUNTED']),
+      realJobsRequired: optionalBodyNumber(stabilityBody, 'TOTAL_REAL_JOBS_REQUIRED') ?? 15,
+      blocker: cleanText(bodyValue(stabilityBody, 'CURRENT_BLOCKER') || bodyValue(stabilityBody, 'BLOCKED_BY') || (stabilityIssue ? 'Theo dõi #2891' : ''), 120) || null,
+      issueNumber: stabilityIssue ? 2891 : null,
+    };
+
+    const displayPortfolio = buildProjectPortfolio(mergePortfolioWorkRows(
+      openWork, annotatePortfolioRows(activeRows, openIssues), recentWork,
+    ));
+
+    return {
+      ...base,
+      skillPromotion: skillPromotionSnapshot(),
+      openWork: openWork.map(ownerFacingWorkRow),
+      openSummary,
+      portfolioProgress,
+      completionProgress,
+      apiWorkforceSummary,
+      projectPortfolio: displayPortfolio,
+      portfolioGroups: buildPortfolioGroups(displayPortfolio),
+      activeWork: activeRows.sort((a, b) => compareQueueRows(
+        { ownerDirect: false, priority: a.priority || 'P2', number: a.number },
+        { ownerDirect: false, priority: b.priority || 'P2', number: b.number },
+      )).map(ownerFacingWorkRow),
+      nv03MilestoneQaInbox: nv03MilestoneQaInbox.map(ownerFacingWorkRow),
+      nv03MilestoneQaInboxFresh: !projectionStale && issuesComplete === true,
+      nextQueue: nextQueue.map(ownerFacingWorkRow),
+      nextQueueTotal: rankedQueue.length,
+      nextExecutable: nextExecutable ? ownerFacingWorkRow(nextExecutable) : null,
+      recentWork: recentWork.map(ownerFacingWorkRow),
+      workProjection: {
+        mode: projectionStale ? 'stale-cache' : (base.liveConnected ? 'pc01-live+github' : 'github-fallback'),
+        queuePolicy: 'ELIGIBLE_P1>P2>P3>P4>P5;OWNER_DIRECT_TIEBREAK;WAITING_UNRANKED',
+        source: projectionStale ? 'GitHub snapshot xác minh gần nhất' : 'PC01 runtime when available + GitHub canonical parsers',
+        verifiedAt: githubProjectionCache.verifiedAt,
+        stale: projectionStale,
+        reason: projectionReason,
+        queueLimit: QUEUE_LIMIT,
+        nextExecutableIssue: nextExecutable?.number || null,
+        openIssueEnumerationComplete: issuesComplete === true && !projectionStale,
+        ownerBacklogOrder,
+        ownerBacklogOrderSource: ownerBacklogOrder.length ? 'github_canonical_issue_280' : 'unverified',
+      },
+    };
+  } catch (error) {
+    return {
+      ...base,
+      skillPromotion: skillPromotionSnapshot(),
+      openWork: [],
+      openSummary: { open: 0, running: 0, waiting: 0, done: 0 },
+      activeWork: [],
+      nv03MilestoneQaInbox: [],
+      nv03MilestoneQaInboxFresh: false,
+      nextQueue: [],
+      nextQueueTotal: 0,
+      recentWork: [],
+      projectPortfolio: [],
+      portfolioGroups: [],
+      workProjection: {
+        mode: 'unavailable',
+        queuePolicy: 'ELIGIBLE_P1>P2>P3>P4>P5;OWNER_DIRECT_TIEBREAK;WAITING_UNRANKED',
+        source: 'GitHub unavailable',
+        reason: String(error instanceof Error ? error.message : error).slice(0, 120),
+        queueLimit: QUEUE_LIMIT,
+      },
+    };
+  }
+}
+
+export function sanitizeRuntimePayload(payload) {
+  if (!payload || payload.ok !== true || !Array.isArray(payload.workers)) throw new Error('runtime_bridge_payload_invalid');
+  const referenceAt = Date.parse(payload.generatedAt || '') || Date.now();
+  const workers = payload.workers.map(sanitizeRuntimeWorker).filter(Boolean).map((worker) => normalizeRuntimeWorkerActivity(worker, referenceAt)).map(ownerFacingWorkRow);
+  const summary = {
+    working: workers.filter((w) => w.state === 'working').length,
+    waiting: workers.filter((w) => w.state === 'waiting').length,
+    blocked: workers.filter((w) => w.state === 'blocked').length,
+    idle: workers.filter((w) => w.state === 'idle').length,
+    unknown: workers.filter((w) => w.state === 'unknown').length,
+    paused: workers.filter((w) => w.state === 'paused').length,
+    total: workers.length,
+  };
+  return {
+    ok: true,
+    liveConnected: true,
+    mode: 'pc01-live',
+    authority: 'PC01 live runtime',
+    generatedAt: typeof payload.generatedAt === 'string' ? payload.generatedAt.slice(0, 64) : new Date().toISOString(),
+    refreshSeconds: 5,
+    source: {
+      runtime: 'PC01 Core + Coding Lane',
+      core: payload.source?.core === true,
+      coding: payload.source?.coding === true,
+      uiAutopilot: payload.source?.uiAutopilot === true,
+    },
+    summary,
+    workers,
+    activeWork: runtimeWorkRows(workers).map(ownerFacingWorkRow),
+    nextQueue: [],
+    nextQueueTotal: 0,
+    recentWork: [],
+  };
+}
+
+async function resolveRuntimeBridge(fetchImpl = fetch) {
+  const now = Date.now();
+  if (pointerCache.url && now - pointerCache.at < POINTER_CACHE_MS) return pointerCache.url;
+  const { owner, repo } = repoParts();
+  const issue = await gh(`/repos/${owner}/${repo}/issues/${RUNTIME_POINTER_ISSUE}`, fetchImpl);
+  const url = parseRuntimeBridgeUrl(issue.body || '');
+  pointerCache = { at: now, url };
+  return url;
+}
+
+async function fetchRuntimeBridgePayload(base, fetchImpl = fetch) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), RUNTIME_FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetchImpl(`${base}/status`, {
+      method: 'GET',
+      headers: { accept: 'application/json' },
+      signal: controller.signal,
+      redirect: 'error',
+      cache: 'no-store',
+    });
+    if (!response.ok) throw new Error(`runtime_bridge_http_${response.status}`);
+    return response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export async function fetchPc01Runtime(fetchImpl = fetch) {
+  let base = await resolveRuntimeBridge(fetchImpl);
+  try {
+    return sanitizeRuntimePayload(await fetchRuntimeBridgePayload(base, fetchImpl));
+  } catch (error) {
+    const reason = String(error instanceof Error ? error.message : error);
+    if (!/^runtime_bridge_(?:http_|pointer_|payload_|fetch|timeout)/i.test(reason) && !/AbortError/i.test(reason)) throw error;
+    pointerCache = { at: 0, url: null };
+    const refreshedBase = await resolveRuntimeBridge(fetchImpl);
+    if (refreshedBase === base && !/^runtime_bridge_http_530$/i.test(reason)) throw error;
+    base = refreshedBase;
+    return sanitizeRuntimePayload(await fetchRuntimeBridgePayload(base, fetchImpl));
+  }
+}
+
+export async function fetchPc01Live(fetchImpl = fetch) {
+  const now = Date.now();
+  let runtime = runtimeCache.value && now - runtimeCache.at < CACHE_MS ? runtimeCache.value : null;
+  if (!runtime) {
+    runtime = await fetchPc01Runtime(fetchImpl);
+    runtimeCache = { at: now, value: runtime };
+  }
+  return buildWorkSections(runtime, fetchImpl);
+}
+
+export default async function handler(req, res) {
+  const deviceKey=String(process.env.TIGERIQ_LIVE_DEVICE_KEY||'');
+  res.setHeader('Cache-Control','private, no-store');
+  if(deviceKey.length<48)return json(res,503,{error:'DEVICE_AUTH_NOT_CONFIGURED'});
+  if(!authorizedDevice(String(req.headers?.cookie||''),deviceKey))return json(res,403,{error:'DEVICE_NOT_ENROLLED'});
+  if (req.method !== 'GET') return json(res, 405, { error: 'method_not_allowed' });
+  const now = Date.now();
+  const requestUrl = new URL(req.url || '/', 'http://localhost');
+  const workforceOnly = req.query?.scope === 'workforce' || requestUrl.searchParams.get('scope') === 'workforce';
+
+  if (workforceOnly) {
+    if (runtimeCache.value && now - runtimeCache.at < CACHE_MS) return json(res, 200, runtimeCache.value);
+    try {
+      const value = await fetchPc01Runtime();
+      runtimeCache = { at: now, value };
+      return json(res, 200, value);
+    } catch (error) {
+      const reason = String(error instanceof Error ? error.message : error).slice(0, 120);
+      if (runtimeCache.value && now - runtimeCache.at < STALE_RESPONSE_MS) {
+        return json(res, 200, {
+          ...runtimeCache.value,
+          liveConnected: false,
+          mode: 'stale-cache',
+          authority: 'Dữ liệu runtime xác minh gần nhất',
+          staleAll: true,
+          staleAt: runtimeCache.value.generatedAt || null,
+          liveReason: reason,
+        });
+      }
+      return json(res, 200, {
+        ok: false,
+        liveConnected: false,
+        mode: 'unavailable',
+        authority: 'Không có nguồn runtime',
+        generatedAt: new Date().toISOString(),
+        reason,
+        summary: { working: 0, waiting: 0, blocked: 0, idle: 0, unknown: 0, paused: 0, total: 0 },
+        workers: [],
+      });
+    }
+  }
+
+  if (cache.value && now - cache.at < CACHE_MS) return json(res, 200, cache.value);
+
+  let liveError = null;
+  try {
+    const value = await fetchPc01Live();
+    cache = { at: now, value };
+    return json(res, 200, value);
+  } catch (error) {
+    liveError = String(error instanceof Error ? error.message : error).slice(0, 120);
+  }
+
+  try {
+    const value = await buildLiveStatus();
+    value.liveConnected = false;
+    value.mode = 'github-fallback';
+    value.authority = 'GitHub/Registry dự phòng';
+    value.refreshSeconds = 5;
+    value.liveReason = liveError;
+    value.staleAll = false;
+    cache = { at: now, value };
+    return json(res, 200, value);
+  } catch (error) {
+    if (cache.value && now - cache.at < STALE_RESPONSE_MS) {
+      const value = {
+        ...cache.value,
+        liveConnected: false,
+        mode: 'stale-cache',
+        authority: 'Dữ liệu xác minh gần nhất',
+        staleAll: true,
+        staleAt: cache.value.generatedAt || null,
+        liveReason: liveError || String(error instanceof Error ? error.message : error).slice(0, 120),
+      };
+      return json(res, 200, value);
+    }
+    return json(res, 200, {
+      ok: false,
+      liveConnected: false,
+      mode: 'unavailable',
+      authority: 'Không có nguồn live',
+      generatedAt: new Date().toISOString(),
+      reason: localizeOwnerFacingText(liveError || String(error instanceof Error ? error.message : error).slice(0, 120)),
+      summary: { working: 0, waiting: 0, blocked: 0, idle: 0, unknown: 0, paused: 0, total: 0 },
+      workers: [],
+      activeWork: [],
+      nextQueue: [],
+      nextQueueTotal: 0,
+      recentWork: [],
+      projectPortfolio: [],
+      portfolioGroups: [],
+      workProjection: {
+        mode: 'unavailable',
+        queuePolicy: 'ELIGIBLE_P1>P2>P3>P4>P5;OWNER_DIRECT_TIEBREAK;WAITING_UNRANKED',
+        source: 'Không có nguồn xác minh',
+      },
+    });
+  }
+}

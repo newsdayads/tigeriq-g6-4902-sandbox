@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "updated": "2026-10-06",
+  "entries": [
+    {
+      "skillId": "document-normalization-ingest",
+      "status": "ACTIVE",
+      "attempts": 1,
+      "maxAttempts": 3,
+      "blocker": null,
+      "nextCondition": null,
+      "nextEligibleAt": null,
+      "fixtureRef": "docs/skills/canary/4380/README.md",
+      "provenanceRef": "learning-log/2026-09-23-agent-review-document-research.md",
+      "promotionEligible": false,
+      "evidence": [
+        {
+          "type": "USE_MEASURE",
+          "outcome": "PASS",
+          "at": "2026-10-06T15:25:00Z",
+          "useCount": 1,
+          "measureRef": "docs/skills/canary/4380/evidence.json",
+          "evidenceRef": "docs/skills/canary/4380/README.md#document-normalization-ingest"
+        }
+      ]
+    },
+    {
+      "skillId": "source-grounded-knowledge-retrieval",
+      "status": "ACTIVE",
+      "attempts": 1,
+      "maxAttempts": 3,
+      "blocker": null,
+      "nextCondition": null,
+      "nextEligibleAt": null,
+      "fixtureRef": "docs/skills/canary/4380/README.md",
+      "provenanceRef": "learning-log/2026-09-23-agent-review-document-research.md",
+      "promotionEligible": false,
+      "evidence": [
+        {
+          "type": "USE_MEASURE",
+          "outcome": "PASS",
+          "at": "2026-10-06T15:25:00Z",
+          "useCount": 1,
+          "measureRef": "docs/skills/canary/4380/evidence.json",
+          "evidenceRef": "docs/skills/canary/4380/README.md#source-grounded-knowledge-retrieval"
+        }
+      ]
+    },
+    {
+      "skillId": "external-research-capability-routing",
+      "status": "ACTIVE",
+      "attempts": 1,
+      "maxAttempts": 3,
+      "blocker": null,
+      "nextCondition": null,
+      "nextEligibleAt": null,
+      "fixtureRef": "docs/skills/canary/4380/README.md",
+      "provenanceRef": "learning-log/2026-09-23-agent-review-document-research.md",
+      "promotionEligible": false,
+      "evidence": [
+        {
+          "type": "USE_MEASURE",
+          "outcome": "PASS",
+          "at": "2026-10-06T15:25:00Z",
+          "useCount": 1,
+          "measureRef": "docs/skills/canary/4380/evidence.json",
+          "evidenceRef": "docs/skills/canary/4380/README.md#external-research-capability-routing"
+        }
+      ]
+    },
+    {
+      "skillId": "domain-skill-packaging",
+      "status": "ACTIVE",
+      "attempts": 1,
+      "maxAttempts": 3,
+      "blocker": null,
+      "nextCondition": null,
+      "nextEligibleAt": null,
+      "fixtureRef": "docs/skills/canary/4380/README.md",
+      "provenanceRef": "learning-log/2026-09-23-agent-review-document-research.md",
+      "promotionEligible": false,
+      "evidence": [
+        {
+          "type": "USE_MEASURE",
+          "outcome": "PASS",
+          "at": "2026-10-06T15:25:00Z",
+          "useCount": 1,
+          "measureRef": "docs/skills/canary/4380/evidence.json",
+          "evidenceRef": "docs/skills/canary/4380/README.md#domain-skill-packaging"
+        }
+      ]
+    }
+  ]
+}

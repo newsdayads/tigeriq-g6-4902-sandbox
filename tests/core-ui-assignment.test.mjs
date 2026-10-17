@@ -1,0 +1,778 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {CORE_UI_ASSIGNMENT_STALE_MS,buildCoreUiAssignmentSnapshot,buildCoreUiPrompt,completeCoreUiAssignment,coreUiNv03CoreRoutingDisabled,coreUiNv03SelfPullFenced,coreUiSourceRevision,parseCoreUiIssue,parseInternalReviewEvidence,readyUnassignedCoreUiSnapshot,selectCoreUiWorker} from '../apps/tigeriq-core/core-ui-assignment.mjs';
+
+const safe=(extra=[])=>[
+  'TIGERIQ_EXECUTABLE=true','OWNER_POLICY=AUTO','PRIORITY=P2','RESOURCE_SCOPE=UI_CANARY',
+  'NO_CODE_CHANGE=true','NO_PC01_SHELL=true','NO_DIRECT_MAIN=true','NO_PAID_COST=true',
+  'NO_CREDENTIAL_CHANGE=true','NO_DESTRUCTIVE=true','NO_PRODUCTION_RELEASE=true',...extra
+].join('\n');
+const issue=(number,body,title='Core UI canary')=>({number,title,state:'open',state_reason:null,html_url:'https://github.com/newsdayads/tigeriq-ai-lab/issues/'+number,body,comments:0,created_at:'2026-09-30T00:00:00Z',updated_at:'2026-09-30T00:00:00Z',closed_at:null});
+function response(value,status=200){return{ok:status>=200&&status<300,status,json:async()=>value};}
+
+function fakePool(){
+  const objectives=[],jobs=[],events=[];let terminalLock=Promise.resolve();
+  const joined=(j)=>{const o=objectives.find(x=>x.id===j.objective_id);return {job_id:j.id,objective_id:j.objective_id,status:j.status,employee_id:j.employee_id,resource_id:j.resource_id,provider:j.provider,prompt:j.prompt,created_at:j.created_at,started_at:j.started_at,completed_at:j.completed_at,result:j.result,routing_decision:j.routing_decision,priority:o.priority,metadata:o.metadata,objective_updated_at:o.updated_at};};
+  const pool={objectives,jobs,events,async connect(){
+    let unlock=()=>{};
+    return {
+      async query(sql,params=[]){
+        if(sql==='begin')return{rowCount:0,rows:[]};
+        if(sql.startsWith('select pg_advisory_xact_lock')){
+          const previous=terminalLock;let release;
+          terminalLock=new Promise(resolve=>{release=resolve;});
+          await previous;unlock=()=>release();return{rowCount:1,rows:[{locked:true}]};
+        }
+        if(sql==='commit'||sql==='rollback'){unlock();unlock=()=>{};return{rowCount:0,rows:[]};}
+        return pool.query(sql,params);
+      },
+      release(){},
+    };
+  },async query(sql,params=[]){
+    if(sql.includes('from tigeriq_jobs j join tigeriq_objectives o')&&sql.includes('j.id=$1')){const j=jobs.find(x=>x.id===params[0]);return {rowCount:j?1:0,rows:j?[joined(j)]:[]};}
+    if(sql.includes('from tigeriq_jobs j join tigeriq_objectives o')&&sql.includes('j.employee_id=$1')){const j=jobs.find(x=>x.employee_id===params[0]&&['ui_assigned','ui_running'].includes(x.status)&&objectives.find(o=>o.id===x.objective_id)?.status==='active');return {rowCount:j?1:0,rows:j?[joined(j)]:[]};}
+    if(sql.startsWith("select id,status,metadata,updated_at from tigeriq_objectives where metadata->>'source'='github_ui'")){
+      const rows=objectives.filter(x=>x.metadata?.source==='github_ui'&&String(x.metadata?.issueNumber)===String(params[0])).sort((a,b)=>Date.parse(b.updated_at||0)-Date.parse(a.updated_at||0));
+      return{rowCount:rows.length?1:0,rows:rows.length?[{id:rows[0].id,status:rows[0].status,metadata:rows[0].metadata,updated_at:rows[0].updated_at}]:[]};
+    }
+    if(sql.startsWith('select 1 from tigeriq_objectives where id=$1')){const found=objectives.some(x=>x.id===params[0]);return{rowCount:found?1:0,rows:found?[{one:1}]:[]};}
+    if(sql.startsWith('with locked as materialized')){const found=objectives.some(x=>x.status==='active'&&x.metadata.resourceScope===params[0]);if(found)return{rowCount:0,rows:[]};objectives.push({id:params[1],objective:params[2],priority:params[3],status:'active',summary:params[4],metadata:JSON.parse(params[5]),updated_at:'2026-09-30T00:00:01Z'});return{rowCount:1,rows:[{id:params[1]}]};}
+    if(sql.includes("metadata->>'resourceScope'=$1")){const found=objectives.some(x=>x.status==='active'&&x.metadata.resourceScope===params[0]);return{rowCount:found?1:0,rows:found?[{one:1}]:[]};}
+    if(sql.startsWith('insert into tigeriq_objectives')){objectives.push({id:params[0],objective:params[1],priority:params[2],status:'active',summary:params[3],metadata:JSON.parse(params[4]),updated_at:'2026-09-30T00:00:01Z'});return{rowCount:1,rows:[]};}
+    if(sql.startsWith('insert into tigeriq_jobs')){jobs.push({id:params[0],objective_id:params[1],title:params[2],prompt:params[3],capability:params[4],kind:'ui',status:'ui_assigned',employee_id:params[5],resource_id:params[6],provider:'ui',routing_decision:JSON.parse(params[7]),created_at:'2026-09-30T00:00:01Z'});return{rowCount:1,rows:[]};}
+    if(sql.includes('CORE_UI_ASSIGNMENT_CREATED')){events.push({type:'CORE_UI_ASSIGNMENT_CREATED',objectiveId:params[0],jobId:params[1],workerId:params[2]});return{rowCount:1,rows:[]};}
+    if(sql.includes('CORE_UI_ASSIGNMENT_TERMINAL')){events.push({type:'CORE_UI_ASSIGNMENT_TERMINAL',objectiveId:params[0],jobId:params[1],workerId:params[2]});return{rowCount:1,rows:[]};}
+    if(sql.startsWith('select prompt from tigeriq_jobs')){const j=jobs.find(x=>x.id===params[0]);return{rowCount:j?1:0,rows:j?[{prompt:j.prompt}]:[]};}
+    if(sql.includes("set status='ui_running'")){const j=jobs.find(x=>x.id===params[0]);if(j){j.status='ui_running';j.started_at='2026-09-30T00:01:00Z';}return{rowCount:j?1:0,rows:[]};}
+    if(sql.startsWith("update tigeriq_jobs set employee_id=$2,resource_id=$3,routing_decision=$4::jsonb,prompt=$5")){
+      const j=jobs.find(x=>x.id===params[0]&&x.status==='ui_assigned'&&x.employee_id===params[5]);
+      if(j){j.employee_id=params[1];j.resource_id=params[2];j.routing_decision=JSON.parse(params[3]);j.prompt=params[4];}
+      return{rowCount:j?1:0,rows:[]};
+    }
+    if(sql.startsWith("update tigeriq_objectives set metadata=jsonb_set(metadata,'{uiWorkerId}'")){
+      const o=objectives.find(x=>x.id===params[0]&&x.status==='active');
+      if(o){o.metadata={...o.metadata,uiWorkerId:JSON.parse(params[1])};o.summary=params[2];}
+      return{rowCount:o?1:0,rows:[]};
+    }
+    if(sql.includes('CORE_UI_ASSIGNMENT_FAILOVER')){events.push({type:'CORE_UI_ASSIGNMENT_FAILOVER',objectiveId:params[0],jobId:params[1],workerId:params[2]});return{rowCount:1,rows:[]};}
+    if(sql.startsWith("insert into tigeriq_events(type,objective_id,job_id")){events.push({type:params[0],objectiveId:params[1],jobId:params[2],workerId:params[3]});return{rowCount:1,rows:[]};}
+    if(sql.startsWith('update tigeriq_jobs set status=$2')){const j=jobs.find(x=>x.id===params[0]);if(j){j.status=params[1];j.completed_at='2026-09-30T00:02:00Z';j.result=JSON.parse(params[2]);j.failure=params[3]?JSON.parse(params[3]):null;}return{rowCount:j?1:0,rows:[]};}
+    if(sql.startsWith('update tigeriq_objectives set status=$2')){const o=objectives.find(x=>x.id===params[0]);if(o){o.status=params[1];o.summary=params[2];}return{rowCount:o?1:0,rows:[]};}
+    throw new Error('UNHANDLED_SQL:'+sql);
+  }};
+  return pool;
+}
+
+test('Core routes only review/research UI work to NV03/NV04',()=>{
+  assert.equal(parseCoreUiIssue(issue(200,safe(['CAPABILITY=general']))),null);
+  let x=parseCoreUiIssue(issue(201,safe(['CAPABILITY=review'])));assert.equal(x.workerId,'NV03');assert.deepEqual(x.eligibleWorkerIds,['NV03','NV04']);
+  x=parseCoreUiIssue(issue(202,safe(['CAPABILITY=research'])));assert.equal(x.workerId,'NV04');assert.deepEqual(x.eligibleWorkerIds,['NV04']);
+  x=parseCoreUiIssue(issue(203,safe(['CAPABILITY=deep_research'])));assert.equal(x.workerId,'NV04');
+  assert.equal(parseCoreUiIssue(issue(204,safe(['CAPABILITY=review']).replace('PRIORITY=P2','PRIORITY=P0'))),null);
+  assert.equal(selectCoreUiWorker('general'),null);
+  assert.equal(selectCoreUiWorker('review'),'NV03');
+  assert.equal(selectCoreUiWorker('research'),'NV04');
+});
+
+
+test('Core UI rejects canonical disabled, excluded, blocked and historical-only grants',()=>{
+  const granted=safe(['CAPABILITY=review','AUTO_QUEUE=INCLUDED','CURRENT_STATE=READY','NO_SECURITY_BOUNDARY_CHANGE=true']);
+  const historical='\n## HISTORICAL CONTRACT\n'+granted;
+  assert.equal(parseCoreUiIssue(issue(3278,'## CURRENT AUTO RCA\nTIGERIQ_EXECUTABLE=false\nAUTO_QUEUE=EXCLUDED_REVIEW_CHANGES_REQUIRED\nCURRENT_STATE=BLOCKED_INDEPENDENT_REVIEW_CHANGES_REQUIRED'+historical)),null);
+  assert.equal(parseCoreUiIssue(issue(3279,'## HISTORICAL CONTRACT\n'+granted)),null);
+  for(const revoked of [
+    granted.replace('TIGERIQ_EXECUTABLE=true','TIGERIQ_EXECUTABLE=false'),
+    granted.replace('AUTO_QUEUE=INCLUDED','AUTO_QUEUE=EXCLUDED_REVIEW_CHANGES_REQUIRED'),
+    granted.replace('CURRENT_STATE=READY','CURRENT_STATE=FAILED_RETRY_EXHAUSTED'),
+    granted.replace('CURRENT_STATE=READY','CURRENT_STATE=BLOCKED_REVIEW'),
+    granted.replace('NO_SECURITY_BOUNDARY_CHANGE=true','NO_SECURITY_BOUNDARY_CHANGE=false'),
+    granted+'\nOWNER_HOLD=true',
+    granted.replace('PRIORITY=P2','PRIORITY=P0'),
+  ]){
+    assert.equal(parseCoreUiIssue(issue(3280,'## CURRENT CONTRACT\n'+revoked+historical)),null);
+  }
+  const valid=issue(3281,'## CURRENT CONTRACT\n'+granted+'\n## HISTORICAL CONTRACT\nTIGERIQ_EXECUTABLE=false\nOWNER_HOLD=true\nAUTO_QUEUE=EXCLUDED_OLD');
+  assert.equal(parseCoreUiIssue(valid)?.number,3281);
+});
+
+test('Core UI reconciles a revoked GitHub assignment without delivering the stale NV03 job',async()=>{
+  const pool=fakePool();
+  const enabled=safe(['CAPABILITY=review','AUTO_QUEUE=INCLUDED','CURRENT_STATE=READY','NO_SECURITY_BOUNDARY_CHANGE=true']);
+  let current=issue(3278,'## ACTIVE REVIEW\n'+enabled,'Review must be revoked');
+  const fetchImpl=async url=>response(url.endsWith('/issues/3278')?current:[current]);
+  const first=await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.equal(first.nextJobs[0].workerId,'NV03');
+  assert.equal(pool.jobs[0].status,'ui_assigned');
+  current={...current,body:'## CURRENT AUTO RCA\nTIGERIQ_EXECUTABLE=false\nAUTO_QUEUE=EXCLUDED_REVIEW_CHANGES_REQUIRED\nCURRENT_STATE=BLOCKED_INDEPENDENT_REVIEW_CHANGES_REQUIRED\n'+enabled+'\n## HISTORICAL ONLY\n'+enabled};
+  const revoked=await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.equal(pool.jobs[0].status,'cancelled');
+  assert.equal(pool.objectives[0].status,'blocked');
+  assert.equal(revoked.assignmentState,'READY_UNASSIGNED');
+  assert.equal(revoked.nextJobs.length,0);
+  assert.equal(revoked.workerBindings.NV03.currentWorkOrder,null);
+  const repeat=await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.equal(repeat.assignmentState,'READY_UNASSIGNED');
+  assert.equal(pool.jobs.length,1);
+  const previous=await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x',previousJobId:'GH-3278'});
+  assert.equal(previous.previousJob?.status,'CANCELLED');
+  assert.equal(previous.nextJobs.length,0);
+});
+
+test('Core UI fails closed if GitHub source cannot be reverified for a previously assigned job',async()=>{
+  const pool=fakePool();
+  const enabled=issue(3282,safe(['CAPABILITY=review']),'Revalidation outage');
+  let outage=false;
+  const fetchImpl=async url=>{
+    if(outage&&url.endsWith('/issues/3282'))throw new Error('NETWORK_UNAVAILABLE');
+    return response(url.endsWith('/issues/3282')?enabled:[enabled]);
+  };
+  await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  outage=true;
+  await assert.rejects(()=>buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'}),/CORE_UI_CURRENT_SOURCE_UNVERIFIED/);
+  assert.equal(pool.jobs[0].status,'ui_assigned');
+});
+
+test('Core UI honors TARGET_EMPLOYEE precedence for NV03/NV04',()=>{
+  let x=parseCoreUiIssue(issue(208,safe(['TARGET_EMPLOYEE=NV03','ASSIGNED_EXECUTOR=NV11','PRIMARY_EMPLOYEE=NV12','CAPABILITY=review']),'Explicit review target'));
+  assert.equal(x.workerId,'NV03');assert.equal(x.capability,'review');
+  x=parseCoreUiIssue(issue(209,safe(['TARGET_EMPLOYEE=NV04','ASSIGNED_EXECUTOR=NV11','PRIMARY_EMPLOYEE=NV12','CAPABILITY=deep_research']),'Explicit research target'));
+  assert.equal(x.workerId,'NV04');assert.equal(x.capability,'deep_research');
+});
+
+test('Core UI never assigns App Chrome LOCAL-only work',()=>{
+  const byScope=issue(205,safe(['CAPABILITY=review']).replace('RESOURCE_SCOPE=UI_CANARY','RESOURCE_SCOPE=APP_CHROME_REPAIR'),'Local boundary');
+  const byTitle=issue(206,safe(['CAPABILITY=research']),'[P1][APP-CHROME] local repair');
+  const byPath=issue(207,safe(['CAPABILITY=review'])+'\nSOURCE_PATH=apps/chrome-controller/direct-cdp-bridge.mjs','Local path');
+  assert.equal(parseCoreUiIssue(byScope),null);
+  assert.equal(parseCoreUiIssue(byTitle),null);
+  assert.equal(parseCoreUiIssue(byPath),null);
+});
+
+test('Core can assign NV03 and NV04 concurrently while NV02 remains external',async()=>{
+  const pool=fakePool();
+  const issues=[
+    issue(211,safe(['CAPABILITY=review']).replace('RESOURCE_SCOPE=UI_CANARY','RESOURCE_SCOPE=REVIEW_A'),'Review'),
+    issue(212,safe(['CAPABILITY=research']).replace('RESOURCE_SCOPE=UI_CANARY','RESOURCE_SCOPE=RESEARCH_A'),'Research'),
+  ];
+  const fetchImpl=async url=>{const m=url.match(/\/issues\/(\d+)$/);return response(m?issues.find(x=>x.number===Number(m[1])):issues);};
+  const snap=await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.equal(pool.jobs.length,2);assert.equal(pool.events.length,2);
+  assert.deepEqual(snap.nextJobs.map(x=>x.workerId).sort(),['NV03','NV04']);
+  assert.equal(snap.workerBindings.NV02.state,'EXTERNAL_TO_CORE');
+  assert.equal(snap.workerBindings.NV03.currentWorkOrder.jobId,'GH-211');
+  assert.equal(snap.workerBindings.NV04.currentWorkOrder.jobId,'GH-212');
+});
+
+test('Core UI paginates beyond the first 100 open issues so newer eligible review work is not starved',async()=>{
+  const pool=fakePool();
+  const filler=Array.from({length:100},(_,i)=>issue(1000+i,safe(['CAPABILITY=general']).replace('RESOURCE_SCOPE=UI_CANARY','RESOURCE_SCOPE=FILLER_'+i),'Filler '+i));
+  const target=issue(3059,safe(['TARGET_EMPLOYEE=NV04','CAPABILITY=review']).replace('RESOURCE_SCOPE=UI_CANARY','RESOURCE_SCOPE=PAGINATED_REVIEW'),'Paged NV04 review');
+  const seenPages=[];
+  const fetchImpl=async url=>{
+    if(url.includes('/issues?')){
+      const page=Number(String(url).match(/[?&]page=(\d+)/)?.[1]||1);
+      seenPages.push(page);
+      return response(page===1?filler:page===2?[target]:[]);
+    }
+    if(url.endsWith('/issues/3059'))return response(target);
+    return response([]);
+  };
+  const snap=await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.deepEqual(seenPages,[1,2]);
+  assert.equal(pool.jobs.length,1);
+  assert.equal(snap.nextJobs[0].workerId,'NV04');
+  assert.equal(snap.nextJobs[0].issueRef,target.html_url);
+  assert.equal(snap.nextJobs[0].resourceScope,'PAGINATED_REVIEW');
+});
+
+test('Core UI fails closed instead of silently truncating a full bounded issue listing',async()=>{
+  const pool=fakePool();
+  const fullPage=Array.from({length:100},(_,i)=>issue(2000+i,safe(['CAPABILITY=general']).replace('RESOURCE_SCOPE=UI_CANARY','RESOURCE_SCOPE=LIMIT_'+i),'Limit filler '+i));
+  let listCalls=0;
+  const fetchImpl=async url=>{
+    if(url.includes('/issues?')){listCalls+=1;return response(fullPage);}
+    return response([]);
+  };
+  await assert.rejects(
+    ()=>buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'}),
+    /CORE_UI_GITHUB_ISSUES_PAGE_LIMIT/,
+  );
+  assert.equal(listCalls,20);
+  assert.equal(pool.jobs.length,0);
+  assert.equal(pool.objectives.length,0);
+});
+
+test('same RESOURCE_SCOPE cannot be assigned twice across NV03/NV04 using atomic advisory-lock insert',async()=>{
+  const pool=fakePool();
+  const issues=[issue(220,safe(['CAPABILITY=review'])),issue(221,safe(['CAPABILITY=research']))];
+  const fetchImpl=async()=>response(issues);
+  const snap=await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.equal(pool.jobs.length,1);assert.equal(snap.nextJobs.length,1);
+});
+
+test('previous NV03 assignment becomes RUNNING then terminalizes from GitHub close',async()=>{
+  const pool=fakePool();let current=issue(230,safe(['CAPABILITY=review']));
+  const fetchImpl=async url=>response(url.includes('/issues/230')?current:[current]);
+  await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  let snap=await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x',previousJobId:'GH-230'});
+  assert.equal(snap.previousJob.status,'RUNNING');assert.equal(pool.jobs[0].status,'ui_running');
+  current={...current,state:'closed',state_reason:'completed',closed_at:'2026-09-30T00:02:00Z'};
+  snap=await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x',previousJobId:'GH-230'});
+  assert.equal(snap.previousJob.status,'DONE');assert.equal(pool.objectives[0].status,'completed');
+});
+
+test('READY_UNASSIGNED keeps mixed authority explicit',()=>{
+  const snap=readyUnassignedCoreUiSnapshot({observedAt:'2026-09-30T00:00:00Z'});
+  assert.equal(snap.authority,'CORE');
+  assert.equal(snap.assignmentState,'READY_UNASSIGNED');
+  assert.equal(snap.workerBindings.NV02.state,'EXTERNAL_TO_CORE');
+  assert.equal(snap.workerBindings.NV03.state,'READY_UNASSIGNED');
+  assert.equal(snap.workerBindings.NV04.state,'READY_UNASSIGNED');
+});
+
+
+test('Core UI prompt is self-contained and NV04 satisfies explicit assignment contract',()=>{
+  const review=parseCoreUiIssue(issue(2601,safe(['CAPABILITY=review']),'Review contract'));
+  const research=parseCoreUiIssue(issue(2602,safe(['CAPABILITY=research']),'Research contract'));
+  const p3=buildCoreUiPrompt(review);
+  const p4=buildCoreUiPrompt(research);
+  assert.match(p3,/ROLE=INDEPENDENT_REVIEW_QA/);
+  assert.match(p3,/WORK_ORDER_BODY_BEGIN/);
+  assert.match(p3,/DONE hoặc BLOCKED hoặc EXTERNAL_WAIT/);
+  assert.match(p4,/NV04_ROLE=DEEP_RESEARCH/);
+  assert.match(p4,/CURRENT_WORK_ORDER=#2602/);
+  assert.match(p4,/EXACT_INPUT=https:\/\/github\.com\//);
+  assert.match(p4,/RESOURCE_SCOPE=UI_CANARY/);
+  assert.match(p4,/CHECKLIST=/);
+  assert.match(p4,/OUTPUT=/);
+  assert.match(p4,/EVIDENCE_DESTINATION=/);
+  assert.match(p4,/MUTATION_ALLOWED=false/);
+  assert.match(p4,/WORK_ORDER_BODY_BEGIN/);
+});
+
+
+test('Core UI injects bounded exact-head PR context for NV03 review',async()=>{
+  const pool=fakePool();
+  const head='a'.repeat(40);
+  const review=issue(27430,safe(['TARGET_EMPLOYEE=NV03','CAPABILITY=review','TARGET_PR=#123 - exact review','TARGET_HEAD='+head]),'Exact-head review');
+  const seen=[];
+  const fetchImpl=async url=>{
+    seen.push(url);
+    if(url.includes('/pulls/123/files?'))return response([{filename:'apps/core.mjs',status:'modified',patch:'@@ -1 +1 @@\n-old\n+new'}]);
+    if(url.endsWith('/pulls/123'))return response({title:'Fix exact context',state:'open',head:{sha:head},base:{sha:'b'.repeat(40)},changed_files:1,additions:1,deletions:1});
+    if(url.includes('/issues?'))return response([review]);
+    if(url.endsWith('/issues/27430'))return response(review);
+    return response([]);
+  };
+  const snap=await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.equal(pool.jobs.length,1);
+  assert.equal(snap.nextJobs[0].workerId,'NV03');
+  const prompt=pool.jobs[0].prompt;
+  assert.match(prompt,/EXACT_HEAD_CONTEXT_BEGIN/);
+  assert.match(prompt,/TARGET_PR=#123/);
+  assert.match(prompt,new RegExp('TARGET_HEAD='+head));
+  assert.match(prompt,/FILE=apps\/core\.mjs/);
+  assert.match(prompt,/\+new/);
+  assert.match(prompt,/EXACT_HEAD_CONTEXT_END/);
+  assert.equal(pool.objectives[0].metadata.targetPr,123);
+  assert.equal(pool.objectives[0].metadata.targetHead,head);
+  assert.equal(seen.some(x=>!x.startsWith('https://api.github.com/repos/newsdayads/tigeriq-ai-lab/')),false);
+});
+
+test('Core UI exact-head context honors allowlisted TARGET_REPOSITORY',async()=>{
+  const pool=fakePool();
+  const head='f'.repeat(40);
+  const review=issue(27433,safe([
+    'TARGET_EMPLOYEE=NV03',
+    'CAPABILITY=review',
+    'TARGET_REPOSITORY=newsdayads/tigeriq-media',
+    'TARGET_PR=40',
+    'TARGET_HEAD='+head,
+  ]),'Cross-repo exact-head review');
+  const seen=[];
+  const fetchImpl=async url=>{
+    seen.push(url);
+    if(url.includes('/repos/newsdayads/tigeriq-media/pulls/40/files?'))return response([{filename:'services/news-engine/collector.mjs',status:'modified',patch:'@@ -1 +1 @@\n-old\n+new'}]);
+    if(url.endsWith('/repos/newsdayads/tigeriq-media/pulls/40'))return response({title:'News collector',state:'open',head:{sha:head},base:{sha:'b'.repeat(40)},changed_files:1,additions:1,deletions:1});
+    if(url.includes('/repos/newsdayads/tigeriq-ai-lab/issues?'))return response([review]);
+    if(url.endsWith('/repos/newsdayads/tigeriq-ai-lab/issues/27433'))return response(review);
+    return response([]);
+  };
+  const snap=await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.equal(pool.jobs.length,1);
+  assert.equal(snap.nextJobs[0].workerId,'NV03');
+  assert.match(pool.jobs[0].prompt,/REPOSITORY=newsdayads\/tigeriq-media/);
+  assert.equal(pool.objectives[0].metadata.targetRepository,'newsdayads/tigeriq-media');
+  assert.equal(pool.objectives[0].metadata.targetPr,40);
+  assert.equal(pool.objectives[0].metadata.targetHead,head);
+  assert.equal(seen.some(url=>url.includes('/repos/newsdayads/tigeriq-media/pulls/40')),true);
+  assert.equal(seen.some(url=>url.includes('/repos/newsdayads/tigeriq-ai-lab/pulls/40')),false);
+});
+
+test('Core UI fails closed for unsupported TARGET_REPOSITORY',()=>{
+  const review=issue(27434,safe([
+    'TARGET_EMPLOYEE=NV03',
+    'CAPABILITY=review',
+    'TARGET_REPOSITORY=example.com/not-allowed',
+    'TARGET_PR=40',
+    'TARGET_HEAD='+'a'.repeat(40),
+  ]),'Disallowed cross-repo review');
+  assert.equal(parseCoreUiIssue(review),null);
+});
+
+test('Core UI fails closed when TARGET_HEAD does not match current PR head',async()=>{
+  const pool=fakePool();
+  const expected='a'.repeat(40),actual='c'.repeat(40);
+  const review=issue(27431,safe(['TARGET_EMPLOYEE=NV03','CAPABILITY=review','TARGET_PR=#124','TARGET_HEAD='+expected]),'Stale-head review');
+  const seen=[];
+  const fetchImpl=async url=>{
+    seen.push(url);
+    if(url.endsWith('/pulls/124'))return response({title:'Mismatch',state:'open',head:{sha:actual},base:{sha:'b'.repeat(40)},changed_files:1});
+    if(url.includes('/issues?'))return response([review]);
+    return response([]);
+  };
+  const snap=await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.equal(pool.jobs.length,0);
+  assert.equal(pool.objectives.length,0);
+  assert.equal(snap.assignmentState,'READY_UNASSIGNED');
+  assert.equal(seen.some(x=>x.includes('/pulls/124/files?')),false);
+});
+
+test('Core UI bounds exact-head patches before sending to UI worker',async()=>{
+  const pool=fakePool();
+  const head='d'.repeat(40);
+  const review=issue(27432,safe(['TARGET_EMPLOYEE=NV03','CAPABILITY=review','TARGET_PR=#125','TARGET_HEAD='+head]),'Bounded context');
+  const huge='x'.repeat(40000);
+  const files=Array.from({length:30},(_,i)=>({filename:'f'+i+'.mjs',status:'modified',patch:huge}));
+  const fetchImpl=async url=>{
+    if(url.includes('/pulls/125/files?'))return response(files);
+    if(url.endsWith('/pulls/125'))return response({title:'Large PR',state:'open',head:{sha:head},base:{sha:'e'.repeat(40)},changed_files:30,additions:100,deletions:90});
+    if(url.includes('/issues?'))return response([review]);
+    return response([]);
+  };
+  await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.equal(pool.jobs.length,1);
+  assert.equal(pool.objectives[0].metadata.exactContextTruncated,true);
+  const prompt=pool.jobs[0].prompt;
+  const context=prompt.split('EXACT_HEAD_CONTEXT_BEGIN')[1].split('EXACT_HEAD_CONTEXT_END')[0];
+  const patchPayload=[...context.matchAll(/PATCH_BEGIN\n([\s\S]*?)\nPATCH_END/g)].map(m=>m[1]).join('');
+  assert.equal(patchPayload.length,24000);
+  assert.ok(patchPayload.length<=24000);
+  assert.ok(prompt.length<39000);
+  assert.match(prompt,/CONTEXT_FILE_LIMIT=20/);
+  assert.match(prompt,/CONTEXT_PATCH_CHAR_LIMIT=24000/);
+});
+
+test('Core UI source revision is stable for title+body and changes with canonical source',()=>{
+  const a=issue(2700,safe(['CAPABILITY=review']),'Revision canary');
+  const b={...a,updated_at:'2026-10-01T01:00:00Z'};
+  assert.equal(coreUiSourceRevision(a),coreUiSourceRevision(b));
+  assert.notEqual(coreUiSourceRevision(a),coreUiSourceRevision({...a,body:a.body+'\nREARMED_AT=2026-10-01T01:00:00Z'}));
+  assert.notEqual(coreUiSourceRevision(a),coreUiSourceRevision({...a,title:'Revision canary v2'}));
+});
+
+test('terminal Core UI Work Order rearms exactly once when source revision changes',async()=>{
+  const pool=fakePool();
+  let current=issue(2733,safe(['CAPABILITY=review'])+'\nREARMED_AT=2026-10-01T18:00:00Z','Final review');
+  const fetchImpl=async url=>response(url.includes('/issues/2733')?current:[current]);
+  await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.equal(pool.jobs.length,1);
+  assert.equal(pool.jobs[0].id,'GH-2733');
+  const firstObjective=pool.objectives[0];
+  assert.equal(firstObjective.metadata.sourceRevision,coreUiSourceRevision(current));
+  assert.equal(firstObjective.metadata.rearmedFromObjectiveId,null);
+
+  pool.jobs[0].status='failed';pool.jobs[0].completed_at='2026-10-01T18:01:00Z';
+  firstObjective.status='blocked';firstObjective.updated_at='2026-10-01T18:01:00Z';
+  current={...current,body:current.body+'\nPOST_FIX_EVIDENCE=true\nREARMED_AT=2026-10-01T18:10:00Z',updated_at:'2026-10-01T18:10:00Z'};
+  const revision=coreUiSourceRevision(current);
+  await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.equal(pool.jobs.length,2);
+  assert.equal(pool.jobs[1].id,'GH-2733-R'+revision);
+  assert.equal(pool.objectives[1].id,'OBJ-UI-GH-2733-R'+revision);
+  assert.equal(pool.objectives[1].metadata.sourceRevision,revision);
+  assert.equal(pool.objectives[1].metadata.rearmedFromObjectiveId,'OBJ-UI-GH-2733');
+
+  pool.jobs[1].status='failed';pool.jobs[1].completed_at='2026-10-01T18:11:00Z';
+  pool.objectives[1].status='blocked';pool.objectives[1].updated_at='2026-10-01T18:11:00Z';
+  await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.equal(pool.jobs.length,2);
+  assert.equal(pool.objectives.length,2);
+});
+
+test('legacy Core UI objective can rearm only with a newer explicit rearm epoch',async()=>{
+  const pool=fakePool();
+  pool.objectives.push({id:'OBJ-UI-GH-2734',objective:'legacy',priority:'P1',status:'blocked',summary:'legacy',metadata:{source:'github_ui',issueNumber:2734,resourceScope:'UI_CANARY',uiWorkerId:'NV03'},updated_at:'2026-10-01T18:01:00Z'});
+  let current=issue(2734,safe(['CAPABILITY=review'])+'\nREARMED_AT=2026-10-01T18:10:00Z','Legacy rearm');
+  const fetchImpl=async url=>response(url.includes('/issues/2734')?current:[current]);
+  const revision=coreUiSourceRevision(current);
+  await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.equal(pool.jobs.length,1);
+  assert.equal(pool.jobs[0].id,'GH-2734-R'+revision);
+  assert.equal(pool.objectives.at(-1).metadata.rearmedFromObjectiveId,'OBJ-UI-GH-2734');
+});
+
+test('Core UI terminal evidence closes DONE issue and frees the worker durably',async()=>{
+  const pool=fakePool();
+  let current=issue(2603,safe(['CAPABILITY=review']),'Terminal canary');
+  const fetchImpl=async(url,init={})=>{
+    if(url.endsWith('/comments')&&init.method==='POST')return response({html_url:'https://github.com/newsdayads/tigeriq-ai-lab/issues/2603#issuecomment-1',body:JSON.parse(init.body).body});
+    if(url.includes('/comments?'))return response([]);
+    if(url.endsWith('/issues/2603')&&init.method==='PATCH'){current={...current,state:'closed',state_reason:'completed',closed_at:'2026-09-30T00:03:00Z'};return response(current);}
+    if(url.endsWith('/issues/2603'))return response(current);
+    return response([current]);
+  };
+  await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.equal(pool.jobs[0].status,'ui_assigned');
+  const out=await completeCoreUiAssignment({pool,fetchImpl,token:'x',jobId:'GH-2603',workerId:'NV03',terminal:'DONE',result:'QA PASS\nDONE'});
+  assert.equal(out.terminal,'DONE');
+  assert.match(out.evidenceRef,/issuecomment-1/);
+  assert.equal(pool.jobs[0].status,'done');
+  assert.equal(pool.objectives[0].status,'completed');
+  assert.equal(pool.events.at(-1).type,'CORE_UI_ASSIGNMENT_TERMINAL');
+});
+
+
+test('concurrent terminal replay creates one evidence comment and one terminal transition',async()=>{
+  const pool=fakePool();let current=issue(2604,safe(['CAPABILITY=review']),'Concurrent terminal canary');
+  let postCount=0;const comments=[];
+  const fetchImpl=async(url,init={})=>{
+    if(url.includes('/comments?'))return response(comments);
+    if(url.endsWith('/comments')&&init.method==='POST'){
+      postCount+=1;
+      const body=JSON.parse(init.body).body;
+      const comment={html_url:'https://github.com/newsdayads/tigeriq-ai-lab/issues/2604#issuecomment-'+postCount,body};
+      comments.push(comment);
+      await new Promise(resolve=>setTimeout(resolve,5));
+      return response(comment);
+    }
+    if(url.endsWith('/issues/2604')&&init.method==='PATCH'){current={...current,state:'closed',state_reason:'completed',closed_at:'2026-09-30T00:04:00Z'};return response(current);}
+    if(url.endsWith('/issues/2604'))return response(current);
+    return response([current]);
+  };
+  await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  const [a,b]=await Promise.all([
+    completeCoreUiAssignment({pool,fetchImpl,token:'x',jobId:'GH-2604',workerId:'NV03',terminal:'DONE',result:'PASS A\nDONE'}),
+    completeCoreUiAssignment({pool,fetchImpl,token:'x',jobId:'GH-2604',workerId:'NV03',terminal:'DONE',result:'PASS B\nDONE'}),
+  ]);
+  assert.equal(postCount,1);
+  assert.equal(pool.events.filter(x=>x.type==='CORE_UI_ASSIGNMENT_TERMINAL').length,1);
+  assert.equal(pool.jobs[0].status,'done');
+  assert.equal(a.evidenceRef,b.evidenceRef);
+  assert.equal(b.alreadyTerminal,true);
+});
+
+
+test('active Core UI assignment remains durable but is not exposed as executable during GitHub outage',async()=>{
+  const pool=fakePool();
+  const review=issue(28150,safe(['CAPABILITY=review']).replace('RESOURCE_SCOPE=UI_CANARY','RESOURCE_SCOPE=REVIEW_OUTAGE_KEEP'),'Outage keep assignment');
+  let githubAvailable=true;
+  const fetchImpl=async url=>{
+    if(!githubAvailable)return response({message:'rate limited'},403);
+    if(url.includes('/issues?'))return response([review]);
+    if(url.endsWith('/issues/28150'))return response(review);
+    return response([]);
+  };
+  let snap=await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.equal(pool.jobs.length,1);
+  assert.equal(snap.nextJobs[0].jobId,'GH-28150');
+  assert.equal(snap.nextJobs[0].workerId,'NV03');
+
+  githubAvailable=false;
+  await assert.rejects(
+    ()=>buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'}),
+    /CORE_UI_CURRENT_SOURCE_UNVERIFIED/,
+  );
+  // Fail closed for consumers; preserve the durable job for a later retry.
+  assert.equal(pool.jobs.length,1);
+  assert.equal(pool.objectives.length,1);
+  assert.equal(pool.jobs[0].status,'ui_assigned');
+  assert.equal(pool.objectives[0].status,'active');
+  githubAvailable=true;
+  snap=await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.equal(snap.assignmentState,'READY_ASSIGNED');
+  assert.equal(snap.nextJobs[0].jobId,'GH-28150');
+  assert.equal(pool.jobs.length,1);
+});
+
+test('Core UI fails closed on GitHub source outage when there is no active DB assignment',async()=>{
+  const pool=fakePool();
+  const fetchImpl=async()=>response({message:'rate limited'},403);
+  await assert.rejects(
+    ()=>buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'}),
+    /GITHUB_HTTP_403/,
+  );
+  assert.equal(pool.jobs.length,0);
+  assert.equal(pool.objectives.length,0);
+});
+
+
+test('Core UI admits only explicitly dispatched P0 read-only review for NV03/NV04',()=>{
+  const base=[
+    'TIGERIQ_EXECUTABLE=true','OWNER_POLICY=AUTO','PRIORITY=P0','RESOURCE_SCOPE=P0_REVIEW_CANARY',
+    'NO_CODE_CHANGE=true','NO_PC01_SHELL=true','NO_DIRECT_MAIN=true','NO_PAID_COST=true',
+    'NO_CREDENTIAL_CHANGE=true','NO_SECURITY_BOUNDARY_CHANGE=true','NO_DESTRUCTIVE=true','NO_PRODUCTION_RELEASE=true',
+    'CAPABILITY=review','OWNER_DIRECT=true','VY_DIRECT_REVIEW_DISPATCH=true','REVIEW_ONLY=true'
+  ];
+  let x=parseCoreUiIssue(issue(39051,[...base,'OWNER_REVIEWER=NV03'].join('\n'),'P0 review NV03'));
+  assert.equal(x.workerId,'NV03');assert.equal(x.priority,'P0');assert.equal(x.readOnly,true);
+  x=parseCoreUiIssue(issue(39052,[...base,'OWNER_REVIEWER=NV04'].join('\n'),'P0 review NV04'));
+  assert.equal(x.workerId,'NV04');assert.equal(x.priority,'P0');assert.equal(x.readOnly,true);
+  assert.equal(parseCoreUiIssue(issue(39053,[...base.filter(line=>line!=='VY_DIRECT_REVIEW_DISPATCH=true'),'OWNER_REVIEWER=NV03'].join('\n'),'P0 blocked')),null);
+  assert.equal(parseCoreUiIssue(issue(39054,[...base,'OWNER_REVIEWER=NV11'].join('\n'),'P0 invalid reviewer')),null);
+  assert.equal(parseCoreUiIssue(issue(39055,[...base.filter(line=>line!=='NO_SECURITY_BOUNDARY_CHANGE=true'),'OWNER_REVIEWER=NV03'].join('\n'),'P0 missing safety')),null);
+});
+
+test('Core UI routes NV04 second-opinion assignments and emits the dedicated role',()=>{
+  let x=parseCoreUiIssue(issue(29101,safe(['CAPABILITY=second_opinion']).replace('RESOURCE_SCOPE=UI_CANARY','RESOURCE_SCOPE=SECOND_OPINION_CANARY'),'Second opinion canary'));
+  assert.equal(x.workerId,'NV04');assert.equal(x.capability,'second_opinion');
+  assert.equal(selectCoreUiWorker('second_opinion'),'NV04');
+  let prompt=buildCoreUiPrompt(x);
+  assert.match(prompt,/NV04_ROLE=SECOND_OPINION/);
+  assert.match(prompt,/MUTATION_ALLOWED=false/);
+
+  x=parseCoreUiIssue(issue(29102,safe(['CAPABILITY=review','REVIEW_SPECIALTY=FACT_CHECK']).replace('RESOURCE_SCOPE=UI_CANARY','RESOURCE_SCOPE=FACT_CHECK_CANARY'),'Fact check canary'));
+  assert.equal(x.workerId,'NV04');assert.equal(x.capability,'second_opinion');
+  prompt=buildCoreUiPrompt(x);
+  assert.match(prompt,/NV04_ROLE=SECOND_OPINION/);
+});
+
+
+test('idle NV03/NV04 can absorb explicit CORE_REVIEW overflow without duplicate scope',async()=>{
+  const pool=fakePool();
+  const reviewA=issue(4201,safe([
+    'CAPABILITY=review',
+    'EXECUTION_SURFACE=CORE_REVIEW',
+    'REVIEW_ONLY=true',
+    'INDEPENDENT_EVALUATION=true',
+  ]).replace('RESOURCE_SCOPE=UI_CANARY','RESOURCE_SCOPE=CORE_REVIEW_OVERFLOW_A'),'Core review overflow A');
+  const reviewB=issue(4202,safe([
+    'CAPABILITY=review',
+    'EXECUTION_SURFACE=CORE_REVIEW',
+    'REVIEW_ONLY=true',
+    'INDEPENDENT_EVALUATION=true',
+  ]).replace('RESOURCE_SCOPE=UI_CANARY','RESOURCE_SCOPE=CORE_REVIEW_OVERFLOW_B'),'Core review overflow B');
+  const fetchImpl=async url=>{
+    const m=url.match(/\/issues\/(\d+)$/);
+    return response(m?[reviewA,reviewB].find(x=>x.number===Number(m[1])):[reviewA,reviewB]);
+  };
+  const snap=await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.equal(pool.jobs.length,2);
+  assert.deepEqual(snap.nextJobs.map(x=>x.workerId).sort(),['NV03','NV04']);
+  assert.deepEqual(new Set(pool.objectives.map(x=>x.metadata.resourceScope)).size,2);
+});
+
+test('CORE_REVIEW overflow preserves reviewer independence for NV03/NV04',()=>{
+  const nv03Implemented=parseCoreUiIssue(issue(4203,safe([
+    'CAPABILITY=review',
+    'EXECUTION_SURFACE=CORE_REVIEW',
+    'IMPLEMENTER=NV03',
+  ]),'NV03 implemented'));
+  assert.deepEqual(nv03Implemented.eligibleWorkerIds,['NV04']);
+  const nv04Implemented=parseCoreUiIssue(issue(4204,safe([
+    'CAPABILITY=review',
+    'EXECUTION_SURFACE=CORE_REVIEW',
+    'IMPLEMENTER_EMPLOYEE=NV04',
+  ]),'NV04 implemented'));
+  assert.deepEqual(nv04Implemented.eligibleWorkerIds,['NV03']);
+});
+
+
+test('flexible review exposes NV03/NV04 as eligible failover workers',()=>{
+  const x=parseCoreUiIssue(issue(4301,safe([
+    'TARGET_EMPLOYEE=NV03',
+    'PREFERRED_REVIEWER=NV03',
+    'CAPABILITY=review',
+    'CORE_TARGET_STRICT=false',
+  ]),'Flexible review'));
+  assert.deepEqual(x.eligibleWorkerIds,['NV03','NV04']);
+});
+
+test('stale unstarted NV03 UI assignment fails over to idle NV04 without minting a new objective',async()=>{
+  const pool=fakePool();
+  const review=issue(4302,safe([
+    'TARGET_EMPLOYEE=NV03',
+    'PREFERRED_REVIEWER=NV03',
+    'CAPABILITY=review',
+    'CORE_TARGET_STRICT=false',
+  ]).replace('RESOURCE_SCOPE=UI_CANARY','RESOURCE_SCOPE=STALE_UI_FAILOVER'),'Stale UI review');
+  const fetchImpl=async url=>response(url.includes('/issues/4302')?review:[review]);
+  await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.equal(pool.jobs.length,1);
+  assert.equal(pool.jobs[0].employee_id,'NV03');
+  pool.jobs[0].created_at=new Date(Date.now()-CORE_UI_ASSIGNMENT_STALE_MS-1000).toISOString();
+  const snap=await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.equal(pool.jobs.length,1,'must preserve the same job');
+  assert.equal(pool.objectives.length,1,'must preserve the same objective');
+  assert.equal(pool.jobs[0].employee_id,'NV04');
+  assert.match(pool.jobs[0].prompt,/^NV04_ROLE=INDEPENDENT_REVIEW$/m);
+  assert.match(pool.jobs[0].prompt,/^EXACT_INPUT=https:\/\/github\.com\//m);
+  assert.equal(snap.workerBindings.NV04.currentWorkOrder.jobId,'GH-4302');
+  assert.ok(pool.events.some(e=>e.type==='CORE_UI_ASSIGNMENT_FAILOVER'));
+  const afterFirst=pool.jobs[0].employee_id;
+  const second=await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+  assert.equal(pool.jobs[0].employee_id,afterFirst,'must not ping-pong on a later snapshot');
+  assert.equal(pool.events.filter(e=>e.type==='CORE_UI_ASSIGNMENT_FAILOVER').length,1);
+  assert.equal(second.workerBindings.NV04.currentWorkOrder.jobId,'GH-4302');
+});
+
+test('internal final-review evidence accepts multiline findings',()=>{
+  const head='1234567890abcdef1234567890abcdef12345678';
+  const parsed=parseInternalReviewEvidence([
+    '[TIGERIQ_INDEPENDENT_REVIEW_V1]',
+    'REVIEW=PASS',
+    'TARGET_HEAD='+head,
+    'SUMMARY=verified',
+    'FINDINGS=first line',
+    'second line',
+  ].join('\n'),'TARGET_HEAD='+head);
+  assert.equal(parsed.valid,true);
+  assert.match(parsed.reviewEvidence.findings,/second line/);
+});
+
+test('internal final-review preserves BLOCKED and EXTERNAL_WAIT job semantics',async()=>{
+  for(const [terminal,expectedStatus,expectedEvent] of [
+    ['BLOCKED','blocked','CORE_UI_FINAL_REVIEW_BLOCKED'],
+    ['EXTERNAL_WAIT','external_wait','CORE_UI_FINAL_REVIEW_EXTERNAL_WAIT'],
+  ]){
+    const pool=fakePool();
+    pool.objectives.push({id:'OBJ-X',priority:'P1',status:'active',metadata:{issueUrl:'https://github.com/newsdayads/tigeriq-ai-lab/issues/999',resourceScope:'REVIEW_X'},updated_at:'2026-10-06T00:00:00Z'});
+    pool.jobs.push({id:'FINAL-REVIEW-X-'+terminal,objective_id:'OBJ-X',status:'ui_assigned',employee_id:'NV03',resource_id:'res:ui:nv03:subscription:chrome',provider:'ui',kind:'ui',prompt:'TARGET_HEAD=1234567890abcdef1234567890abcdef12345678',routing_decision:{authority:'CORE_UI_FINAL_REVIEW'}});
+    const out=await completeCoreUiAssignment({pool,jobId:'FINAL-REVIEW-X-'+terminal,workerId:'NV03',terminal,result:terminal});
+    assert.equal(out.terminal,terminal);
+    assert.equal(pool.jobs[0].status,expectedStatus);
+    assert.equal(pool.jobs[0].failure.kind,terminal);
+    assert.ok(pool.events.some(e=>e.type===expectedEvent));
+  }
+});
+
+
+test('review substep DONE keeps parent open despite header drift; ordinary DONE may close',async()=>{
+  const scenarios=[
+    {n:44571,assigned:['REVIEW_ONLY=true'],terminal:[],close:false,sticky:true},
+    {n:45781,assigned:[],terminal:['REVIEW_ONLY=true'],close:false,sticky:false},
+    {n:44572,assigned:['KEEP_OPEN_ON_STEP_COMPLETE=true'],terminal:[],close:false,sticky:true},
+    {n:44573,assigned:[],terminal:[],close:true,sticky:false},
+  ];
+  for(const scenario of scenarios){
+    const pool=fakePool();
+    let current=issue(scenario.n,safe(['CAPABILITY=review',...scenario.assigned]),'Terminal boundary');
+    let posted=0,patched=0;
+    const base='https://github.com/newsdayads/tigeriq-ai-lab/issues/'+scenario.n;
+    const fetchImpl=async(url,init={})=>{
+      if(url.endsWith('/comments')&&init.method==='POST'){
+        posted++;
+        return response({html_url:base+'#issuecomment-'+posted,body:JSON.parse(init.body).body});
+      }
+      if(url.includes('/comments?'))return response([]);
+      if(url.endsWith('/issues/'+scenario.n)&&init.method==='PATCH'){
+        patched++;
+        current={...current,state:'closed',state_reason:'completed'};
+        return response(current);
+      }
+      if(url.endsWith('/issues/'+scenario.n))return response(current);
+      return response([current]);
+    };
+    await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'x'});
+    assert.equal(pool.objectives[0].metadata.keepParentOpenAtAssignment,scenario.sticky);
+    current={...current,body:safe(['CAPABILITY=review',...scenario.terminal])};
+    const result=await completeCoreUiAssignment({pool,fetchImpl,token:'x',jobId:'GH-'+scenario.n,workerId:'NV03',terminal:'DONE',result:'Review substep complete; no parent acceptance'});
+    assert.equal(result.terminal,'DONE');
+    assert.equal(posted,1,'exactly one reviewer evidence comment');
+    assert.equal(patched,scenario.close?1:0,'parent closure must honor sticky/current policy');
+    assert.equal(current.state,scenario.close?'closed':'open');
+    assert.equal(pool.jobs[0].status,'done','review slot must be released');
+    assert.equal(pool.objectives[0].status,'completed','only Core UI subtask objective is terminal');
+  }
+});
+
+test('NV03 independent self-pull fence requires all three verified Core gates; default keeps existing route',()=>{
+  const env={TIGERIQ_NV03_SELF_PULL_MODE:'GITHUB_SELF_PULL',
+    TIGERIQ_NV03_CORE_ROUTE_FENCED:'1',TIGERIQ_NV03_GLOBAL_LEASE_VERIFIED:'1'};
+  assert.equal(coreUiNv03SelfPullFenced({}),false);
+  for(const key of Object.keys(env))assert.equal(coreUiNv03SelfPullFenced({...env,[key]:''}),false,key);
+  assert.equal(coreUiNv03SelfPullFenced(env),true);
+  assert.equal(selectCoreUiWorker('review'),'NV03');
+  assert.equal(selectCoreUiWorker('research'),'NV04');
+});
+
+test('Owner explicit NV03 Core routing disable is fail-closed by default and preserves NV04 and NV02',()=>{
+  assert.equal(coreUiNv03CoreRoutingDisabled({}),false);
+  assert.equal(coreUiNv03CoreRoutingDisabled({TIGERIQ_NV03_CORE_DISPATCH_DISABLED:'true'}),false);
+  assert.equal(coreUiNv03CoreRoutingDisabled({TIGERIQ_NV03_CORE_DISPATCH_DISABLED:'1'}),true);
+  const before=process.env.TIGERIQ_NV03_CORE_DISPATCH_DISABLED;
+  try{
+    process.env.TIGERIQ_NV03_CORE_DISPATCH_DISABLED='1';
+    const snap=readyUnassignedCoreUiSnapshot();
+    assert.equal(snap.workerBindings.NV03.state,'EXTERNAL_TO_CORE');
+    assert.equal(snap.workerBindings.NV04.state,'READY_UNASSIGNED');
+    assert.equal(snap.workerBindings.NV02.state,'EXTERNAL_TO_CORE');
+    assert.equal(selectCoreUiWorker('review'),'NV04');
+    assert.equal(selectCoreUiWorker('research'),'NV04');
+  }finally{
+    if(before===undefined)delete process.env.TIGERIQ_NV03_CORE_DISPATCH_DISABLED;
+    else process.env.TIGERIQ_NV03_CORE_DISPATCH_DISABLED=before;
+  }
+  assert.equal(selectCoreUiWorker('review'),'NV03');
+});
+
+test('installed Core launcher persistently disables NV03 Core routing after updater restart',()=>{
+ const script=readFileSync(new URL('../scripts/tigeriq-core/run-core.ps1',import.meta.url),'utf8');
+ assert.match(script,/\$env:TIGERIQ_NV03_CORE_DISPATCH_DISABLED='1'/);
+ assert.match(script,/\$env:TIGERIQ_CORE_PORT='8795'/);
+});
+
+test('Core NV04 idle audit is created only after normal work absence; terminal findings remain verification-gated',async()=>{
+  const pool=fakePool(),sha='0000000000000000000000000000000000000000';
+  const content='export function auditRoute(){return 12345678;}\nexport const VERSION=2026;\n';
+  const fetchImpl=async url=>{
+    if(url.includes('/issues?'))return response([]);
+    if(url.includes('/commits/main'))return response({sha});
+    if(url.includes('/contents/'))return response({encoding:'base64',sha:'fixture-blob',content:Buffer.from(content).toString('base64')});
+    throw Error('UNEXPECTED_IDLE_FETCH:'+url);
+  };
+  const ready={id:'NV04',status:'READY',uiPhase:'READY',uiBusy:false,blocked:false,heartbeatAt:new Date().toISOString(),
+    url:'https://gemini.google.com/app',securityBlock:null,windowState:'OPEN',composerReady:true};
+  const args={pool,fetchImpl,token:'test',nv04Observation:ready,nv04IdleEnabled:true,nv04IdleForceProbe:true};
+  const snapshot=await buildCoreUiAssignmentSnapshot(args);
+  assert.equal(snapshot.nextJobs.length,1);
+  assert.equal(snapshot.nextJobs[0].workerId,'NV04');
+  assert.match(snapshot.nextJobs[0].jobId,/^NV04-AUDIT-0{12}-\d{8}T(?:00|06|12|18)$/);
+  assert.match(snapshot.nextJobs[0].prompt,/KHONG_SUA_CODE/);
+  assert.equal(pool.jobs.length,1);
+  const repeated=await buildCoreUiAssignmentSnapshot(args);
+  assert.equal(repeated.nextJobs.length,1);
+  assert.equal(pool.jobs.length,1);
+  const finding={path:pool.objectives[0].metadata.sourcePaths[0],line:1,quote:'export function auditRoute()',
+    description:'Có nguy cơ sai định tuyến trong trường hợp đầu vào biên',repro:'Tạo test cho dữ liệu đầu vào không hợp lệ',severity:'P2'};
+  const result=['NV04_IDLE_AUDIT_RESULT_V1','SOURCE_SHA='+sha,'AUDIT_SLOT='+pool.objectives[0].metadata.auditSlot,'FINDINGS_JSON='+JSON.stringify([finding])].join('\n');
+  const completed=await completeCoreUiAssignment({pool,fetchImpl,token:'test',jobId:snapshot.nextJobs[0].jobId,workerId:'NV04',terminal:'DONE',result});
+  assert.equal(completed.accepted,true);
+  assert.equal(completed.repairAuthorized,false);
+  assert.equal(completed.findingCount,1);
+  assert.equal(pool.jobs[0].status,'done');
+  assert.equal(pool.jobs[0].result.findings[0].verification,'SOURCE_LINE_CONFIRMED_LOGIC_UNVERIFIED');
+  const after=await buildCoreUiAssignmentSnapshot(args);
+  assert.equal(after.nextJobs.length,0);
+  assert.equal(pool.jobs.length,1);
+  const previous=await buildCoreUiAssignmentSnapshot({...args,previousJobId:snapshot.nextJobs[0].jobId});
+  assert.equal(previous.previousJob.status,'DONE');
+  assert.equal(previous.previousJob.executable,false);
+});
+
+test('Core NV04 idle audit does not preempt a real P1-P5 research task',async()=>{
+  const pool=fakePool(),sha='0000000000000000000000000000000000000000';
+  const work=issue(4889,safe(['CAPABILITY=research']).replace('PRIORITY=P2','PRIORITY=P1'));
+  const fetchImpl=async url=>{
+    if(url.includes('/issues?'))return response([work]);
+    if(url.endsWith('/issues/4889'))return response(work);
+    if(url.includes('/commits/main')||url.includes('/contents/'))throw Error('IDLE_SOURCE_SHOULD_NOT_BE_FETCHED');
+    return response([]);
+  };
+  const ready={id:'NV04',status:'READY',uiPhase:'READY',uiBusy:false,blocked:false,heartbeatAt:new Date().toISOString(),
+    url:'https://gemini.google.com/app',securityBlock:null,windowState:'OPEN',composerReady:true};
+  const snap=await buildCoreUiAssignmentSnapshot({pool,fetchImpl,token:'test',nv04Observation:ready,nv04IdleEnabled:true,nv04IdleForceProbe:true});
+  assert.equal(snap.nextJobs[0].jobId,'GH-4889');
+  assert.equal(pool.jobs.length,1);
+});

@@ -1,0 +1,133 @@
+$ErrorActionPreference='Stop'
+Set-StrictMode -Version Latest
+. 'D:\TigerIQ\Rebuild\credential-store.ps1'
+$defaultRepo='D:\TigerIQ\Workspace\tigeriq-ai-lab'
+$runtimeSourceState='D:\TigerIQ\State\core-runtime-source.json'
+$repo=$defaultRepo
+if(Test-Path -LiteralPath $runtimeSourceState){
+  try{$meta=Get-Content -Raw -LiteralPath $runtimeSourceState|ConvertFrom-Json;if($meta.sourcePath -and (Test-Path -LiteralPath ([string]$meta.sourcePath))){$repo=[string]$meta.sourcePath}}catch{}
+}
+$updaterTask='TigerIQ Core Runtime Updater'
+function Ensure-CoreRuntimeUpdater {
+  $existing=Get-ScheduledTask -TaskName $updaterTask -ErrorAction SilentlyContinue
+  if($existing){return}
+  $installer=Join-Path $repo 'scripts\tigeriq-core\install-core-updater.ps1'
+  if(-not(Test-Path -LiteralPath $installer)){throw 'CORE_RUNTIME_UPDATER_INSTALLER_MISSING'}
+  & 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $installer -Repo $repo
+  if($LASTEXITCODE -ne 0){throw ('CORE_RUNTIME_UPDATER_INSTALL_FAILED:'+ $LASTEXITCODE)}
+  $created=Get-ScheduledTask -TaskName $updaterTask -ErrorAction SilentlyContinue
+  if(-not $created){throw 'CORE_RUNTIME_UPDATER_TASK_RECREATE_FAILED'}
+}
+Ensure-CoreRuntimeUpdater
+$core=Join-Path $repo 'apps\tigeriq-core\core-entry.mjs'
+$coreMatch=$core.ToLowerInvariant()
+$logDir='D:\TigerIQ\Logs\Core24x7'
+New-Item -ItemType Directory -Path $logDir -Force|Out-Null
+$supervisorMutex=New-Object Threading.Mutex($false,'Global\TigerIQCoreSupervisorV2')
+$ownsSupervisor=$false
+try{$ownsSupervisor=$supervisorMutex.WaitOne(0)}catch{$ownsSupervisor=$false}
+if(-not $ownsSupervisor){exit 73}
+function Stop-OrphanCore {
+  $procs=Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue | Where-Object {$_.CommandLine -and $_.CommandLine.ToLowerInvariant().Contains($coreMatch)}
+  foreach($proc in $procs){try{Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop}catch{}}
+}
+function Set-SecretEnv([string]$EnvName,[string]$SecretName,[string]$Entropy){
+  $value=Get-TigerIQSecret $SecretName $Entropy
+  if(-not[string]::IsNullOrWhiteSpace($value)){[Environment]::SetEnvironmentVariable($EnvName,$value,'Process')}
+}
+# Owner-approved standing Free proof: no synthetic monthly expiry extension.
+# Fail closed for missing scope/approval or unsafe paid/billing flags.
+# Only NV11 Groq and NV12 Gemini are admitted by this standing gate.
+function Test-TigerIQFreeProviderProof([object]$Proof,[string]$Provider) {
+  if($null -eq $Proof -or $Provider -notin @('groq','gemini')){return $false}
+  if(-not $Proof.PSObject.Properties['provider'] -or [string]$Proof.provider -cne $Provider){return $false}
+  if([string]$Proof.plan -cne 'Free' -or [double]$Proof.priceUsd -ne 0 -or $Proof.ownerConfirmed -cne $true -or $Proof.paidFallbackAllowed -cne $false){return $false}
+  if($Provider -eq 'gemini' -and $Proof.billingLinked -cne $false){return $false}
+  $now=[DateTime]::UtcNow
+  $expires=[DateTime]::MinValue
+  if($Proof.PSObject.Properties['expiresAtUtc']){try{$expires=[DateTime]::Parse([string]$Proof.expiresAtUtc).ToUniversalTime()}catch{return $false}}
+  if($expires -gt $now){return $true}
+  # Current screenshot and explicit Owner scope permit continued free-only use;
+  # any paid-account setting change must revoke this standing authorization.
+  if(-not $Proof.PSObject.Properties['standingZeroCostApproved'] -or $Proof.standingZeroCostApproved -cne $true){return $false}
+  if(-not $Proof.PSObject.Properties['standingApprovalSource'] -or [string]$Proof.standingApprovalSource -cne 'owner_direct_2026-10-15'){return $false}
+  if(-not $Proof.PSObject.Properties['verifiedAtUtc']){return $false}
+  try{$verified=[DateTime]::Parse([string]$Proof.verifiedAtUtc).ToUniversalTime()}catch{return $false}
+  if($verified -gt $now -or $verified -lt [DateTime]'2026-10-15T00:00:00Z'){return $false}
+  if(-not $Proof.PSObject.Properties['source'] -or [string]$Proof.source -notlike 'owner_screenshot_2026-10-15_*'){return $false}
+  return $true
+}
+function Clear-CoreEnvironment {
+  $names=@('DATABASE_URL','PGPASSWORD','TIGERIQ_CORE_TOKEN','TIGERIQ_GITHUB_TOKEN','GROQ_API_KEY','GEMINI_API_KEY','OPENROUTER_API_KEY','MISTRAL_API_KEY','CLOUDFLARE_AUTH_TOKEN','HF_TOKEN','INCEPTION_API_KEY','WATSONX_API_KEY','COHERE_API_KEY','NVIDIA_API_KEY','CLOUDFLARE_ACCOUNT_ID','WATSONX_PROJECT_ID','WATSONX_MODEL_ID','TIGERIQ_GROQ_FREE_TIER_VERIFIED','TIGERIQ_GEMINI_FREE_TIER_VERIFIED','TIGERIQ_INCEPTION_FREE_TIER_VERIFIED','TIGERIQ_INCEPTION_MODEL','TIGERIQ_WATSONX_LITE_CONFIRMED','TIGERIQ_COHERE_TRIAL_CONFIRMED','TIGERIQ_NVIDIA_FREE_DEV_CONFIRMED','TIGERIQ_GEMINI_MODEL','TIGERIQ_GEMINI_MIN_INTERVAL_MS','TIGERIQ_GEMINI_BACKOFF_BASE_MS','TIGERIQ_GEMINI_MAX_ATTEMPTS','TIGERIQ_GITHUB_RECONCILE_MS','TIGERIQ_OLLAMA_MODEL','TIGERIQ_NV10_NATIVE_STRUCTURED')
+  foreach($name in $names){[Environment]::SetEnvironmentVariable($name,$null,'Process')}
+}
+function Get-SecretStamp {
+  $files=Get-ChildItem 'D:\TigerIQ\Secrets' -File -ErrorAction SilentlyContinue | Where-Object {$_.Name -match 'api|token|proof|config|database-url|pgpass'} | Sort-Object Name
+  return (($files | ForEach-Object {$_.Name+':'+$_.Length+':'+$_.LastWriteTimeUtc.Ticks}) -join '|')
+}
+function Load-CoreEnvironment {
+  Clear-CoreEnvironment
+  $env:DATABASE_URL=(Get-Content -Raw 'D:\TigerIQ\Secrets\workforce-controller-v1.database-url').Trim()
+  $pgLine=(Get-Content 'D:\TigerIQ\Secrets\workforce-controller-v1.pgpass'|Where-Object{$_ -and -not $_.StartsWith('#')}|Select-Object -First 1)
+  $env:PGPASSWORD=([string]$pgLine).Split(':',5)[4]
+  $env:TIGERIQ_CORE_TOKEN=(Get-Content -Raw 'D:\TigerIQ\Secrets\pc01-primary-node.ingress-token').Trim()
+  $githubTokenPath='D:\TigerIQ\Secrets\github-command-center.token'
+  if(Test-Path -LiteralPath $githubTokenPath){$env:TIGERIQ_GITHUB_TOKEN=(Get-Content -Raw -LiteralPath $githubTokenPath).Trim()}
+  $tail=(tailscale ip -4 2>$null | Select-Object -First 1)
+  $env:TIGERIQ_CORE_HOST=if($tail){[string]$tail}else{'127.0.0.1'}
+  $env:TIGERIQ_CORE_PORT='8795'
+  # Owner direct 2026-10-10: NV03 independently self-pulls GitHub P1-P5; Core may dispatch review/research to NV04 only.
+  $env:TIGERIQ_NV03_CORE_DISPATCH_DISABLED='1'
+  # P0 Owner 2026-10-11: opt-in LOCAL NV10 native structured output; reversible via guarded source rollback.
+  $env:TIGERIQ_OLLAMA_MODEL='gemma3:4b'
+  $env:TIGERIQ_NV10_NATIVE_STRUCTURED='enabled'
+  $env:TIGERIQ_ALLOW_PAID_AI='false'
+  $env:TIGERIQ_GITHUB_RECONCILE_MS='30000'
+  $env:TIGERIQ_GITHUB_SHARED_CACHE_MS='30000'
+  $env:TIGERIQ_GITHUB_PROJECTION_CACHE_MS='120000'
+  $env:TIGERIQ_GITHUB_LOW_WATERMARK='250'
+  $env:TIGERIQ_GEMINI_MODEL='gemini-3.5-flash-lite'
+  $env:TIGERIQ_GEMINI_MIN_INTERVAL_MS='4500'
+  $env:TIGERIQ_GEMINI_BACKOFF_BASE_MS='4500'
+  $env:TIGERIQ_GEMINI_MAX_ATTEMPTS='4'
+  $groqProof=Get-Content -Raw 'D:\TigerIQ\Secrets\groq-free-tier-proof.json'|ConvertFrom-Json
+  $geminiProof=Get-Content -Raw 'D:\TigerIQ\Secrets\gemini-free-tier-proof.json'|ConvertFrom-Json
+  if(Test-TigerIQFreeProviderProof -Proof $groqProof -Provider 'groq'){
+    Set-SecretEnv 'GROQ_API_KEY' 'groq-api-key' 'TigerIQ-Groq-PC01-v1';$env:TIGERIQ_GROQ_FREE_TIER_VERIFIED='true'
+  }
+  if(Test-TigerIQFreeProviderProof -Proof $geminiProof -Provider 'gemini'){
+    Set-SecretEnv 'GEMINI_API_KEY' 'gemini-api-key' 'TigerIQ-Gemini-PC01-v1';$env:TIGERIQ_GEMINI_FREE_TIER_VERIFIED='true'
+  }
+  Set-SecretEnv 'OPENROUTER_API_KEY' 'openrouter-api-key' 'TigerIQ-OpenRouter-PC01-v1'
+  Set-SecretEnv 'MISTRAL_API_KEY' 'mistral-api-key' 'TigerIQ-Mistral-PC01-v1'
+  Set-SecretEnv 'CLOUDFLARE_AUTH_TOKEN' 'cloudflare-auth-token' 'TigerIQ-Cloudflare-PC01-v1'
+  Set-SecretEnv 'HF_TOKEN' 'hf-token' 'TigerIQ-HuggingFace-PC01-v1'
+  Set-SecretEnv 'WATSONX_API_KEY' 'watsonx-api-key' 'TigerIQ-Watsonx-PC01-v1'
+  Set-SecretEnv 'COHERE_API_KEY' 'cohere-api-key' 'TigerIQ-Cohere-PC01-v1'
+  Set-SecretEnv 'NVIDIA_API_KEY' 'nvidia-api-key' 'TigerIQ-NVIDIA-PC01-v1'
+  $cf=Get-TigerIQConfig 'cloudflare-config';if($cf -and $cf.PSObject.Properties['accountId']){$env:CLOUDFLARE_ACCOUNT_ID=[string]$cf.accountId}
+  $inc=Get-TigerIQConfig 'inception-proof';if($inc -and $inc.PSObject.Properties['plan'] -and [string]$inc.plan -eq 'Free' -and $inc.PSObject.Properties['freeConfirmed'] -and $inc.freeConfirmed -and $inc.PSObject.Properties['freeTokens'] -and [double]$inc.freeTokens -gt 0 -and $inc.PSObject.Properties['creditCardRequired'] -and -not $inc.creditCardRequired -and $inc.PSObject.Properties['paidFallbackAllowed'] -and -not $inc.paidFallbackAllowed){Set-SecretEnv 'INCEPTION_API_KEY' 'inception-api-key' 'TigerIQ-Inception-PC01-v1';$env:TIGERIQ_INCEPTION_FREE_TIER_VERIFIED='true';$env:TIGERIQ_INCEPTION_MODEL='mercury-2.5'}
+  $wx=Get-TigerIQConfig 'watsonx-config';if($wx){if($wx.PSObject.Properties['projectId']){$env:WATSONX_PROJECT_ID=[string]$wx.projectId};if($wx.PSObject.Properties['modelId']){$env:WATSONX_MODEL_ID=[string]$wx.modelId};if($wx.PSObject.Properties['liteConfirmed'] -and $wx.liteConfirmed){$env:TIGERIQ_WATSONX_LITE_CONFIRMED='true'}}
+  $co=Get-TigerIQConfig 'cohere-proof';if($co -and $co.PSObject.Properties['trialConfirmed'] -and $co.trialConfirmed){$env:TIGERIQ_COHERE_TRIAL_CONFIRMED='true'}
+  $nv=Get-TigerIQConfig 'nvidia-proof';if($nv -and $nv.PSObject.Properties['freeConfirmed'] -and $nv.freeConfirmed){$env:TIGERIQ_NVIDIA_FREE_DEV_CONFIRMED='true'}
+}
+Stop-OrphanCore
+while($true){
+  try {
+    Load-CoreEnvironment
+    $stamp=Get-SecretStamp
+    $out=Join-Path $logDir ('core-'+(Get-Date -Format 'yyyyMMdd')+'.out.log')
+    $err=Join-Path $logDir ('core-'+(Get-Date -Format 'yyyyMMdd')+'.err.log')
+    $p=Start-Process -FilePath 'C:\Program Files\nodejs\node.exe' -ArgumentList @($core) -PassThru -WindowStyle Hidden -RedirectStandardOutput $out -RedirectStandardError $err
+    while(-not $p.HasExited){
+      Start-Sleep -Seconds 5
+      if((Get-SecretStamp)-ne$stamp){try{Stop-Process -Id $p.Id -Force -ErrorAction Stop}catch{};break}
+    }
+  } catch {
+    $supervisorLog=Join-Path $logDir 'supervisor.log'
+    Add-Content -Path $supervisorLog -Value ((Get-Date -Format o)+' '+($_.Exception.Message)) -Encoding UTF8
+  } finally {
+    Clear-CoreEnvironment
+  }
+  Start-Sleep -Seconds 10
+}

@@ -1,0 +1,405 @@
+import {randomUUID} from 'node:crypto';
+
+export const SHARED_RESOURCE_LEASE_TTL_MS=5*60*1000;
+export const SHARED_RESOURCE_LEASE_HEARTBEAT_MS=30*1000;
+
+export function sharedLeaseIdleWorkState(employeeId='',healthState='READY'){
+  const employee=String(employeeId||'').trim().toUpperCase();
+  const health=String(healthState||'').trim().toUpperCase();
+  if(employee==='NV09'&&['READY','ONLINE'].includes(health))return 'ON_DEMAND';
+  if(health==='ONLINE')return 'IDLE';
+  if(health==='READY')return 'READY';
+  return health||'READY';
+}
+
+export async function ensureSharedResourceLeaseTable(db){
+  if(!db)return false;
+  await db.query(`
+create table if not exists tigeriq_ai_resource_leases(
+  resource_id text primary key,
+  employee_id text not null,
+  lane text not null,
+  work_id text not null,
+  role text not null,
+  lease_token text not null unique,
+  lease_until timestamptz not null,
+  heartbeat_at timestamptz not null default now(),
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists tigeriq_ai_resource_leases_until_idx on tigeriq_ai_resource_leases(lease_until);
+`);
+  return true;
+}
+
+async function clearExpiredLeaseForLockedResource(client,row){
+  const lease=(await client.query(
+    'select * from tigeriq_ai_resource_leases where resource_id=$1 for update',
+    [row.resource_id],
+  )).rows[0]||null;
+  if(!lease||new Date(lease.lease_until).getTime()>Date.now())return false;
+  if(String(row.current_job_id||'')===String(lease.work_id||'')){
+    await client.query(
+      `update tigeriq_ai_resources
+       set current_job_id=null,
+           work_state=case
+             when employee_id='NV09' and health_state in ('READY','ONLINE') then 'ON_DEMAND'
+             when health_state='ONLINE' then 'IDLE'
+             when health_state='READY' then 'READY'
+             else health_state end,
+           updated_at=now()
+       where resource_id=$1 and current_job_id=$2`,
+      [row.resource_id,lease.work_id],
+    );
+    await client.query(
+      `update tigeriq_resources
+       set current_job_id=null,
+           work_state=case
+             when employee_id='NV09' and health_state in ('READY','ONLINE') then 'ON_DEMAND'
+             when health_state='ONLINE' then 'IDLE'
+             when health_state='READY' then 'READY'
+             else health_state end,
+           updated_at=now()
+       where employee_id=$1 and current_job_id=$2`,
+      [row.employee_id,lease.work_id],
+    );
+  }
+  await client.query('delete from tigeriq_ai_resource_leases where resource_id=$1 and lease_token=$2',[row.resource_id,lease.lease_token]);
+  return true;
+}
+
+export async function acquireSharedResourceLease(db,{
+  employeeId,
+  resourceId,
+  workId,
+  role='inference',
+  lane='coding_lane',
+  ttlMs=SHARED_RESOURCE_LEASE_TTL_MS,
+  metadata={},
+}={}){
+  if(!db)throw new Error('SHARED_RESOURCE_LEASE_DB_REQUIRED');
+  const employee=String(employeeId||'').trim().toUpperCase();
+  const resource=String(resourceId||'').trim();
+  const work=String(workId||'').trim();
+  const leaseRole=String(role||'inference').trim().toLowerCase();
+  const leaseLane=String(lane||'coding_lane').trim().toLowerCase();
+  if(!/^NV\d{2}$/.test(employee)||!work)throw new Error('SHARED_RESOURCE_LEASE_IDENTITY_REQUIRED');
+  const client=await db.connect();
+  const token=randomUUID();
+  const ttl=Math.max(30000,Math.min(15*60*1000,Number(ttlMs)||SHARED_RESOURCE_LEASE_TTL_MS));
+  try{
+    await client.query('begin');
+    let row=resource
+      ? (await client.query(
+          `select * from tigeriq_ai_resources
+           where resource_id=$1 and employee_id=$2 and enabled=true
+           for update skip locked`,
+          [resource,employee],
+        )).rows[0]||null
+      : (await client.query(
+          `select * from tigeriq_ai_resources
+           where employee_id=$1 and enabled=true
+           order by rank,resource_id
+           limit 1
+           for update skip locked`,
+          [employee],
+        )).rows[0]||null;
+    if(!row){await client.query('commit');return null;}
+    await clearExpiredLeaseForLockedResource(client,row);
+    row=(await client.query('select * from tigeriq_ai_resources where resource_id=$1',[row.resource_id])).rows[0]||row;
+    if(row.current_job_id){await client.query('commit');return null;}
+    const inserted=await client.query(
+      `insert into tigeriq_ai_resource_leases(resource_id,employee_id,lane,work_id,role,lease_token,lease_until,heartbeat_at,metadata,updated_at)
+       values($1,$2,$3,$4,$5,$6,now()+($7::bigint*interval '1 millisecond'),now(),$8::jsonb,now())
+       on conflict(resource_id) do nothing
+       returning resource_id,employee_id,lane,work_id,role,lease_token,lease_until`,
+      [row.resource_id,employee,leaseLane,work,leaseRole,token,ttl,JSON.stringify(metadata||{})],
+    );
+    if(!inserted.rowCount){await client.query('commit');return null;}
+    const claimed=await client.query(
+      `update tigeriq_ai_resources
+       set current_job_id=$2,work_state='BUSY',updated_at=now()
+       where resource_id=$1 and current_job_id is null
+       returning resource_id`,
+      [row.resource_id,work],
+    );
+    if(!claimed.rowCount){
+      await client.query('delete from tigeriq_ai_resource_leases where resource_id=$1 and lease_token=$2',[row.resource_id,token]);
+      await client.query('commit');
+      return null;
+    }
+    await client.query(
+      `update tigeriq_resources
+       set current_job_id=$2,work_state='BUSY',updated_at=now()
+       where employee_id=$1 and (current_job_id is null or current_job_id=$2)`,
+      [employee,work],
+    );
+    await client.query('commit');
+    return inserted.rows[0];
+  }catch(error){
+    await client.query('rollback').catch(()=>{});
+    throw error;
+  }finally{client.release();}
+}
+
+export async function heartbeatSharedResourceLease(db,{resourceId,leaseToken,ttlMs=SHARED_RESOURCE_LEASE_TTL_MS}={}){
+  if(!db)return false;
+  const ttl=Math.max(30000,Math.min(15*60*1000,Number(ttlMs)||SHARED_RESOURCE_LEASE_TTL_MS));
+  const q=await db.query(
+    `update tigeriq_ai_resource_leases
+     set heartbeat_at=now(),lease_until=now()+($3::bigint*interval '1 millisecond'),updated_at=now()
+     where resource_id=$1 and lease_token=$2 and lease_until>now()
+     returning resource_id`,
+    [String(resourceId||''),String(leaseToken||''),ttl],
+  );
+  return q.rowCount>0;
+}
+
+export async function releaseSharedResourceLease(db,{resourceId,leaseToken}={}){
+  if(!db)return false;
+  const resource=String(resourceId||'').trim();
+  const token=String(leaseToken||'').trim();
+  if(!resource||!token)return false;
+  const client=await db.connect();
+  try{
+    await client.query('begin');
+    const resourceRow=(await client.query(
+      'select resource_id,employee_id,current_job_id,health_state,work_state from tigeriq_ai_resources where resource_id=$1 for update',
+      [resource],
+    )).rows[0]||null;
+    const lease=(await client.query(
+      'select * from tigeriq_ai_resource_leases where resource_id=$1 and lease_token=$2 for update',
+      [resource,token],
+    )).rows[0]||null;
+    if(!lease){await client.query('commit');return false;}
+    if(resourceRow&&String(resourceRow.current_job_id||'')===String(lease.work_id||'')){
+      await client.query(
+        `update tigeriq_ai_resources
+         set current_job_id=null,
+             work_state=case
+               when employee_id='NV09' and health_state in ('READY','ONLINE') then 'ON_DEMAND'
+               when health_state='ONLINE' then 'IDLE'
+               when health_state='READY' then 'READY'
+               else health_state end,
+             updated_at=now()
+         where resource_id=$1 and current_job_id=$2`,
+        [resource,lease.work_id],
+      );
+      await client.query(
+        `update tigeriq_resources
+         set current_job_id=null,
+             work_state=case
+               when employee_id='NV09' and health_state in ('READY','ONLINE') then 'ON_DEMAND'
+               when health_state='ONLINE' then 'IDLE'
+               when health_state='READY' then 'READY'
+               else health_state end,
+             updated_at=now()
+         where employee_id=$1 and current_job_id=$2`,
+        [lease.employee_id,lease.work_id],
+      );
+    }
+    await client.query('delete from tigeriq_ai_resource_leases where resource_id=$1 and lease_token=$2',[resource,token]);
+    await client.query('commit');
+    return true;
+  }catch(error){
+    await client.query('rollback').catch(()=>{});
+    throw error;
+  }finally{client.release();}
+}
+
+export async function recoverExpiredSharedResourceLeases(db){
+  if(!db)return [];
+  const candidates=(await db.query(
+    `select resource_id from tigeriq_ai_resource_leases
+     where lease_until<=now()
+     order by lease_until`,
+  )).rows||[];
+  const recovered=[];
+  for(const candidate of candidates){
+    const client=await db.connect();
+    try{
+      await client.query('begin');
+      const resourceRow=(await client.query(
+        'select resource_id,employee_id,current_job_id,health_state,work_state from tigeriq_ai_resources where resource_id=$1 for update',
+        [candidate.resource_id],
+      )).rows[0]||null;
+      const lease=(await client.query(
+        'select * from tigeriq_ai_resource_leases where resource_id=$1 and lease_until<=now() for update',
+        [candidate.resource_id],
+      )).rows[0]||null;
+      if(!lease){await client.query('commit');continue;}
+      if(resourceRow&&String(resourceRow.current_job_id||'')===String(lease.work_id||'')){
+        await client.query(
+          `update tigeriq_ai_resources
+           set current_job_id=null,
+               work_state=case
+                 when employee_id='NV09' and health_state in ('READY','ONLINE') then 'ON_DEMAND'
+                 when health_state='ONLINE' then 'IDLE'
+                 when health_state='READY' then 'READY'
+                 else health_state end,
+               updated_at=now()
+           where resource_id=$1 and current_job_id=$2`,
+          [lease.resource_id,lease.work_id],
+        );
+        await client.query(
+          `update tigeriq_resources
+           set current_job_id=null,
+               work_state=case
+                 when employee_id='NV09' and health_state in ('READY','ONLINE') then 'ON_DEMAND'
+                 when health_state='ONLINE' then 'IDLE'
+                 when health_state='READY' then 'READY'
+                 else health_state end,
+               updated_at=now()
+           where employee_id=$1 and current_job_id=$2`,
+          [lease.employee_id,lease.work_id],
+        );
+      }
+      await client.query('delete from tigeriq_ai_resource_leases where resource_id=$1 and lease_token=$2',[lease.resource_id,lease.lease_token]);
+      await client.query('commit');
+      recovered.push({resourceId:lease.resource_id,employeeId:lease.employee_id,workId:lease.work_id,role:lease.role,lane:lease.lane});
+    }catch(error){
+      await client.query('rollback').catch(()=>{});
+      throw error;
+    }finally{client.release();}
+  }
+  const orphanedProbes=await recoverOrphanedCoreProbeOccupancies(db);
+  for(const probe of orphanedProbes)console.info(JSON.stringify({event:'CORE_ORPHANED_PROBE_RECOVERED',employeeId:probe.employeeId,resourceId:probe.resourceId,workId:probe.workId}));
+  return recovered;
+}
+
+export async function activeSharedResourceLeases(db){
+  if(!db)return [];
+  const q=await db.query(
+    `select resource_id,employee_id,lane,work_id,role,lease_until,heartbeat_at,metadata
+     from tigeriq_ai_resource_leases
+     where lease_until>now()
+     order by employee_id,resource_id`,
+  );
+  return q.rows||[];
+}
+
+// NV07 bootstrap: read-only, Core-owned translation of an existing atomic lease.
+// Call ONLY inside trusted Core with its DB pool. Never build this receipt from a
+// job payload, LLM result, device connector or the public live-status projection.
+// This reader does not acquire, extend, release or expose a bearer lease token.
+// Require exact Core-pinned resource identity, not employee/job-only matching.
+export const NV07_CANARY_CORE_SCOPE='TIGERIQ_NV07_PC01_READ_ONLY_CANARY_4783';
+export async function readVerifiedNv07CanaryCoreLease(db,{jobId,sourceSha,resourceScope,resourceId,nowMs=Date.now()}={}){
+  if(!db||typeof db.query!=='function')return null;
+  if(typeof jobId!=='string'||!/^[a-z0-9:_-]{6,128}$/i.test(jobId)
+    ||typeof sourceSha!=='string'||!/^[a-f0-9]{40}$/i.test(sourceSha)
+    ||resourceScope!==NV07_CANARY_CORE_SCOPE
+    ||typeof resourceId!=='string'||!/^[a-z0-9:_-]{6,128}$/i.test(resourceId)
+    ||!Number.isFinite(nowMs))return null;
+  // The acquisition path serializes claims; this read only observes the same
+  // canonical DB rows and rejects inactive, disabled or unrelated resource slots.
+  const result=await db.query(
+    `select l.resource_id,l.employee_id,l.work_id,l.lane,l.role,l.lease_until,l.metadata,
+            r.current_job_id,r.enabled,r.employee_id as resource_employee_id
+       from tigeriq_ai_resource_leases l
+       join tigeriq_ai_resources r on r.resource_id=l.resource_id
+      where l.employee_id=$1 and l.work_id=$2 and l.resource_id=$3 and l.lease_until>now()
+        and r.employee_id=$1 and r.enabled=true and r.current_job_id=l.work_id`,
+    ['NV07',jobId,resourceId],
+  );
+  const rows=result?.rows;
+  if(!Array.isArray(rows)||rows.length!==1)return null;
+  const row=rows[0];
+  const meta=row?.metadata;
+  const expires=Date.parse(String(row?.lease_until||''));
+  if(row?.resource_id!==resourceId||row?.employee_id!=='NV07'||row?.resource_employee_id!=='NV07'
+    ||row?.current_job_id!==jobId||row?.enabled!==true
+    ||row?.lane!=='nv07_bootstrap'||row?.role!=='canary'
+    ||!meta||typeof meta!=='object'||Array.isArray(meta)
+    ||meta.workOrderId!==4783||meta.resourceScope!==NV07_CANARY_CORE_SCOPE
+    ||meta.sourceSha!==sourceSha||meta.action!=='READ_METADATA'
+    ||typeof meta.idempotencyKey!=='string'
+    ||meta.idempotencyKey.length<16||meta.idempotencyKey.length>128
+    ||!Number.isFinite(expires)||expires<=nowMs)return null;
+  // verifiedByCore is warranted only by the trusted caller and this actual DB
+  // observation; the separate Owner/session/provenance gates must still pass.
+  return Object.freeze({
+    verifiedByCore:true,job_id:jobId,employee_id:'NV07',
+    resource_scope:NV07_CANARY_CORE_SCOPE,state:'ACTIVE',
+    idempotency_key:meta.idempotencyKey,expires_at:new Date(expires).toISOString(),
+  });
+}
+
+// Opt-in Core-side host callback bound to a trusted pinned Work Order.
+// The job payload may supply neither sourceSha nor identity to this callback;
+// keep the pinned source SHA and job ID inside the trusted Core closure.
+// This is the lease-reader callback ONLY, not device/session authority, a
+// lease claim, a CLI launch, or a durable reservation.
+export function bindNv07CanaryCoreLeaseCallback(db,{jobId,sourceSha,resourceId}={}){
+  const valid=Boolean(db&&typeof db.query==='function'
+    &&typeof jobId==='string'&&/^[a-z0-9:_-]{6,128}$/i.test(jobId)
+    &&typeof sourceSha==='string'&&/^[a-f0-9]{40}$/i.test(sourceSha)
+    &&typeof resourceId==='string'&&/^[a-z0-9:_-]{6,128}$/i.test(resourceId));
+  return async ({resourceScope,jobId:requestedJobId}={})=>{
+    if(!valid||requestedJobId!==jobId||resourceScope!==NV07_CANARY_CORE_SCOPE)return null;
+    // Read the canonical DB on each invocation: the bootstrap host rechecks
+    // lease freshness immediately before a single bounded CLI invocation.
+    return readVerifiedNv07CanaryCoreLease(db,{
+      jobId,sourceSha,resourceScope,resourceId,nowMs:Date.now(),
+    });
+  };
+}
+
+export function indexSharedResourceLeases(rows=[]){
+  return new Map((Array.isArray(rows)?rows:[]).map(row=>[String(row.resource_id||row.resourceId||''),row]).filter(([key])=>key));
+}
+
+// Core health probes occupy the resource slot through a shared lease. If Core
+// restarts after the lease was deleted, a CORE-PROBE slot can be left BUSY
+// forever. Reconcile ONLY orphan probe slots with no lease row and no live
+// job, using the same row lock that serializes shared lease acquisition.
+// Never clear a manager, coding, reviewer or external-worker claim.
+export async function recoverOrphanedCoreProbeOccupancies(db) {
+  if (!db) return [];
+  const q = await db.query(
+    `
+    with orphan as (
+      select r.resource_id,r.employee_id,r.current_job_id
+      from tigeriq_ai_resources r
+      where r.current_job_id like 'CORE-PROBE:%'
+        and not exists (
+          select 1 from tigeriq_ai_resource_leases l
+          where l.resource_id=r.resource_id
+        )
+        and not exists (
+          select 1 from tigeriq_jobs j
+          where j.id=r.current_job_id and j.status in ('running','dispatching')
+        )
+      for update of r skip locked
+    )
+    update tigeriq_ai_resources r
+    set current_job_id=null,
+        work_state=case
+          when r.employee_id='NV09' and r.health_state in ('READY','ONLINE') then 'ON_DEMAND'
+          when r.health_state='ONLINE' then 'IDLE'
+          when r.health_state='READY' then 'READY'
+          else r.health_state end,
+        updated_at=now()
+    from orphan o
+    where r.resource_id=o.resource_id and r.current_job_id=o.current_job_id
+    returning o.resource_id,o.employee_id,o.current_job_id as work_id`
+  );
+  const recovered=[];
+  for (const row of q.rows||[]) {
+    await db.query(
+      `
+      update tigeriq_resources set current_job_id=null,
+        work_state=case
+          when employee_id='NV09' and health_state in ('READY','ONLINE') then 'ON_DEMAND'
+          when health_state='ONLINE' then 'IDLE'
+          when health_state='READY' then 'READY'
+          else health_state end,
+        updated_at=now()
+      where employee_id=$1 and current_job_id=$2`,
+      [row.employee_id,row.work_id],
+    );
+    recovered.push({resourceId:row.resource_id,employeeId:row.employee_id,workId:row.work_id,role:'probe',lane:'core_probe'});
+  }
+  return recovered;
+}

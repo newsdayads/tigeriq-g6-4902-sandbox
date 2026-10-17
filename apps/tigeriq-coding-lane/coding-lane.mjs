@@ -1,0 +1,2281 @@
+import {createServer} from 'node:http';
+import {managerLocalRequestBody} from '../tigeriq-core/manager-json.mjs';
+import {createNonblockingManagerTick} from './nonblocking-manager-tick.mjs';
+import {codingChatRequestBody,codingChatContent} from '../shared/nvidia-coding-request.mjs';
+import {validateCodingFastHealthResponse} from '../shared/coding-core-health-response.mjs';
+import {createHash,randomUUID} from 'node:crypto';
+import {Pool} from 'pg';
+import {withPc01LocalInferenceSlot} from '../tigeriq-core/pc01-local-inference-slot.mjs';
+import {branchName,checkGateState,extractCanonicalAllowedPaths,isRetryableAiError,parseJsonObject,safeRepoPath,validateChanges} from './policy.mjs';
+import {assertSafeFileChange} from './safety-guard.mjs';
+import {compactPromptForChanges,currentFilesFromPrompt,expandCompactChanges,installAiJsonTransport,parseModelJson} from './ai-json-transport.mjs';
+import { createGeminiRateController } from '../shared/gemini-rate-control.mjs';
+import {assertExecutionPlaneMutationPaths,controlPlaneRepairIntent} from '../shared/control-plane-lock.mjs';
+import {rankCandidates} from '../tigeriq-core/smart-router.mjs';
+import {loadRequiredCodingSkills,assertCodingSkillProof,requiredCodingSkillIdsForDeliverable} from './coding-skill-policy.mjs';
+import {withAtomicCodingSourceClaim} from './atomic-source-claim.mjs';
+import {compileCodingStepPacket,codingStepInstruction,codingStepPacketFromInstruction,codingRolePrompt,verifyCodingDeliverable,verifyCodingFunctionalChecks,repeatedCodingAttemptDecision,verifyClosedCodingWorkOrder,codingFailureSignature,codingMaterialSourceRevision,codingSourceRevisionPaths,codingUnverifiedLegacyHistoryDecision,verifyCodingCanaryProductGate} from './step-contract.mjs';
+
+// Candidate code only: this flag is OFF unless an explicitly scoped isolated canary enables it.
+// The canary gate is evaluated inline so isolated runJob VM tests stay faithful to the default-off runtime.
+import {SHARED_RESOURCE_LEASE_HEARTBEAT_MS,acquireSharedResourceLease,ensureSharedResourceLeaseTable,heartbeatSharedResourceLease,releaseSharedResourceLease} from '../tigeriq-core/shared-resource-lease.mjs';
+
+export class CodingScopeViolationError extends Error {
+  constructor(offending) {
+    super(`CODING_SCOPE_VIOLATION: ${offending.join(', ')}`);
+    this.code='CODING_SCOPE_VIOLATION';
+    this.offending=offending;
+    this.detail={code:'CODING_SCOPE_VIOLATION',offending};
+  }
+}
+
+export function validateJobScope(jobPaths,changes){
+  const allowed=new Set(Array.isArray(jobPaths)?jobPaths:[]);
+  const offending=(changes||[]).map(c=>c?.path).filter(Boolean).filter(p=>!allowed.has(p));
+  if(offending.length) throw new CodingScopeViolationError(offending);
+  return true;
+}
+
+export function validateSourceScope(proposedPaths,canonicalPaths){
+  const canonical=(canonicalPaths||[]).map(value=>String(value||'').trim()).filter(Boolean);
+  if(!canonical.length)return true;
+  const rules=canonical.map(value=>{
+    const directory=value.endsWith('/');
+    const path=value.replace(/\/+$/,'');
+    if(!path||!safeRepoPath(path)){
+      const error=new Error(`CODING_CANONICAL_SCOPE_INVALID:${value}`);
+      error.code='CODING_CANONICAL_SCOPE_INVALID';
+      throw error;
+    }
+    return {path,directory};
+  });
+  const offending=(proposedPaths||[]).map(String).filter(path=>
+    !safeRepoPath(path)||!rules.some(rule=>rule.directory?path.startsWith(`${rule.path}/`):path===rule.path)
+  );
+  if(offending.length)throw new CodingScopeViolationError(offending);
+  return true;
+}
+
+export function validateManagerJobPaths(decision,canonicalPaths=[],mutationAuth={}){
+  if(decision?.status!=='continue')return [];
+  const raw=[...new Set((decision?.job?.paths||[]).map(String))];
+  if(!decision?.job||raw.length<1||raw.length>8||raw.some(p=>!safeRepoPath(p))){
+    const e=new Error('MANAGER_PATHS_INVALID');e.code='MANAGER_PATHS_INVALID';throw e;
+  }
+  // Reject a hallucinated out-of-scope path as a correctable manager output
+  // before evaluating protected-area mutation authority. Both checks still run
+  // for every in-scope proposal; the control-plane deny is never bypassed.
+  try{validateSourceScope(raw,canonicalPaths)}catch(error){
+    const offending=Array.isArray(error?.offending)?error.offending:raw.filter(p=>!(canonicalPaths||[]).includes(p));
+    const e=new Error('MANAGER_SCOPE_MISMATCH:'+offending.join(', '));e.code='MANAGER_SCOPE_MISMATCH';e.detail={offending};throw e;
+  }
+  assertExecutionPlaneMutationPaths(raw,mutationAuth);
+  return raw;
+}
+
+export function shrinkAiPrompt(prompt,maxChars=18000){
+  const p=String(prompt||'');
+  if(p.length<=maxChars)return p;
+  const head=Math.floor(maxChars*0.45),tail=maxChars-head;
+  return `${p.slice(0,head)}\n...[MODEL_CONTEXT_REDUCED]...\n${p.slice(-tail)}`;
+}
+export function preserveGenerationPrompt(prompt){return String(prompt??'')}
+
+export function canonicalWorkTitleFromObjective(objective){
+  const firstLine=String(objective||'').split(/\r?\n/,1)[0].trim();
+  const match=firstLine.match(/^GitHub autonomous coding.*?\bissue #\d+:\s*(.+)$/i);
+  return String(match?.[1]||'').trim().slice(0,180);
+}
+export function isVietnameseWorkTitle(title){
+  const s=String(title||'').trim();
+  if(!s)return false;
+  if(/[ăâđêôơưàáảãạằắẳẵặầấẩẫậèéẻẽẹềếểễệìíỉĩịòóỏõọồốổỗộờớởỡợùúủũụừứửữựỳýỷỹỵ]/i.test(s))return true;
+  return /\b(và|của|cho|với|trong|không|sửa|kiểm|tăng|giảm|khóa|đăng|đối|rà|tổng|hợp|công|việc|tiêu|đề|nhận|lỗi|chạy|hàng|đợi|xử|lý|giám|sát|cập|nhật|kết|nối|bắt|buộc|hiển|thị|nguồn|mã|phục|hồi)\b/i.test(s);
+}
+export function validateManagerJobTitle(decision,objective=''){
+  if(decision?.status!=='continue'||!decision?.job)return true;
+  if(canonicalWorkTitleFromObjective(objective))return true;
+  if(isVietnameseWorkTitle(decision.job.title))return true;
+  const e=new Error('MANAGER_TITLE_NOT_VI');
+  e.code='MANAGER_TITLE_NOT_VI';
+  throw e;
+}
+export function canonicalCodingJobTitle(objective,managerTitle='Công việc Coding'){
+  const canonical=canonicalWorkTitleFromObjective(objective);
+  if(canonical)return canonical;
+  const manager=String(managerTitle||'').trim();
+  return (isVietnameseWorkTitle(manager)?manager:'Công việc Coding').slice(0,180);
+}
+export function codingMergeCommitTitle(number,title){
+  const n=Math.max(1,Number(number)||1);
+  const work=canonicalCodingJobTitle('',title);
+  return `PR #${n} - ${work}`;
+}
+
+export function assertPrOpenState(pr){
+  if(pr?.state==='open')return true;
+  const code=pr?.merged?'PR_EXTERNALLY_MERGED':'PR_CLOSED_UNMERGED';
+  const e=new Error(code);
+  e.code=code;
+  e.detail={code,number:pr?.number||null,state:pr?.state||null,merged:Boolean(pr?.merged)};
+  throw e;
+}
+
+export function reviewReworkDecision(review,reviewCycle,{maxCycles=3}={}){
+  const decision=String(review?.decision||'').trim().toLowerCase();
+  const cycle=Math.max(0,Number(reviewCycle)||0);
+  const limit=Math.max(1,Number(maxCycles)||3);
+  const issues=Array.isArray(review?.issues)?review.issues.map(String).filter(Boolean).slice(0,8):[];
+  if(decision==='approve')return {action:'approve',issues,nextStatus:'review'};
+  if(decision!=='changes_requested'){
+    const error=new Error('REVIEW_DECISION_INVALID');error.code='REVIEW_SCHEMA_INVALID';throw error;
+  }
+  if(cycle>=limit-1)return {action:'fail',code:'REVIEW_CHANGES_UNRESOLVED',issues,nextStatus:'review'};
+  return {action:'repair',issues,nextStatus:'waiting_ci'};
+}
+
+export async function runReviewReworkLifecycle({
+  maxCycles=3,
+  waitGatesFn,
+  reviewFn,
+  repairFn,
+  onGatesPassed=async()=>{},
+  onWaitingCi=async()=>{},
+}={}){
+  if(typeof waitGatesFn!=='function'||typeof reviewFn!=='function'||typeof repairFn!=='function')throw new Error('REVIEW_LIFECYCLE_DEPENDENCY_MISSING');
+  const limit=Math.max(1,Number(maxCycles)||3);
+  let lastReview=null,lastGates=null;
+  for(let reviewCycle=0;reviewCycle<limit;reviewCycle++){
+    lastGates=await waitGatesFn({reviewCycle});
+    await onGatesPassed({reviewCycle,gates:lastGates});
+    lastReview=await reviewFn({reviewCycle,gates:lastGates});
+    const action=reviewReworkDecision(lastReview,reviewCycle,{maxCycles:limit});
+    if(action.action==='approve')return {review:lastReview,gates:lastGates,reviewCycle,action};
+    if(action.action==='fail')throw Object.assign(new Error(action.code),{detail:lastReview});
+    await repairFn({reviewCycle,gates:lastGates,review:lastReview,issues:action.issues});
+    if(action.nextStatus!=='waiting_ci')throw new Error('REVIEW_REWORK_STATE_INVALID');
+    await onWaitingCi({reviewCycle,gates:lastGates,review:lastReview});
+  }
+  throw Object.assign(new Error('REVIEW_CHANGES_UNRESOLVED'),{detail:lastReview});
+}
+
+export function gateFailureIssues(error){
+  const detail=error?.detail||{};
+  const states=Array.isArray(detail.states)?detail.states:[];
+  const issues=states
+    .filter(s=>s?.conclusion && s.conclusion!=='success')
+    .map(s=>`${s.name||'check'}: ${s.conclusion}${s.status?` (${s.status})`:''}`);
+  if(detail.output)issues.push(String(detail.output).slice(0,2000));
+  if(detail.message)issues.push(String(detail.message).slice(0,2000));
+  if(!issues.length)issues.push(String(error?.message||'CI gate failed').slice(0,2000));
+  return issues.slice(0,8);
+}
+
+export async function runGateWithRepair({waitFn,repairFn,onWaiting=async()=>{},maxRepairCycles=3,timeoutRetries=1}){
+  let repairCycles=0;
+  let timeoutCount=0;
+  while(true){
+    try{return await waitFn()}
+    catch(error){
+      const code=error?.code||String(error?.message||'').split(':')[0];
+      if(code==='CI_GATES_TIMEOUT'){
+        if(timeoutCount>=timeoutRetries){
+          error.detail={...(error.detail||{}),timeoutRetries:timeoutCount};
+          throw error;
+        }
+        timeoutCount++;
+        await onWaiting({reason:'timeout',timeoutCount,evidence:gateFailureIssues(error)});
+        continue;
+      }
+      if(code==='CI_GATES_FAILED'){
+        if(repairCycles>=maxRepairCycles){
+          const exhausted=new Error('CI_GATE_REPAIR_EXHAUSTED');
+          exhausted.code='CI_GATE_REPAIR_EXHAUSTED';
+          exhausted.detail={repairCycles,evidence:gateFailureIssues(error),lastFailure:error.detail||null};
+          throw exhausted;
+        }
+        repairCycles++;
+        const evidence=gateFailureIssues(error);
+        await onWaiting({reason:'failed',repairCycle:repairCycles,evidence});
+        await repairFn({repairCycle:repairCycles,evidence,error});
+        timeoutCount=0;
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
+const RESOURCE_WAIT_MAX_RETRIES=6;
+const RESOURCE_WAIT_MAX_WINDOW_MS=60*60*1000;
+const RESOURCE_WAIT_BASE_MS=30*1000;
+const RESOURCE_WAIT_MAX_DELAY_MS=10*60*1000;
+
+export function isProviderRequestRejected(error){
+  const status=Number(error?.status||0);
+  const msg=String(error?.message||error||'');
+  return status===400||/HTTP_400\b/i.test(msg);
+}
+export function classifyAiFailure(error){
+  const status=Number(error?.status||0);
+  const msg=String(error?.message||error||'');
+  if(isProviderRequestRejected(error))return 'provider_request_rejected';
+  if(status===429||/HTTP_429\b|RATE_LIMIT|RESOURCE_EXHAUSTED/i.test(msg))return 'rate_limit';
+  if(error?.name==='AbortError'||/ETIMEDOUT|timeout|aborted|ECONNRESET|socket/i.test(msg))return 'timeout';
+  if(/MANAGER_(?:SOFT_BLOCK|SCOPE_MISMATCH|PATHS_INVALID|TITLE_NOT_VI)|JSON_OBJECT_(?:INVALID|MISSING)|CODING_CHANGES_COUNT_INVALID|schema|unterminated|truncat|COMPACT_EDIT/i.test(msg))return 'output_contract';
+  if(/EMPTY_RESPONSE|invalid_response/i.test(msg))return 'invalid_response';
+  if([408,409,413,500,502,503,504].includes(status)||/fetch failed|HTTP_(?:408|409|413|500|502|503|504)\b/i.test(msg))return 'provider_unavailable';
+  return isRetryableAiError(error)?'other_retryable':'other';
+}
+
+export function activeProviderCooldownIds(failure,nowMs=Date.now()){
+  const ledger=Array.isArray(failure?.detail?.failureLedger)?failure.detail.failureLedger:[];
+  return [...new Set(ledger.filter(x=>x?.class==='rate_limit'&&Date.parse(x?.cooldownUntil||0)>nowMs).map(x=>x.resourceId).filter(Boolean))];
+}
+export function providerCooldownPollPlan(failure,nowMs=Date.now(),maxPollMs=RESOURCE_WAIT_MAX_DELAY_MS){
+  const ledger=Array.isArray(failure?.detail?.failureLedger)?failure.detail.failureLedger:[];
+  const active=ledger.filter(x=>x?.class==='rate_limit')
+    .map(x=>({resourceId:x?.resourceId,until:Date.parse(x?.cooldownUntil||0)}))
+    .filter(x=>x.resourceId&&Number.isFinite(x.until)&&x.until>nowMs)
+    .sort((a,b)=>a.until-b.until);
+  if(!active.length)return {wait:false,nextAttemptAt:null,delayMs:0,resourceIds:[]};
+  const earliest=active[0].until;
+  const nextMs=Math.min(earliest,nowMs+Math.max(1000,Number(maxPollMs)||RESOURCE_WAIT_MAX_DELAY_MS));
+  return {wait:true,nextAttemptAt:new Date(nextMs).toISOString(),delayMs:nextMs-nowMs,resourceIds:[...new Set(active.map(x=>x.resourceId))],cooldownUntil:new Date(earliest).toISOString()};
+}
+export function cooldownWaitFailure(errorFailure,priorFailure,cooldownPlan,preservedCount=0){
+  const ledger=Array.isArray(priorFailure?.detail?.failureLedger)?priorFailure.detail.failureLedger.filter(x=>x?.class==='rate_limit'):[];
+  return {
+    ...errorFailure,
+    detail:{...(errorFailure?.detail||{}),failureLedger:ledger},
+    cooldownWait:{
+      delayMs:cooldownPlan.delayMs,
+      nextAttemptAt:cooldownPlan.nextAttemptAt,
+      cooldownUntil:cooldownPlan.cooldownUntil,
+      resourceIds:cooldownPlan.resourceIds,
+      preservedRetryCount:Math.max(0,Number(preservedCount)||0),
+    },
+  };
+}
+
+export function isResourceTransientError(error){
+  if(['AI_RESOURCES_UNAVAILABLE','AI_RESOURCES_BUSY','NO_TARGET_EMPLOYEE_AVAILABLE'].includes(error?.code))return true;
+  const msg=String(error?.message||error||'');
+  return /NO_(?:IMPLEMENTER_AVAILABLE|TARGET_EMPLOYEE_AVAILABLE|INDEPENDENT_REVIEWER_AVAILABLE|FREE_API_CODING_RESOURCE)|AI_RETRY_BUDGET_EXHAUSTED/i.test(msg);
+}
+
+export function resourceWaitPlan({retryCount=0,startedAt=null,nowMs=Date.now(),maxRetries=RESOURCE_WAIT_MAX_RETRIES,maxWindowMs=RESOURCE_WAIT_MAX_WINDOW_MS}={}){
+  const count=Math.max(0,Number(retryCount)||0);
+  const startedMs=startedAt?new Date(startedAt).getTime():nowMs;
+  const ageMs=Math.max(0,nowMs-(Number.isFinite(startedMs)?startedMs:nowMs));
+  if(count>=maxRetries||ageMs>=maxWindowMs)return {wait:false,retryCount:count,ageMs,nextAttemptAt:null,delayMs:0};
+  const delayMs=Math.min(RESOURCE_WAIT_MAX_DELAY_MS,RESOURCE_WAIT_BASE_MS*Math.pow(2,count));
+  return {wait:true,retryCount:count+1,ageMs,delayMs,nextAttemptAt:new Date(nowMs+delayMs).toISOString()};
+}
+export function managerResourceFailurePlan(error,objective={},nowMs=Date.now()){
+  if(!isResourceTransientError(error))return {transient:false,wait:false,retryCount:Number(objective?.resource_retry_count||0),nextAttemptAt:null,delayMs:0};
+  return {transient:true,...resourceWaitPlan({retryCount:objective?.resource_retry_count,startedAt:objective?.resource_retry_started_at,nowMs})};
+}
+
+export function shouldResumeExistingPr(job){
+  return Boolean(String(job?.branch||'').trim()&&Number(job?.pr_number)>0);
+}
+
+export function validateObjectiveRoutingInput({targetEmployee=null,currentPr=null,targetHead=null}={}){
+  const employee=String(targetEmployee||'').trim().toUpperCase();
+  if(employee&&!/^NV\d{2,3}$/.test(employee)){
+    const e=new Error('CODING_TARGET_EMPLOYEE_INVALID');e.code='CODING_TARGET_EMPLOYEE_INVALID';throw e;
+  }
+  const hasPr=currentPr!==null&&currentPr!==undefined&&String(currentPr).trim()!=='';
+  const head=String(targetHead||'').trim().toLowerCase();
+  if(hasPr!==Boolean(head)){
+    const e=new Error('CODING_CURRENT_PR_TARGET_HEAD_PAIR_REQUIRED');e.code='CODING_CURRENT_PR_TARGET_HEAD_PAIR_REQUIRED';throw e;
+  }
+  let pr=null;
+  if(hasPr){
+    pr=Number(currentPr);
+    if(!Number.isInteger(pr)||pr<=0){const e=new Error('CODING_CURRENT_PR_INVALID');e.code='CODING_CURRENT_PR_INVALID';throw e}
+    if(!/^[0-9a-f]{40}$/.test(head)){const e=new Error('CODING_TARGET_HEAD_INVALID');e.code='CODING_TARGET_HEAD_INVALID';throw e}
+  }
+  return {targetEmployee:employee||null,currentPr:pr,targetHead:head||null};
+}
+
+// Cloud API workers are first choice. The on-demand NV09 Coder is the
+// last fallback only after no usable cloud Coding worker remains.
+export function selectCodingWorker(available=[],targetEmployee='',fallback=()=>null){
+  const resources=Array.isArray(available)?available:[];
+  const target=String(targetEmployee||'').trim().toUpperCase();
+  const remote=resources.filter(r=>r?.id!=='NV09'&&r?.provider!=='ollama');
+  if(target==='NV09'&&remote.length)return null; // do not override Owner API-first gate
+  if(target)return resources.find(resource=>String(resource?.id||'').toUpperCase()===target)||null;
+  if(remote.length){
+    const selected=typeof fallback==='function'?fallback():null;
+    return selected&&remote.some(r=>r.id===selected.id)?selected:remote[0];
+  }
+  return resources.find(r=>r?.id==='NV09')||null;
+}
+
+export function validateExistingPrResume(pr,{number=null,targetHead=null,repoFullName=''}={}){
+  const expectedNumber=Number(number||0);
+  if(!pr||Number(pr.number)!==expectedNumber){const e=new Error('EXISTING_PR_NUMBER_MISMATCH');e.code='EXISTING_PR_NUMBER_MISMATCH';throw e}
+  if(pr.merged===true||pr.merged_at){const e=new Error('EXISTING_PR_ALREADY_MERGED');e.code='EXISTING_PR_ALREADY_MERGED';throw e}
+  if(String(pr.state||'').toLowerCase()!=='open'){const e=new Error('EXISTING_PR_NOT_OPEN');e.code='EXISTING_PR_NOT_OPEN';throw e}
+  const repo=String(repoFullName||'').toLowerCase();
+  const baseRepo=String(pr?.base?.repo?.full_name||'').toLowerCase();
+  const headRepo=String(pr?.head?.repo?.full_name||'').toLowerCase();
+  if(repo&&baseRepo!==repo){const e=new Error('EXISTING_PR_BASE_REPO_MISMATCH');e.code='EXISTING_PR_BASE_REPO_MISMATCH';throw e}
+  if(repo&&headRepo!==repo){const e=new Error('EXISTING_PR_HEAD_REPO_MISMATCH');e.code='EXISTING_PR_HEAD_REPO_MISMATCH';throw e}
+  const headSha=String(pr?.head?.sha||'').trim().toLowerCase();
+  const expectedHead=String(targetHead||'').trim().toLowerCase();
+  if(expectedHead&&headSha!==expectedHead){const e=new Error('EXISTING_PR_TARGET_HEAD_MISMATCH');e.code='EXISTING_PR_TARGET_HEAD_MISMATCH';e.detail={expectedHead,headSha};throw e}
+  const branch=String(pr?.head?.ref||'').trim();
+  if(!branch||!headSha){const e=new Error('EXISTING_PR_RESUME_IDENTITY_INCOMPLETE');e.code='EXISTING_PR_RESUME_IDENTITY_INCOMPLETE';throw e}
+  return {number:expectedNumber,branch,headSha};
+}
+
+export function existingPrNeedsBaseUpdate(compare){
+  const status=String(compare?.status||'').toLowerCase();
+  return Number(compare?.behind_by||0)>0||status==='behind'||status==='diverged';
+}
+const DATABASE_URL=process.env.DATABASE_URL?.trim(); if(!DATABASE_URL&&process.env.NODE_ENV!=='test')throw new Error('DATABASE_URL_MISSING');
+const GH_TOKEN=(process.env.TIGERIQ_GITHUB_TOKEN||process.env.GITHUB_TOKEN||'').trim(); if(!GH_TOKEN&&process.env.NODE_ENV!=='test')throw new Error('GITHUB_TOKEN_MISSING');
+const OWNER=process.env.TIGERIQ_GITHUB_OWNER||'newsdayads';
+const REPO=process.env.TIGERIQ_GITHUB_REPO||'tigeriq-ai-lab';
+const SOURCE_REPOSITORY={owner:OWNER,repo:REPO,fullName:`${OWNER}/${REPO}`,isSource:true};
+const DEFAULT_ALLOWED_TARGET_REPOSITORIES=new Set([SOURCE_REPOSITORY.fullName.toLowerCase(),'newsdayads/tigeriq-media']);
+export function targetRepositoryFromObjective(objective=''){
+  return String(String(objective||'').match(/^TARGET_REPOSITORY=(.+)$/m)?.[1]||'').trim();
+}
+export function resolveCodingRepository(targetRepository='',{sourceRepository=SOURCE_REPOSITORY.fullName,allowedRepositories=DEFAULT_ALLOWED_TARGET_REPOSITORIES}={}){
+  const source=String(sourceRepository||'').trim();
+  const sourceMatch=source.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/);
+  if(!sourceMatch)throw Object.assign(new Error('CODING_SOURCE_REPOSITORY_INVALID'),{code:'CODING_SOURCE_REPOSITORY_INVALID'});
+  const raw=String(targetRepository||'').trim()||source;
+  const match=raw.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/);
+  if(!match)throw Object.assign(new Error('CODING_TARGET_REPOSITORY_INVALID'),{code:'CODING_TARGET_REPOSITORY_INVALID'});
+  const normalized=raw.toLowerCase();
+  const allowed=new Set([source.toLowerCase(),...[...allowedRepositories].map(x=>String(x||'').toLowerCase())]);
+  if(!allowed.has(normalized))throw Object.assign(new Error('CODING_TARGET_REPOSITORY_NOT_ALLOWED'),{code:'CODING_TARGET_REPOSITORY_NOT_ALLOWED',detail:{targetRepository:raw}});
+  return {owner:match[1],repo:match[2],fullName:raw,isSource:normalized===source.toLowerCase()};
+}
+// Owner direct 2026-10-15: this trusted source policy waives only optional
+// Coding review for this canonical repository. Objective text cannot grant it.
+const OWNER_CODING_REVIEW_WAIVER=Object.freeze({
+  kind:'owner_waiver',repository:'newsdayads/tigeriq-ai-lab',
+  authority:'OWNER_DIRECT_20261015T061206_ICT',
+  reference:'https://github.com/newsdayads/tigeriq-ai-lab/issues/504#issuecomment-6180609154',
+});
+export function codingOwnerReviewWaiver(repository=SOURCE_REPOSITORY,{
+  mode=process.env.TIGERIQ_CODING_REVIEW_POLICY||'owner_waiver',
+}={}){
+  if(mode!=='owner_waiver'||repository?.isSource!==true||
+     String(repository?.fullName||'').toLowerCase()!==OWNER_CODING_REVIEW_WAIVER.repository)return null;
+  return OWNER_CODING_REVIEW_WAIVER;
+}
+function assertTrustedOwnerReviewWaiver(waiver){
+  if(!waiver||Object.keys(OWNER_CODING_REVIEW_WAIVER).some(key=>waiver[key]!==OWNER_CODING_REVIEW_WAIVER[key]))
+    throw new Error('OWNER_REVIEW_WAIVER_INVALID');
+}
+export function formatCodingOwnerReviewPolicy(waiver){
+  if(!waiver)return '';
+  assertTrustedOwnerReviewWaiver(waiver);
+  return '\nAUTHORITATIVE_OWNER_REVIEW_POLICY: optional independent Coding review is OWNER_WAIVED for this repository; absence of a reviewer is not a blocker. This current Owner directive supersedes earlier optional review wording only. Canonical source scope, Owner stops, credentials, paid cost, destructive and external platform/Production gates still apply. Authority: '+waiver.reference+'\n';
+}
+export function formatOwnerReviewWaiverArtifact({implementerId,targetHead,waiver}={}){
+  assertTrustedOwnerReviewWaiver(waiver);
+  const implementer=reviewLine(implementerId,80),head=String(targetHead||'').trim();
+  if(!implementer||!/^[a-f0-9]{40}$/.test(head))throw new Error('OWNER_REVIEW_WAIVER_ARTIFACT_INVALID');
+  return ['[TIGERIQ_OWNER_REVIEW_WAIVER_V1]','REVIEW_MODE=OWNER_WAIVER',
+    'INDEPENDENT_REVIEW=NOT_PERFORMED_OWNER_WAIVED','IMPLEMENTER='+implementer,
+    'TARGET_HEAD='+head,'REPOSITORY='+waiver.repository,'AUTHORITY='+waiver.authority,
+    'OWNER_REFERENCE='+waiver.reference,'CI=PASSED_EXACT_TARGET_HEAD',
+    'WAIVER_IS_NOT_INDEPENDENT_PASS=true'].join('\n');
+}
+export async function runOwnerWaivedAcceptance({
+  waiver,waitGatesFn,onGatesPassed=async()=>{},recordWaiverFn,
+}={}){
+  assertTrustedOwnerReviewWaiver(waiver);
+  if(typeof waitGatesFn!=='function'||typeof recordWaiverFn!=='function')
+    throw new Error('OWNER_REVIEW_WAIVER_DEPENDENCY_MISSING');
+  const gates=await waitGatesFn();
+  if(gates?.state!=='passed'||!/^[a-f0-9]{40}$/.test(String(gates?.sha||'')))
+    throw new Error('OWNER_REVIEW_WAIVER_CI_REQUIRED');
+  await onGatesPassed({gates,reviewCycle:0});
+  const receipt=await recordWaiverFn({gates,waiver});
+  if(!receipt?.id||receipt?.targetHead!==gates.sha||
+     !/^https:\/\/github\.com\/newsdayads\/tigeriq-ai-lab\/(?:issues|pull)\/[1-9]\d*#issuecomment-\d+$/.test(String(receipt?.url||'')))
+    throw new Error('OWNER_REVIEW_WAIVER_RECEIPT_REQUIRED');
+  return {gates,review:{kind:'owner_waiver',authority:waiver.authority,
+    reference:waiver.reference,targetHead:gates.sha,receiptUrl:receipt.url},
+    reviewCycle:0,action:{action:'owner_waiver'}};
+}
+export function assertCodingReviewAcceptance({
+  repository=SOURCE_REPOSITORY,implementerId,reviewerId,targetHead,expectedHead,review,
+}={}){
+  if(review?.kind!=='owner_waiver')
+    return assertIndependentReviewApproval({implementerId,reviewerId,targetHead,expectedHead,decision:review?.decision});
+  const waiver=codingOwnerReviewWaiver(repository);
+  if(!waiver||review.authority!==waiver.authority||review.reference!==waiver.reference)
+    throw new Error('OWNER_REVIEW_WAIVER_REVOKED_OR_INVALID');
+  if(!implementerId||!/^https:\/\/github\.com\/newsdayads\/tigeriq-ai-lab\/(?:issues|pull)\/[1-9]\d*#issuecomment-\d+$/.test(String(review.receiptUrl||''))||review.targetHead!==targetHead||targetHead!==expectedHead||
+     !/^[a-f0-9]{40}$/.test(String(targetHead||'')))throw new Error('OWNER_REVIEW_WAIVER_HEAD_STALE');
+  return true;
+}
+async function persistOwnerReviewWaiverArtifact(prNumber,data,repository=SOURCE_REPOSITORY){
+  const out=await ghRepo(repository,'/issues/'+prNumber+'/comments',{
+    method:'POST',body:JSON.stringify({body:formatOwnerReviewWaiverArtifact(data)}),
+  });
+  return {id:out?.id,url:out?.html_url,targetHead:data.targetHead};
+}
+const HOST=process.env.TIGERIQ_CODING_HOST||'127.0.0.1';
+const PORT=Number(process.env.TIGERIQ_CODING_PORT||8797);
+const CORE_STATUS_URL=process.env.TIGERIQ_CORE_STATUS_URL?.trim()||`http://${process.env.TIGERIQ_CORE_HOST?.trim()||'127.0.0.1'}:${Number(process.env.TIGERIQ_CORE_PORT||8795)}/api/status`;
+// The fast endpoint is not yet installed on Core. Keep the legacy path until explicitly enabled.
+const FAST_CORE_HEALTH_ENABLED=process.env.TIGERIQ_CODING_FAST_CORE_HEALTH==='true';
+const FAST_CORE_HEALTH_URL=process.env.TIGERIQ_CORE_FAST_HEALTH_URL?.trim()||new URL('/api/coding-health',CORE_STATUS_URL).href;
+const CORE_RESOURCE_HEALTH_TTL_MS=Math.max(5000,Number(process.env.TIGERIQ_CODING_CORE_HEALTH_TTL_MS||10000));
+// The full Core status payload is ~920 KB on PC01; 3s occasionally timed out.
+// Keep the fast health endpoint at 3s once safely enabled. The legacy full
+// snapshot has a bounded 8s budget and fails closed on actual Core outages.
+export function normalizeCodingCoreStatusTimeout(value=8000){
+  const n=Number(value);
+  return Math.max(3000,Math.min(12000,Number.isFinite(n)&&n>0?Math.floor(n):8000));
+}
+const CORE_STATUS_TIMEOUT_MS=normalizeCodingCoreStatusTimeout(process.env.TIGERIQ_CODING_CORE_STATUS_TIMEOUT_MS);
+const AUTO_MERGE=String(process.env.TIGERIQ_CODING_AUTO_MERGE||'true').toLowerCase()==='true';
+const STALE_RUNNING_TIMEOUT_MS=Math.max(60000,Number(process.env.TIGERIQ_CODING_STALE_RUNNING_TIMEOUT_MS||15*60*1000));
+const STALE_RUNNING_SCAN_INTERVAL_MS=Math.max(5000,Number(process.env.TIGERIQ_CODING_STALE_RUNNING_SCAN_INTERVAL_MS||15000));
+const STALE_RUNNING_MAX_REQUEUES=Math.max(0,Math.min(3,Number(process.env.TIGERIQ_CODING_STALE_RUNNING_MAX_REQUEUES||1)));
+const STALE_RUNNING_RUNTIME_CANARY_OBJECTIVE_ID='CODEOBJ-CANARY-A8-2068';
+const STALE_RUNNING_RUNTIME_CANARY_JOB_ID='CODE-CANARY-A8-2068';
+const STALE_RUNNING_RUNTIME_CANARY_SOURCE_ISSUE=2068;
+const STALE_RUNNING_RUNTIME_CANARY_TIMEOUT_MS=Math.max(45000,STALE_RUNNING_SCAN_INTERVAL_MS*3);
+export function normalizeCodingParallelLimit(value=6){const n=Number(value);return Math.max(1,Math.min(6,Number.isFinite(n)?Math.floor(n):6))}
+const MAX_PARALLEL=normalizeCodingParallelLimit(process.env.TIGERIQ_CODING_MAX_PARALLEL||6);
+// Opt-in until exact deployed source and real worker canary are verified.
+const DECOUPLED_MANAGER=process.env.TIGERIQ_CODING_MANAGER_DECOUPLED==='true';
+const pool=DATABASE_URL?new Pool({connectionString:DATABASE_URL,max:8}):null;
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const GEMINI_MIN_INTERVAL_MS=Math.max(4500,Number(process.env.TIGERIQ_GEMINI_MIN_INTERVAL_MS||4500));
+const GEMINI_BACKOFF_BASE_MS=Math.max(4500,Number(process.env.TIGERIQ_GEMINI_BACKOFF_BASE_MS||4500));
+const GEMINI_MAX_ATTEMPTS=Math.max(1,Number(process.env.TIGERIQ_GEMINI_MAX_ATTEMPTS||4));
+const geminiRateController=createGeminiRateController({minIntervalMs:GEMINI_MIN_INTERVAL_MS,backoffBaseMs:GEMINI_BACKOFF_BASE_MS,maxAttempts:GEMINI_MAX_ATTEMPTS});
+const OLLAMA_BASE_URL=normalizeLocalOllamaBaseUrl(process.env.TIGERIQ_NV09_OLLAMA_URL||process.env.TIGERIQ_OLLAMA_URL||'http://127.0.0.1:11435');
+// NV08 Manager uses the Core-local service; NV09 keeps its dedicated endpoint.
+const MANAGER_OLLAMA_BASE_URL=normalizeLocalOllamaBaseUrl(process.env.TIGERIQ_CODING_MANAGER_OLLAMA_URL||'http://127.0.0.1:11434');
+const OLLAMA_TIMEOUT_MS=Math.max(15000,Math.min(300000,Number(process.env.TIGERIQ_CODING_OLLAMA_TIMEOUT_MS||240000)));
+// Only Coding Manager planning is timeboxed; Worker/review Ollama requests retain their prior limit.
+export function normalizeManagerOllamaTimeout(value){const n=Number(value);return Math.max(15000,Math.min(120000,Number.isFinite(n)&&n>0?n:45000))}
+const MANAGER_OLLAMA_TIMEOUT_MS=normalizeManagerOllamaTimeout(process.env.TIGERIQ_CODING_MANAGER_OLLAMA_TIMEOUT_MS);
+
+const R=(id,provider,model,ready)=>({id,provider,model,ready});
+const resources=[
+  R('NV09','ollama',process.env.TIGERIQ_NV09_MODEL||'qwen3.5:9b',()=>true),
+  R('NV11','groq',process.env.TIGERIQ_GROQ_MODEL||'openai/gpt-oss-120b',()=>process.env.GROQ_API_KEY&&process.env.TIGERIQ_GROQ_FREE_TIER_VERIFIED==='true'),
+  R('NV12','gemini',process.env.TIGERIQ_GEMINI_MODEL||'gemini-3.5-flash-lite',()=>process.env.GEMINI_API_KEY&&process.env.TIGERIQ_GEMINI_FREE_TIER_VERIFIED==='true'),
+  R('NV13','openrouter','openrouter/free',()=>process.env.OPENROUTER_API_KEY),
+  R('NV14','mistral','mistral-small-latest',()=>process.env.MISTRAL_API_KEY),
+  R('NV15','cloudflare','@cf/meta/llama-3.1-8b-instruct',()=>process.env.CLOUDFLARE_AUTH_TOKEN&&process.env.CLOUDFLARE_ACCOUNT_ID&&process.env.TIGERIQ_CLOUDFLARE_FREE_CONFIRMED==='true'),
+  R('NV16','huggingface','openai/gpt-oss-120b:fastest',()=>process.env.HF_TOKEN),
+  R('NV17','inception',process.env.TIGERIQ_INCEPTION_MODEL||'mercury-2.5',()=>process.env.INCEPTION_API_KEY&&process.env.TIGERIQ_INCEPTION_FREE_TIER_VERIFIED==='true'),
+  R('NV19','cohere',process.env.TIGERIQ_COHERE_MODEL||'command-a-plus-05-2026',()=>process.env.COHERE_API_KEY&&process.env.TIGERIQ_COHERE_TRIAL_CONFIRMED==='true'),
+  R('NV20','nvidia',process.env.TIGERIQ_NVIDIA_MODEL||'nvidia/nemotron-3-super-120b-a12b',()=>process.env.NVIDIA_API_KEY&&process.env.TIGERIQ_NVIDIA_FREE_DEV_CONFIRMED==='true'),
+].filter(x=>x.ready());
+// Owner 2026-10-14: NV08 is the sole Core-local manager fallback.
+// NV09 implements code; NV10 diagnoses APIs. Neither may be Coding Manager.
+const managerLocalBackupResources=[
+  R('NV08','ollama','qwen3:8b',()=>true),
+];
+const busyAiResources=new Set();
+let coreResourceHealth={fetchedAt:0,byEmployee:new Map(),performanceByResourceTask:new Map(),functionalByEmployee:new Map()};
+
+// B03: diagnostic-only counters, never affect worker eligibility or leases.
+let coreHealthReadback={attemptedAt:0,succeededAt:0,failedAt:0,lastFailureKind:null,consecutiveFailures:0};
+export function codingCoreHealthFailureKind(error){
+  const code=String(error?.code||'').toUpperCase();
+  const name=String(error?.name||'');
+  if(name==='AbortError'||name==='TimeoutError'||code.includes('TIMEOUT')||code==='ABORT_ERR')return 'TIMEOUT';
+  if(code==='CODING_CORE_HEALTH_RESPONSE_STALE')return 'STALE_RESPONSE';
+  if(code.startsWith('CODING_CORE_HEALTH_'))return 'INVALID_RESPONSE';
+  const status=Number(error?.status||error?.statusCode||0);
+  if(status>=500&&status<600)return 'CORE_HTTP_5XX';
+  if(status>=400&&status<500)return 'CORE_HTTP_4XX';
+  return 'FETCH_OR_TRANSPORT_ERROR';
+}
+export function codingCoreHealthReadback(health,diagnostics,{nowMs=Date.now(),ttlMs=10000}={}){
+  const at=Number(health?.fetchedAt)||0;
+  const age=at?Math.max(0,nowMs-at):null;
+  const ageOf=stamp=>stamp?Math.max(0,nowMs-stamp):null;
+  return {
+    fresh:Boolean(at&&nowMs-at<=ttlMs),
+    ageMs:age,ttlMs,
+    lastAttemptAgeMs:ageOf(diagnostics?.attemptedAt),
+    lastSuccessAgeMs:ageOf(diagnostics?.succeededAt),
+    lastFailureAgeMs:ageOf(diagnostics?.failedAt),
+    lastFailureKind:diagnostics?.lastFailureKind||null,
+    consecutiveFailures:Math.max(0,Number(diagnostics?.consecutiveFailures)||0),
+  };
+}
+
+export function coreResourceStateEligible(state,nowMs=Date.now()){
+  if(!state||typeof state!=='object')return false;
+  const health=String(state.health_state??state.healthState??'').toUpperCase();
+  const work=String(state.work_state??state.workState??'').toUpperCase();
+  const status=String(state.status??'').toUpperCase();
+  const cooldownUntil=Date.parse(String(state.cooldown_until??state.cooldownUntil??''));
+  const quota=state.quota_state??state.quotaState??{};
+  if(state.enabled===false||quota?.usable===false)return false;
+  if(['ERROR','RATE_LIMITED','OFFLINE','DISABLED','WAIT_KEY'].includes(health)||['ERROR','RATE_LIMITED','OFFLINE','DISABLED','WAIT_KEY'].includes(status))return false;
+  if(Number.isFinite(cooldownUntil)&&cooldownUntil>nowMs)return false;
+  if(state.current_job_id??state.currentJobId)return false;
+  if(work==='BUSY')return false;
+  return health==='ONLINE'||(health==='READY'&&work==='ON_DEMAND')||['IDLE','READY'].includes(status);
+}
+
+export function setCoreResourceHealthSnapshot(snapshot,nowMs=Date.now()){
+  const rows=Array.isArray(snapshot?.resources)?snapshot.resources:[];
+  const byEmployee=new Map();
+  const byResource=new Map();
+  for(const row of rows){
+    const id=String(row?.employee_id??row?.employeeId??row?.id??'').trim();
+    if(id)byEmployee.set(id,row);
+    const resourceId=String(row?.resource_id??row?.resourceId??'').trim();
+    if(resourceId)byResource.set(resourceId,row);
+  }
+  const performanceByResourceTask=new Map();
+  for(const row of Array.isArray(snapshot?.routing?.performanceByTask)?snapshot.routing.performanceByTask:[]){
+    const resourceId=String(row?.resource_id??row?.resourceId??'').trim();
+    const taskKind=String(row?.task_kind??row?.taskKind??'general').trim().toLowerCase()||'general';
+    if(resourceId)performanceByResourceTask.set(`${resourceId}:${taskKind}`,row);
+  }
+  const functionalByEmployee=new Map();
+  for(const event of Array.isArray(snapshot?.events)?snapshot.events:[]){
+    const type=String(event?.type||'').toUpperCase();
+    if(!['RESOURCE_SUCCESS','RESOURCE_PROBE_OK','RESOURCE_FAILURE','RESOURCE_PROBE_FAIL'].includes(type))continue;
+    const resourceId=String(event?.resource_id??event?.resourceId??'').trim();
+    const mapped=resourceId?byResource.get(resourceId):null;
+    const employeeId=String(event?.employee_id??event?.employeeId??mapped?.employee_id??mapped?.employeeId??'').trim();
+    if(!employeeId)continue;
+    const evidence=functionalByEmployee.get(employeeId)||{lastSuccessAt:null,lastFailureAt:null,failureStreak:0,successSeen:false};
+    const ts=event?.ts??event?.created_at??event?.createdAt??null;
+    if(type==='RESOURCE_SUCCESS'||type==='RESOURCE_PROBE_OK'){
+      if(!evidence.lastSuccessAt)evidence.lastSuccessAt=ts;
+      evidence.successSeen=true;
+    }else{
+      if(!evidence.lastFailureAt)evidence.lastFailureAt=ts;
+      if(!evidence.successSeen)evidence.failureStreak++;
+    }
+    functionalByEmployee.set(employeeId,evidence);
+  }
+  for(const evidence of functionalByEmployee.values())delete evidence.successSeen;
+  coreResourceHealth={fetchedAt:nowMs,byEmployee,performanceByResourceTask,functionalByEmployee};
+  return byEmployee.size;
+}
+
+export function codingManagerRankingInput(resource,{nowMs=Date.now(),health=coreResourceHealth}={}){
+  const state=health?.byEmployee?.get?.(resource?.id);
+  if(!state)return null;
+  const resourceId=String(state?.resource_id??state?.resourceId??'').trim();
+  const performance=health?.performanceByResourceTask?.get?.(`${resourceId}:coding_manager`)
+    ||health?.performanceByResourceTask?.get?.(`${resourceId}:coding`)
+    ||health?.performanceByResourceTask?.get?.(`${resourceId}:general`)
+    ||null;
+  const evidence=health?.functionalByEmployee?.get?.(resource?.id)||null;
+  const successAt=Date.parse(String(evidence?.lastSuccessAt||''));
+  const failureAt=Date.parse(String(evidence?.lastFailureAt||''));
+  const freshnessMs=15*60*1000;
+  const hasRecentEvidence=(Number.isFinite(successAt)&&nowMs-successAt<=freshnessMs)
+    ||(Number.isFinite(failureAt)&&nowMs-failureAt<=freshnessMs);
+  const capabilities=[...new Set([...(Array.isArray(state?.capabilities)?state.capabilities:[]),'coding','general'])];
+  return {
+    ...state,
+    employee_id:resource.id,
+    resource_id:resourceId||`coding:${resource.id}`,
+    provider:state?.provider||resource?.provider,
+    model:state?.model||resource?.model,
+    cost_tier:state?.cost_tier??state?.costTier??(resource?.provider==='ollama'?'LOCAL':'FREE'),
+    capabilities,
+    taskStats:performance?{coding_manager:performance}:undefined,
+    ...(hasRecentEvidence&&evidence?{functionalEvidence:evidence}:{}),
+  };
+}
+
+export function rankCodingManagerResources(candidates=[],{nowMs=Date.now()}={}){
+  return rankCandidates(candidates,{
+    profile:'CODING',
+    capability:'coding',
+    taskKind:'coding_manager',
+    nowMs,
+    requireFunctionalEvidence:false,
+    ownerCodexApproved:false,
+  });
+}
+export function createCodingCoreHealthPump(refresh,{intervalMs=2500,setTimer=setTimeout,clearTimer=clearTimeout}={}){
+  let active=false,timer=null,inFlight=null;
+  const run=()=>{
+    if(inFlight)return inFlight;
+    const job=Promise.resolve().then(refresh);
+    inFlight=job;
+    const release=()=>{if(inFlight===job)inFlight=null;};
+    job.then(release,release);
+    return job;
+  };
+  const arm=()=>{
+    if(!active||timer!==null)return;
+    timer=setTimer(()=>{
+      timer=null;
+      if(!active)return;
+      return run().catch(()=>{}).finally(arm);
+    },intervalMs);
+    timer?.unref?.();
+  };
+  return {
+    refresh:run,
+    start(){
+      if(active)return inFlight||Promise.resolve();
+      active=true;
+      return run().finally(arm);
+    },
+    stop(){
+      active=false;
+      if(timer!==null){clearTimer(timer);timer=null;}
+    },
+  };
+}
+
+async function fetchCoreResourceHealth(){
+  const nowMs=Date.now();
+  // Refresh before expiry; freshness/eligibility still uses the original full TTL.
+  if(coreResourceHealth.fetchedAt&&nowMs-coreResourceHealth.fetchedAt<CORE_RESOURCE_HEALTH_TTL_MS/2)return true;
+  coreHealthReadback.attemptedAt=nowMs;
+  try{
+    const snapshot=await fetchJson(FAST_CORE_HEALTH_ENABLED?FAST_CORE_HEALTH_URL:CORE_STATUS_URL,{},FAST_CORE_HEALTH_ENABLED?3000:CORE_STATUS_TIMEOUT_MS);
+    if(FAST_CORE_HEALTH_ENABLED)validateCodingFastHealthResponse(snapshot);
+    setCoreResourceHealthSnapshot(snapshot,Date.now());
+    coreHealthReadback.succeededAt=Date.now();
+    coreHealthReadback.consecutiveFailures=0;
+    return true;
+  }catch(error){
+    coreHealthReadback.failedAt=Date.now();
+    coreHealthReadback.lastFailureKind=codingCoreHealthFailureKind(error);
+    coreHealthReadback.consecutiveFailures++;
+    // Keep existing fail-closed semantics; do not retain an eligible AI on failure.
+    coreResourceHealth={fetchedAt:0,byEmployee:new Map(),performanceByResourceTask:new Map(),functionalByEmployee:new Map()};
+    return false;
+  }
+}
+
+// One bounded local reader, independent of Manager latency and GitHub cooldown.
+const coreHealthPump=createCodingCoreHealthPump(fetchCoreResourceHealth,{
+  intervalMs:Math.max(1000,Math.floor(CORE_RESOURCE_HEALTH_TTL_MS/4)),
+});
+async function refreshCoreResourceHealth(){return coreHealthPump.refresh();}
+
+function coreResourceEligible(resource,nowMs=Date.now()){
+  if(process.env.NODE_ENV==='test'&&coreResourceHealth.byEmployee.size===0)return true;
+  if(!coreResourceHealth.fetchedAt||nowMs-coreResourceHealth.fetchedAt>CORE_RESOURCE_HEALTH_TTL_MS)return false;
+  return coreResourceStateEligible(coreResourceHealth.byEmployee.get(resource?.id),nowMs);
+}
+
+function selectableResources(exclude=[]){
+  const blocked=new Set((exclude||[]).map(String));
+  const eligible=resources.filter(x=>!blocked.has(x.id)&&!busyAiResources.has(x.id)&&coreResourceEligible(x));
+  return eligible.sort((a,b)=>Number(a.id==='NV09')-Number(b.id==='NV09'));
+}
+
+// Guarded fallback: fail closed on stale Core health, occupied shared leases,
+// cooldown and errors. Preserve the original Coding Lane worker/reviewer pool.
+export function appendEligibleCodingManagerBackups(primary=[],backups=[],{
+  excludeIds=[],busyIds=[],healthByEmployee=new Map(),nowMs=Date.now(),
+}={}){
+  const excluded=new Set([...excludeIds,...busyIds].map(String));
+  const managerPrimary=primary.filter(x=>!['NV09','NV10'].includes(String(x?.id||'')));
+  const present=new Set(managerPrimary.map(x=>String(x?.id||'')));
+  return [...managerPrimary,...backups.filter(x=>{
+    const id=String(x?.id||'');
+    if(id!=='NV08'||excluded.has(id)||present.has(id))return false;
+    if(!coreResourceStateEligible(healthByEmployee.get(id),nowMs))return false;
+    present.add(id);
+    return true;
+  })];
+}
+function selectableManagerResources(exclude=[]){
+  // Keep the designated coding implementer NV09 out of manager planning.
+  const primary=selectableResources([...exclude,'NV09','NV10']);
+  const nowMs=Date.now();
+  if(!coreResourceHealth.fetchedAt||nowMs-coreResourceHealth.fetchedAt>CORE_RESOURCE_HEALTH_TTL_MS)return primary;
+  return appendEligibleCodingManagerBackups(primary,managerLocalBackupResources,{
+    excludeIds:exclude,busyIds:[...busyAiResources],healthByEmployee:coreResourceHealth.byEmployee,nowMs,
+  });
+}
+function pickManagerResource(exclude=[]){
+  const primary=pickResource([...exclude,'NV09','NV10']);
+  if(primary)return primary;
+  // Use only the designated 8B manager as a bounded fallback; do not
+  // borrow NV10 API Doctor or NV09 Coding worker for manager decisions.
+  return selectableManagerResources(exclude).find(x=>managerLocalBackupResources.some(y=>y.id===x.id))||null;
+}
+function pickResource(exclude=[]){
+  const available=selectableResources(exclude);
+  if(!available.length)return null;
+  const nowMs=Date.now();
+  const inputs=available.map(resource=>codingManagerRankingInput(resource,{nowMs})).filter(Boolean);
+  const ranked=rankCodingManagerResources(inputs,{nowMs});
+  const chosenEmployeeId=String(ranked?.chosen?.employeeId||'');
+  return available.find(resource=>resource.id===chosenEmployeeId)||null;
+}
+
+async function fetchJson(url,init={},timeout=90000){const c=new AbortController(),t=setTimeout(()=>c.abort(),timeout);try{const res=await fetch(url,{...init,signal:c.signal});const text=await res.text();let body={};try{body=text?JSON.parse(text):{};}catch{body={text};}if(!res.ok){const e=new Error(`HTTP_${res.status}:${String(body?.message||body?.error||text).slice(0,300)}`);e.status=res.status;e.url=String(url||'');e.retryAfter=res.headers.get('retry-after');e.rateLimitRemaining=res.headers.get('x-ratelimit-remaining');e.rateLimitReset=res.headers.get('x-ratelimit-reset');throw e;}return body;}finally{clearTimeout(t)}}
+
+export function githubApiRateLimitBackoffUntil(error,nowMs=Date.now()){
+  const url=String(error?.url||'');
+  const status=Number(error?.status||0);
+  const message=String(error?.message||'');
+  const github=url.startsWith('https://api.github.com/');
+  const limited=github&&[403,429].includes(status)&&(String(error?.rateLimitRemaining||'')==='0'||/rate limit exceeded|secondary rate limit/i.test(message));
+  if(!limited)return 0;
+  const retryAfterSeconds=Number(error?.retryAfter||0);
+  const resetSeconds=Number(error?.rateLimitReset||0);
+  const retryAt=Number.isFinite(retryAfterSeconds)&&retryAfterSeconds>0?nowMs+retryAfterSeconds*1000:0;
+  const resetAt=Number.isFinite(resetSeconds)&&resetSeconds>0?resetSeconds*1000:0;
+  return Math.max(nowMs+60_000,retryAt,resetAt)+1_000;
+}
+export function normalizeLocalOllamaBaseUrl(value='http://127.0.0.1:11434'){
+  const url=new URL(String(value||'').trim());
+  if(url.protocol!=='http:'||!['127.0.0.1','localhost','::1','[::1]'].includes(url.hostname))throw new Error('OLLAMA_LOOPBACK_ONLY');
+  return url.origin;
+}
+export function codingOllamaBaseUrlForResource(resource,{workerUrl=OLLAMA_BASE_URL,managerUrl=MANAGER_OLLAMA_BASE_URL}={}){
+  if(resource?.provider!=='ollama')throw new Error('CODING_OLLAMA_RESOURCE_REQUIRED');
+  return normalizeLocalOllamaBaseUrl(resource?.id==='NV08'?managerUrl:workerUrl);
+}
+export function configuredCodingResourceIds(){return resources.map(x=>x.id)}
+export function codingOutputTokenLimit(prompt,defaultMax=8000){
+  const p=String(prompt||'');
+  if(p.includes('"edits":[{"path"'))return 2200;
+  if(p.includes('"changes":[{"path"'))return 2600;
+  return Math.max(1,Number(defaultMax)||8000);
+}
+async function openAi(endpoint,key,model,prompt,maxTokens=codingOutputTokenLimit(prompt),providerPayload=null){const b=await fetchJson(endpoint,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${key}`},body:JSON.stringify(providerPayload||{model,messages:[{role:'user',content:prompt}],temperature:0,max_tokens:maxTokens,stream:false})});const text=providerPayload?codingChatContent(b):b?.choices?.[0]?.message?.content;if(!String(text||'').trim())throw new Error('EMPTY_RESPONSE');return String(text)}
+export async function invokeOllamaChat(model,prompt,{fetchImpl=fetch,baseUrl=OLLAMA_BASE_URL,timeoutMs=OLLAMA_TIMEOUT_MS,maxTokens=codingOutputTokenLimit(prompt)}={}){
+  const origin=normalizeLocalOllamaBaseUrl(baseUrl);
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),Math.max(1000,Number(timeoutMs)||OLLAMA_TIMEOUT_MS));
+  try{
+    const response=await fetchImpl(`${origin}/v1/chat/completions`,{
+      method:'POST',
+      headers:{'content-type':'application/json'},
+      body:JSON.stringify({model,messages:[{role:'user',content:prompt}],temperature:0,max_tokens:Math.max(1,Number(maxTokens)||1),stream:false}),
+      signal:controller.signal,
+    });
+    const raw=await response.text();
+    let data={};
+    try{data=raw?JSON.parse(raw):{}}catch{data={text:raw}}
+    if(!response.ok){const error=new Error(`HTTP_${response.status}:${String(data?.message||data?.error||raw).slice(0,300)}`);error.status=response.status;throw error}
+    const text=data?.choices?.[0]?.message?.content;
+    if(!String(text||'').trim())throw new Error('EMPTY_RESPONSE');
+    return String(text);
+  }finally{clearTimeout(timer)}
+}
+// NV09 has its own Ollama process on loopback 11435. Native chat with
+// think:false avoids spending the entire output budget on hidden reasoning,
+// which the OpenAI-compatible chat endpoint otherwise returned as EMPTY_RESPONSE.
+// Keep alive=0s releases local RAM/VRAM between tasks shared with NV08/NV10.
+export async function invokeNv09NativeCoder(model,prompt,{
+  fetchImpl=fetch,baseUrl=OLLAMA_BASE_URL,timeoutMs=OLLAMA_TIMEOUT_MS,
+  maxTokens=codingOutputTokenLimit(prompt),
+}={}){
+  const origin=normalizeLocalOllamaBaseUrl(baseUrl);
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),Math.max(1000,Number(timeoutMs)||OLLAMA_TIMEOUT_MS));
+  try{
+    const response=await fetchImpl(origin+'/api/chat',{
+      method:'POST',
+      headers:{'content-type':'application/json'},
+      body:JSON.stringify({
+        model,messages:[{role:'user',content:prompt}],stream:false,
+        think:false,keep_alive:'0s',
+        options:{temperature:0,num_ctx:8192,num_predict:Math.max(1,Number(maxTokens)||1)},
+      }),
+      signal:controller.signal,
+    });
+    const raw=await response.text();
+    let data={};
+    try{data=raw?JSON.parse(raw):{}}catch{data={text:raw}}
+    if(!response.ok){
+      const error=new Error('HTTP_'+response.status+':'+String(data?.error||data?.message||raw).slice(0,300));
+      error.status=response.status;
+      throw error;
+    }
+    const content=String(data?.message?.content||'');
+    if(!content.trim())throw new Error('EMPTY_RESPONSE');
+    return content;
+  }finally{clearTimeout(timer)}
+}
+// NV08 uses the already accepted Core JSON Manager contract. Worker chat is unchanged.
+export async function invokeOllamaManagerJson(model,prompt,{
+  fetchImpl=fetch,baseUrl=MANAGER_OLLAMA_BASE_URL,timeoutMs=MANAGER_OLLAMA_TIMEOUT_MS,
+}={}){
+  const origin=normalizeLocalOllamaBaseUrl(baseUrl);
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),Math.max(1000,Number(timeoutMs)||MANAGER_OLLAMA_TIMEOUT_MS));
+  try{
+    const response=await fetchImpl(origin+'/api/generate',{
+      method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify(managerLocalRequestBody(model,prompt)),signal:controller.signal,
+    });
+    const raw=await response.text();
+    let data={};
+    try{data=raw?JSON.parse(raw):{}}catch{data={text:raw}}
+    if(!response.ok){const error=new Error('HTTP_'+response.status+':'+String(data?.message||data?.error||raw).slice(0,300));error.status=response.status;throw error}
+    if(!String(data?.response||'').trim())throw new Error('EMPTY_RESPONSE');
+    return String(data.response);
+  }finally{clearTimeout(timer)}
+}
+export function invokeCodingOllamaResource(resource,prompt,{
+  fetchImpl=fetch,workerUrl=OLLAMA_BASE_URL,managerUrl=MANAGER_OLLAMA_BASE_URL,
+  maxTokens=codingOutputTokenLimit(prompt),timeoutMs=OLLAMA_TIMEOUT_MS,
+}={}){
+  const baseUrl=codingOllamaBaseUrlForResource(resource,{workerUrl,managerUrl});
+  if(resource.id==='NV08')return invokeOllamaManagerJson(resource.model,prompt,{fetchImpl,baseUrl,timeoutMs});
+  if(resource.id==='NV09')return invokeNv09NativeCoder(resource.model,prompt,{fetchImpl,baseUrl,maxTokens,timeoutMs});
+  return invokeOllamaChat(resource.model,prompt,{fetchImpl,baseUrl,maxTokens,timeoutMs});
+}
+async function invoke(r,prompt,{ollamaTimeoutMs=null}={}){
+  const outputTokens=codingOutputTokenLimit(prompt);
+  if(r.provider==='ollama')return withPc01LocalInferenceSlot(pool,
+    ()=>invokeCodingOllamaResource(r,prompt,{maxTokens:outputTokens,timeoutMs:ollamaTimeoutMs??OLLAMA_TIMEOUT_MS}),
+    {waitMs:r.id==='NV08'?90000:120000}
+  );
+  if(r.provider==='groq')return openAi('https://api.groq.com/openai/v1/chat/completions',process.env.GROQ_API_KEY,r.model,prompt,outputTokens);
+  if(r.provider==='openrouter')return openAi('https://openrouter.ai/api/v1/chat/completions',process.env.OPENROUTER_API_KEY,r.model,prompt,outputTokens);
+  if(r.provider==='mistral')return openAi('https://api.mistral.ai/v1/chat/completions',process.env.MISTRAL_API_KEY,r.model,prompt,outputTokens);
+  if(r.provider==='cloudflare'){const b=await fetchJson(`https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/ai/run/${r.model}`,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${process.env.CLOUDFLARE_AUTH_TOKEN}`},body:JSON.stringify({prompt})});const text=b?.result?.response;if(!String(text||'').trim())throw new Error('EMPTY_RESPONSE');return String(text)}
+  if(r.provider==='huggingface')return openAi('https://router.huggingface.co/v1/chat/completions',process.env.HF_TOKEN,r.model,prompt,outputTokens);
+  if(r.provider==='inception')return openAi('https://api.inceptionlabs.ai/v1/chat/completions',process.env.INCEPTION_API_KEY,r.model,prompt,outputTokens);
+  if(r.provider==='gemini')return geminiRateController.run(async()=>{const b=await fetchJson(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(r.model)}:generateContent`,{method:'POST',headers:{'content-type':'application/json','x-goog-api-key':process.env.GEMINI_API_KEY},body:JSON.stringify({contents:[{role:'user',parts:[{text:prompt}]}],generationConfig:{temperature:0,maxOutputTokens:codingOutputTokenLimit(prompt,8192)}})});const text=b?.candidates?.[0]?.content?.parts?.map(x=>x.text||'').join('\n');if(!String(text||'').trim())throw new Error('EMPTY_RESPONSE');return String(text)});
+  if(r.provider==='cohere'){const b=await fetchJson('https://api.cohere.com/v2/chat',{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${process.env.COHERE_API_KEY}`},body:JSON.stringify({model:r.model,messages:[{role:'user',content:prompt}],temperature:0,max_tokens:outputTokens})});const text=b?.message?.content?.map(x=>x.text||'').join('');if(!String(text||'').trim())throw new Error('EMPTY_RESPONSE');return String(text)}
+  if(r.provider==='nvidia')return openAi('https://integrate.api.nvidia.com/v1/chat/completions',process.env.NVIDIA_API_KEY,r.model,prompt,outputTokens,codingChatRequestBody({model:r.model,prompt,maxTokens:outputTokens}));
+  throw new Error('PROVIDER_UNSUPPORTED');
+}
+
+export function salvageCompactEditsJson(text){
+  const raw=String(text||'');
+  const marker=/["']edits["']\s*:\s*\[/i.exec(raw);
+  if(!marker)return null;
+  const edits=[];let start=-1,depth=0,inString=false,escape=false;
+  for(let i=marker.index+marker[0].length;i<raw.length;i++){
+    const ch=raw[i];
+    if(inString){
+      if(escape){escape=false;continue}
+      if(ch==='\\'){escape=true;continue}
+      if(ch==='"')inString=false;
+      continue;
+    }
+    if(ch==='"'){inString=true;continue}
+    if(ch==='{'){if(depth===0)start=i;depth++;continue}
+    if(ch==='}'&&depth>0){
+      depth--;
+      if(depth===0&&start>=0){
+        try{
+          const edit=JSON.parse(raw.slice(start,i+1));
+          const path=String(edit?.path||'').trim();
+          const search=typeof edit?.search==='string'?edit.search:typeof edit?.old==='string'?edit.old:null;
+          const replace=typeof edit?.replace==='string'?edit.replace:typeof edit?.new==='string'?edit.new:null;
+          if(path&&search&&replace!==null)edits.push({path,search,replace});
+        }catch{}
+        start=-1;
+      }
+    }
+  }
+  return edits.length?{summary:'salvaged complete compact edits from truncated model response',edits}:null;
+}
+export function parseCompactEditJson(text){
+  const parsed=parseModelJson(text);
+  if(parsed&&typeof parsed==='object'&&!Array.isArray(parsed))return parsed;
+  return parseJsonObject(text);
+}
+
+async function acquireCodingLaneInferenceLease(resource,context={}){
+  if(!pool||!context?.workId)return null;
+  return acquireSharedResourceLease(pool,{
+    employeeId:resource?.id,
+    resourceId:resource?.resourceId,
+    workId:String(context.workId),
+    role:String(context.role||'inference'),
+    lane:'coding_lane',
+    metadata:{provider:resource?.provider||null,model:resource?.model||null},
+  });
+}
+
+async function heartbeatCodingLaneInferenceLease(lease){
+  if(!pool||!lease?.resource_id||!lease?.lease_token)return false;
+  return heartbeatSharedResourceLease(pool,{resourceId:lease.resource_id,leaseToken:lease.lease_token});
+}
+
+async function releaseCodingLaneInferenceLease(lease){
+  if(!pool||!lease?.resource_id||!lease?.lease_token)return false;
+  return releaseSharedResourceLease(pool,{resourceId:lease.resource_id,leaseToken:lease.lease_token});
+}
+
+export async function invokeJsonWithFailover(initialResource,prompt,{
+  exclude=[],
+  resourcePool=null,
+  invokeFn=invoke,
+  shrinkPrompt=shrinkAiPrompt,
+  maxResources=null,
+  maxSameResourceAttempts=2,
+  validateData=null,
+  parseData=parseJsonObject,
+  sleepFn=sleep,
+  randomFn=Math.random,
+  backoffBaseMs=1000,
+  leaseContext=null,
+  acquireLeaseFn=acquireCodingLaneInferenceLease,
+  heartbeatLeaseFn=heartbeatCodingLaneInferenceLease,
+  releaseLeaseFn=releaseCodingLaneInferenceLease,
+}={}){
+  const poolResources=Array.isArray(resourcePool)?resourcePool:selectableResources([]);
+  const eligible=poolResources.filter(r=>r&&!exclude.includes(r.id)&&!busyAiResources.has(r.id));
+  const initial=eligible.find(r=>r.id===initialResource?.id)||eligible[0];
+  if(!initial){const e=new Error('AI_RESOURCES_BUSY');e.code='AI_RESOURCES_BUSY';throw e;}
+  // Always exhaust eligible remote providers before attempting NV09 locally.
+  const ordered=[initial,...eligible.filter(r=>r?.id!==initial.id&&r?.id!=='NV09'),...eligible.filter(r=>r?.id!==initial.id&&r?.id==='NV09')];
+  const unique=[];const ids=new Set();
+  const resourceLimit=maxResources===null?poolResources.length:Math.max(1,Math.min(poolResources.length,Number(maxResources)||1));
+  for(const r of ordered){if(!r||exclude.includes(r.id)||ids.has(r.id)||busyAiResources.has(r.id))continue;ids.add(r.id);unique.push(r);if(unique.length>=resourceLimit)break;}
+  const failureLedger=[];let attempts=0,leaseBusy=0;
+  for(let resourceIndex=0;resourceIndex<unique.length;resourceIndex++){
+    const resource=unique[resourceIndex];
+    for(let same=0;same<Math.max(1,Math.min(2,Number(maxSameResourceAttempts)||2));same++){
+      if(busyAiResources.has(resource.id))break;
+      let sharedLease=null,heartbeatTimer=null;
+      if(leaseContext?.workId){
+        sharedLease=await acquireLeaseFn(resource,leaseContext);
+        if(!sharedLease){leaseBusy++;break;}
+        heartbeatTimer=setInterval(()=>{
+          Promise.resolve(heartbeatLeaseFn(sharedLease)).catch(error=>{
+            console.warn(JSON.stringify({event:'CODING_SHARED_LEASE_HEARTBEAT_FAILED',employeeId:resource.id,workId:leaseContext.workId,error:String(error?.message||error).slice(0,240)}));
+          });
+        },SHARED_RESOURCE_LEASE_HEARTBEAT_MS);
+        heartbeatTimer.unref?.();
+      }
+      attempts++;
+      busyAiResources.add(resource.id);
+      try{
+        const data=parseData(await invokeFn(resource,same===0?prompt:shrinkPrompt(prompt)));
+        if(validateData)validateData(data,resource);
+        return {data,resource,attempts,failureLedger};
+      }catch(e){
+        const providerRequestRejected=isProviderRequestRejected(e);
+        const retryable=isRetryableAiError(e)||providerRequestRejected;
+        const failureClass=classifyAiFailure(e);
+        const cooldownUntil=failureClass==='rate_limit'?new Date(Date.now()+30*60*1000).toISOString():null;
+        failureLedger.push({resourceId:resource.id,provider:resource.provider,class:failureClass,retryable,cooldownUntil,message:String(e?.message||e).slice(0,500)});
+        if(!retryable){
+          e.detail={...(e.detail||{}),attempts,tried:[...new Set(failureLedger.map(x=>x.resourceId))],failureLedger};
+          throw e;
+        }
+        if(providerRequestRejected||failureClass==='rate_limit')break;
+        if(same===0)continue;
+        break;
+      }finally{
+        if(heartbeatTimer)clearInterval(heartbeatTimer);
+        if(sharedLease){
+          try{await releaseLeaseFn(sharedLease)}
+          catch(error){console.warn(JSON.stringify({event:'CODING_SHARED_LEASE_RELEASE_FAILED',employeeId:resource.id,workId:leaseContext?.workId||null,error:String(error?.message||error).slice(0,240)}))}
+        }
+        busyAiResources.delete(resource.id);
+      }
+    }
+  }
+  const tried=[...new Set(failureLedger.map(x=>x.resourceId))];
+  if(!failureLedger.length&&leaseBusy>0){
+    const error=new Error('AI_RESOURCES_BUSY');error.code='AI_RESOURCES_BUSY';error.detail={attempts,tried,leaseBusy,failureLedger};throw error;
+  }
+  const resourceOnly=failureLedger.length>0&&failureLedger.every(x=>['rate_limit','timeout','provider_unavailable'].includes(x.class));
+  const hasOutputFailure=failureLedger.some(x=>['output_contract','invalid_response'].includes(x.class));
+  const code=resourceOnly?'AI_RESOURCES_UNAVAILABLE':hasOutputFailure?'OUTPUT_CONTRACT_EXHAUSTED':'AI_RETRY_BUDGET_EXHAUSTED';
+  const error=new Error(code);error.code=code;error.detail={attempts,tried,leaseBusy,failureLedger};throw error;
+}
+
+async function ghRepo(repository,path,init={}){
+  const target=repository||SOURCE_REPOSITORY;
+  return fetchJson(`https://api.github.com/repos/${target.owner}/${target.repo}${path}`,{...init,headers:{accept:'application/vnd.github+json','content-type':'application/json','user-agent':'TigerIQ-Coding-Lane/1.0','x-github-api-version':'2022-11-28',authorization:`Bearer ${GH_TOKEN}`,...(init.headers||{})}},30000);
+}
+async function gh(path,init={}){return ghRepo(SOURCE_REPOSITORY,path,init)}
+
+export function requiresLiveGithubContext(objective=''){
+  return /^REQUIRES_LIVE_GITHUB_CONTEXT=true\s*$/mi.test(String(objective||''));
+}
+export function sourceIssueNumberFromObjective(objective=''){
+  const match=String(objective||'').match(/^GitHub autonomous coding.*?\bissue #(\d+):/im);
+  const value=Number(match?.[1]||0);
+  return Number.isInteger(value)&&value>0?value:null;
+}
+export function extractLiveGithubContextRefs(objective='',maxRefs=16){
+  if(!requiresLiveGithubContext(objective))return [];
+  const sourceIssue=sourceIssueNumberFromObjective(objective);
+  const refs=[],seen=new Set();
+  for(const match of String(objective||'').matchAll(/#(\d+)\b/g)){
+    const value=Number(match[1]);
+    if(!Number.isInteger(value)||value<=0||value===sourceIssue||seen.has(value))continue;
+    seen.add(value);refs.push(value);
+    if(refs.length>=Math.max(1,Math.min(16,Number(maxRefs)||16)))break;
+  }
+  return refs;
+}
+export function liveGithubContextFingerprint(context){
+  const entries=Array.isArray(context?.entries)?context.entries:[];
+  return createHash('sha256').update(JSON.stringify(entries.map(entry=>({
+    number:Number(entry.number),
+    kind:String(entry.kind||'issue'),
+    title:String(entry.title||''),
+    state:String(entry.state||''),
+    state_reason:entry.state_reason??null,
+    updated_at:String(entry.updated_at||''),
+    head_sha:entry.head_sha??null,
+  })))).digest('hex');
+}
+export function formatAuthoritativeGithubContext(context){
+  if(!context)return '';
+  const fingerprint=String(context.fingerprint||liveGithubContextFingerprint(context));
+  return `AUTHORITATIVE_GITHUB_CONTEXT
+FINGERPRINT=${fingerprint}
+ENTRIES=${JSON.stringify(context.entries||[])}
+Use this bounded GitHub snapshot as authoritative for the referenced issue/PR state. Do not infer a different live state.`;
+}
+export function assertLiveGithubContextFresh(expected,current){
+  if(!expected&&!current)return true;
+  if(!expected||!current)throw Object.assign(new Error('LIVE_GITHUB_CONTEXT_STALE'),{code:'LIVE_GITHUB_CONTEXT_STALE'});
+  const expectedFingerprint=String(expected.fingerprint||liveGithubContextFingerprint(expected));
+  const currentFingerprint=String(current.fingerprint||liveGithubContextFingerprint(current));
+  if(expectedFingerprint!==currentFingerprint)throw Object.assign(new Error(`LIVE_GITHUB_CONTEXT_STALE:${expectedFingerprint}!=${currentFingerprint}`),{code:'LIVE_GITHUB_CONTEXT_STALE',detail:{expectedFingerprint,currentFingerprint}});
+  return true;
+}
+export async function loadAuthoritativeGithubContext(objective='',{
+  fetchIssue=async number=>gh(`/issues/${number}`),
+  fetchPr=async number=>gh(`/pulls/${number}`),
+  maxRefs=16,
+}={}){
+  if(!requiresLiveGithubContext(objective))return null;
+  const refs=extractLiveGithubContextRefs(objective,maxRefs);
+  if(!refs.length)throw Object.assign(new Error('LIVE_GITHUB_CONTEXT_UNAVAILABLE:NO_REFERENCES'),{code:'LIVE_GITHUB_CONTEXT_UNAVAILABLE'});
+  try{
+    const entries=[];
+    for(const number of refs){
+      const issue=await fetchIssue(number);
+      if(!issue||Number(issue.number)!==number)throw new Error(`MISSING_ISSUE_${number}`);
+      const isPr=Boolean(issue.pull_request);
+      let headSha=null;
+      if(isPr){
+        const pr=await fetchPr(number);
+        headSha=String(pr?.head?.sha||'').trim()||null;
+        if(!headSha)throw new Error(`MISSING_PR_HEAD_${number}`);
+      }
+      entries.push({
+        number,
+        kind:isPr?'pr':'issue',
+        title:String(issue.title||''),
+        state:String(issue.state||''),
+        state_reason:issue.state_reason??null,
+        updated_at:String(issue.updated_at||''),
+        head_sha:headSha,
+      });
+    }
+    const context={entries};
+    return {...context,fingerprint:liveGithubContextFingerprint(context)};
+  }catch(error){
+    const wrapped=Object.assign(new Error(`LIVE_GITHUB_CONTEXT_UNAVAILABLE:${String(error?.message||error)}`),{code:'LIVE_GITHUB_CONTEXT_UNAVAILABLE',cause:error});
+    throw wrapped;
+  }
+}
+
+async function ghTextRepo(repository,path,accept){const target=repository||SOURCE_REPOSITORY;const res=await fetch(`https://api.github.com/repos/${target.owner}/${target.repo}${path}`,{headers:{accept,authorization:`Bearer ${GH_TOKEN}`,'user-agent':'TigerIQ-Coding-Lane/1.0'},signal:AbortSignal.timeout(30000)});const text=await res.text();if(!res.ok)throw new Error(`GITHUB_HTTP_${res.status}:${text.slice(0,250)}`);return text}
+export function checkRepositoryGateState(checkRuns,repository=SOURCE_REPOSITORY){
+  if(repository?.isSource!==false)return checkGateState(checkRuns);
+  const fullName=String(repository?.fullName||'').toLowerCase();
+  if(fullName==='newsdayads/tigeriq-media'){
+    const rows=(Array.isArray(checkRuns)?checkRuns:[]).filter(row=>String(row?.name||'').toLowerCase()==='verify');
+    const states=rows.map(row=>({name:String(row?.name||''),status:String(row?.status||'missing'),conclusion:row?.conclusion||null}));
+    const failed=states.filter(row=>['failure','cancelled','timed_out','action_required','startup_failure'].includes(String(row.conclusion||'')));
+    if(failed.length)return {state:'failed',states};
+    if(states.length>=2&&states.every(row=>row.status==='completed'&&row.conclusion==='success'))return {state:'passed',states};
+    return {state:'pending',states};
+  }
+  return {state:'failed',states:[{name:'TARGET_REPOSITORY_GATE_POLICY',status:'completed',conclusion:'failure'}]};
+}
+async function mainSha(repository=SOURCE_REPOSITORY){return (await ghRepo(repository,'/git/ref/heads/main')).object.sha}
+async function reconcileExistingPrBranch(pr,expectedHeadSha,repository=SOURCE_REPOSITORY){
+  const identity=validateExistingPrResume(pr,{number:pr?.number,targetHead:expectedHeadSha,repoFullName:repository.fullName});
+  const baseSha=await mainSha(repository);
+  const compare=await ghRepo(repository,`/compare/${baseSha}...${identity.headSha}`);
+  if(!existingPrNeedsBaseUpdate(compare))return identity;
+  try{
+    await ghRepo(repository,`/pulls/${identity.number}/update-branch`,{method:'PUT',body:JSON.stringify({expected_head_sha:identity.headSha})});
+  }catch(error){
+    const e=new Error(`EXISTING_PR_RECONCILE_FAILED:${String(error?.message||error).slice(0,300)}`);e.code='EXISTING_PR_RECONCILE_FAILED';throw e;
+  }
+  for(let attempt=0;attempt<20;attempt++){
+    const updated=await ghRepo(repository,`/pulls/${identity.number}`);
+    const current=validateExistingPrResume(updated,{number:identity.number,repoFullName:repository.fullName});
+    const nextCompare=await ghRepo(repository,`/compare/${baseSha}...${current.headSha}`);
+    if(!existingPrNeedsBaseUpdate(nextCompare))return current;
+    await sleep(1000);
+  }
+  const e=new Error('EXISTING_PR_RECONCILE_TIMEOUT');e.code='EXISTING_PR_RECONCILE_TIMEOUT';throw e;
+}
+async function repoTree(repository=SOURCE_REPOSITORY){const sha=await mainSha(repository);const t=await ghRepo(repository,`/git/trees/${sha}?recursive=1`);return (t.tree||[]).filter(x=>x.type==='blob').map(x=>x.path).filter(safeRepoPath).slice(0,3000)}
+async function readRepoFile(path,ref='main',repository=SOURCE_REPOSITORY){try{const x=await ghRepo(repository,`/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${encodeURIComponent(ref)}`);return {path,sha:x.sha,content:Buffer.from(x.content||'','base64').toString('utf8')};}catch(e){if(e.status===404)return {path,sha:null,content:''};throw e}}
+async function createBranch(name,sha,repository=SOURCE_REPOSITORY){
+  try{return await ghRepo(repository,'/git/refs',{method:'POST',body:JSON.stringify({ref:`refs/heads/${name}`,sha})})}
+  catch(error){
+    if(Number(error?.status)!==422)throw error;
+    const existing=await ghRepo(repository,`/git/ref/heads/${encodeURIComponent(name)}`);
+    if(String(existing?.object?.sha||'')===String(sha||''))return existing;
+    throw error;
+  }
+}
+async function writeFile(branch,change,mutationAuth={},repository=SOURCE_REPOSITORY){assertExecutionPlaneMutationPaths([change.path],mutationAuth);const old=await readRepoFile(change.path,branch,repository);assertSafeFileChange({path:change.path,before:old.sha?old.content:null,after:change.content,isNew:!old.sha});const body={message:`TigerIQ ${change.path}`,content:Buffer.from(change.content,'utf8').toString('base64'),branch};if(old.sha)body.sha=old.sha;return ghRepo(repository,`/contents/${change.path.split('/').map(encodeURIComponent).join('/')}`,{method:'PUT',body:JSON.stringify(body)})}
+async function openPr(branch,title,body,repository=SOURCE_REPOSITORY,{canary=false}={}){return ghRepo(repository,'/pulls',{method:'POST',body:JSON.stringify({title,head:branch,base:'main',body,draft:canary,maintainer_can_modify:true})})}
+async function headSha(branch,repository=SOURCE_REPOSITORY){return (await ghRepo(repository,`/git/ref/heads/${encodeURIComponent(branch)}`)).object.sha}
+async function waitGates(branch,prNumber,repository=SOURCE_REPOSITORY,timeoutMs=20*60*1000){const deadline=Date.now()+timeoutMs;while(Date.now()<deadline){assertPrOpenState(await ghRepo(repository,`/pulls/${prNumber}`));const sha=await headSha(branch,repository);const x=await ghRepo(repository,`/commits/${sha}/check-runs?per_page=100`);const g=checkRepositoryGateState(x.check_runs||[],repository);if(g.state==='passed')return {sha,...g};if(g.state==='failed'){const e=Object.assign(new Error('CI_GATES_FAILED'),{code:'CI_GATES_FAILED',detail:g});throw e}await sleep(15000)}const e=new Error('CI_GATES_TIMEOUT');e.code='CI_GATES_TIMEOUT';throw e}
+async function mergePr(number,sha,title='',repository=SOURCE_REPOSITORY){return ghRepo(repository,`/pulls/${number}/merge`,{method:'PUT',body:JSON.stringify({sha,merge_method:'squash',commit_title:codingMergeCommitTitle(number,title)})})}
+
+function reviewLine(value,max=1000){return String(value??'').replace(/[\r\n]+/g,' ').trim().slice(0,max)}
+export function formatIndependentReviewArtifact({implementerId,reviewerId,targetHead,review={}}={}){
+  const implementer=reviewLine(implementerId,80),reviewer=reviewLine(reviewerId,80),head=reviewLine(targetHead,80);
+  const decision=reviewLine(review?.decision,40);
+  if(!implementer||!reviewer||!head||!['approve','changes_requested'].includes(decision))throw new Error('REVIEW_ARTIFACT_INVALID');
+  if(implementer===reviewer)throw new Error('REVIEWER_IMPLEMENTER_COLLISION');
+  const summary=reviewLine(review?.summary,1000);
+  const issues=(Array.isArray(review?.issues)?review.issues:[]).slice(0,8).map(x=>reviewLine(x,500));
+  return ['[TIGERIQ_INDEPENDENT_REVIEW_V1]',`IMPLEMENTER=${implementer}`,`REVIEWER=${reviewer}`,`TARGET_HEAD=${head}`,`DECISION=${decision}`,`SUMMARY=${summary}`,`ISSUES=${JSON.stringify(issues)}`].join('\n');
+}
+export function assertIndependentReviewApproval({implementerId,reviewerId,targetHead,expectedHead,decision}={}){
+  const implementer=String(implementerId||'').trim(),reviewer=String(reviewerId||'').trim();
+  const approved=String(targetHead||'').trim(),current=String(expectedHead||'').trim();
+  if(!implementer||!reviewer||implementer===reviewer)throw new Error('REVIEWER_IMPLEMENTER_COLLISION');
+  if(decision!=='approve')throw new Error('REVIEW_NOT_APPROVED');
+  if(!approved||!current||approved!==current)throw new Error('REVIEW_HEAD_STALE');
+  return true;
+}
+async function persistIndependentReviewArtifact(prNumber,data,repository=SOURCE_REPOSITORY){
+  const body=formatIndependentReviewArtifact(data);
+  const out=await ghRepo(repository,`/issues/${prNumber}/comments`,{method:'POST',body:JSON.stringify({body})});
+  if(!out?.id)throw new Error('DURABLE_REVIEW_ARTIFACT_WRITE_UNVERIFIED');
+  return {id:out.id,body};
+}
+
+export function codingP0CanaryApplies(objective=''){
+  if(process.env.TIGERIQ_P0_CODING_STEP_CANARY!=='1')return false;
+  const issue=Number(process.env.TIGERIQ_P0_CODING_STEP_CANARY_ISSUE||0);
+  if(!Number.isSafeInteger(issue)||issue<=0)
+    throw Object.assign(new Error('CODING_CANARY_ISSUE_SCOPE_REQUIRED'),{code:'CODING_CANARY_ISSUE_SCOPE_REQUIRED'});
+  return (Number.isSafeInteger(objective)&&objective>0?objective:sourceWorkOrderNumber(objective))===issue;
+}
+export function sourceWorkOrderNumber(objective=''){
+  const text=String(objective||'').trimStart();
+  // Only the authoritative objective header may select a canary Issue.
+  // Quoted instructions, later Markdown or past-history text cannot re-scope it.
+  const patterns=[
+    /^GitHub autonomous coding\s+issue\s+#(\d+)\b/i,
+    /^GitHub autonomous coding\s+retry\s+\d+\/\d+\s+for\s+issue\s+#(\d+)\b/i,
+    /^GitHub autonomous coding\s+(?:recovery|retry|repair)(?:\s+for)?\s+issue\s+#(\d+)\b/i,
+  ];
+  for(const pattern of patterns){
+    const match=text.match(pattern);
+    const number=Number(match?.[1]||0);
+    if(Number.isInteger(number)&&number>0)return number;
+  }
+  return null;
+}
+
+// The GitHub Coding Intake accepts ONLY the first current contract section.
+// Historical snapshots commonly contain TIGERIQ_EXECUTABLE=false and must
+// never revoke a later, explicit Owner-issued current authorization.
+export function currentSourceWorkOrderContract(body=''){
+  const source=String(body||'');
+  const headings=[...source.matchAll(/^ {0,3}#{1,6}[ \t]+\S[^\r\n]*/gm)];
+  const first=headings[0];
+  if(first?.index===0&&/(?:\b(?:HISTORICAL|HISTORY|SUPERSEDED|ARCHIVED)\b|LỊCH SỬ)/i.test(first[0]))return '';
+  const sectionEnd=first?.index===0?(headings[1]?.index??source.length):(first?.index??source.length);
+  const separator=source.match(/^ {0,3}(?:-{3,}|\*{3,}|_{3,})(?:[ \t]+(?:HISTORICAL|SUPERSEDED|LỊCH SỬ)[^\r\n]*)?[ \t]*$/mi);
+  return source.slice(0,Math.min(sectionEnd,separator?.index??source.length));
+}
+
+export function assertSourceWorkOrderExecutable(issue,issueNumber=null){
+  const body=currentSourceWorkOrderContract(issue?.body);
+  const state=String(issue?.state||'').trim().toLowerCase();
+  const stateReason=String(issue?.state_reason||'').trim().toLowerCase();
+  const executableTrue=/^\s*TIGERIQ_EXECUTABLE\s*=\s*true\s*$/im.test(body);
+  const executableFalse=/^\s*TIGERIQ_EXECUTABLE\s*=\s*false\s*$/im.test(body);
+  const terminalState=/^\s*STATE\s*=\s*(?:SUPERSEDED|CANCELLED)\s*$/im.test(body);
+  const supersededBy=/^\s*SUPERSEDED_BY\s*=\s*\S+/im.test(body);
+  if(state!=='open'||!executableTrue||executableFalse||terminalState||supersededBy){
+    const error=new Error('SOURCE_WORK_ORDER_NO_LONGER_EXECUTABLE');
+    error.code='SOURCE_WORK_ORDER_NO_LONGER_EXECUTABLE';
+    error.detail={issueNumber:Number(issueNumber)||Number(issue?.number)||null,state:state||null,stateReason:stateReason||null,executableTrue,executableFalse,terminalState,supersededBy,
+      completionEvidence:(codingP0CanaryApplies(Number(issueNumber)||Number(issue?.number)||0)&&state==='closed')?verifyClosedCodingWorkOrder({body,state,stateReason}):null};
+    throw error;
+  }
+  return true;
+}
+
+export async function assertCanonicalSourceWorkOrderExecutable(objective,{fetchIssue}={}){
+  const issueNumber=sourceWorkOrderNumber(objective);
+  if(!issueNumber)return {checked:false,issueNumber:null};
+  const loader=fetchIssue||((number)=>gh(`/issues/${number}`));
+  let issue;
+  try{issue=await loader(issueNumber)}
+  catch(cause){
+    const error=new Error('SOURCE_WORK_ORDER_LOOKUP_FAILED');
+    error.code='SOURCE_WORK_ORDER_LOOKUP_FAILED';
+    error.detail={issueNumber,message:String(cause?.message||cause).slice(0,300)};
+    throw error;
+  }
+  assertSourceWorkOrderExecutable(issue,issueNumber);
+  return {checked:true,issueNumber};
+}
+
+export function codingObjectiveSourcePreflightDecision(error){
+  const code=String(error?.code||error?.message||'SOURCE_WORK_ORDER_PREFLIGHT_FAILED');
+  if(code!=='SOURCE_WORK_ORDER_NO_LONGER_EXECUTABLE')return {action:'defer',code};
+  const state=String(error?.detail?.state||'').toLowerCase();
+  const stateReason=String(error?.detail?.stateReason||'').toLowerCase();
+  if(state==='closed'&&stateReason==='completed'){
+    if(codingP0CanaryApplies(Number(error?.detail?.issueNumber)||0)&&error?.detail?.completionEvidence?.pass!==true)
+      return {action:'block',code:'SOURCE_WORK_ORDER_CLOSED_UNACCEPTED'};
+    return {action:'complete',code:'SOURCE_WORK_ORDER_COMPLETED'};
+  }
+  return {action:'block',code:'SOURCE_WORK_ORDER_NO_LONGER_EXECUTABLE'};
+}
+
+async function initDb(){if(!pool)return;await pool.query(`
+create table if not exists tigeriq_coding_objectives(id text primary key,objective text not null,priority text not null default 'P1',status text not null default 'active',summary text,manager_employee_id text,created_at timestamptz not null default now(),updated_at timestamptz not null default now());
+alter table tigeriq_coding_objectives add column if not exists next_attempt_at timestamptz;
+alter table tigeriq_coding_objectives add column if not exists resource_retry_count int not null default 0;
+alter table tigeriq_coding_objectives add column if not exists resource_retry_started_at timestamptz;
+alter table tigeriq_coding_objectives add column if not exists target_employee text;
+alter table tigeriq_coding_objectives add column if not exists current_pr int;
+alter table tigeriq_coding_objectives add column if not exists target_head text;
+create table if not exists tigeriq_coding_jobs(id text primary key,objective_id text references tigeriq_coding_objectives(id),title text not null,instruction text not null,paths jsonb not null default '[]'::jsonb,status text not null default 'queued',employee_id text,reviewer_employee_id text,branch text,pr_number int,head_sha text,result jsonb,failure jsonb,attempts int not null default 0,created_at timestamptz not null default now(),started_at timestamptz,completed_at timestamptz);
+alter table tigeriq_coding_jobs add column if not exists target_employee_id text;
+alter table tigeriq_coding_jobs add column if not exists next_attempt_at timestamptz;
+alter table tigeriq_coding_jobs add column if not exists resource_retry_count int not null default 0;
+alter table tigeriq_coding_jobs add column if not exists resource_retry_started_at timestamptz;
+alter table tigeriq_coding_jobs add column if not exists stale_recovery_count int not null default 0;
+alter table tigeriq_coding_jobs add column if not exists live_github_context jsonb;
+alter table tigeriq_coding_jobs add column if not exists live_github_context_fingerprint text;
+create index if not exists tigeriq_coding_jobs_status_idx on tigeriq_coding_jobs(status,created_at);
+`);await ensureSharedResourceLeaseTable(pool)}
+
+export function managerBlockKind(summary=''){
+  const text=String(summary||'').trim().toUpperCase();
+  if(/SECURITY|CREDENTIAL|PAID|DESTRUCTIVE|PRODUCTION|BROWSER[_ -]?AUTH|AUTHORIZATION[_ -]?REQUIRED|POLICY[_ -]?BLOCK|OUT[_ -]?OF[_ -]?SCOPE|NO[_ -]?SAFE[_ -]?PATH/.test(text))return 'hard';
+  return 'soft';
+}
+
+async function managerTick(){
+  const q=await pool.query("select * from tigeriq_coding_objectives where status='active' and (next_attempt_at is null or next_attempt_at<=now()) and not exists(select 1 from tigeriq_coding_jobs j where j.objective_id=tigeriq_coding_objectives.id and j.status in ('queued','running','review','waiting_ci','waiting_resource','waiting_owner')) order by case priority when 'P0' then 0 when 'P1' then 1 else 2 end,created_at limit 1");
+  const o=q.rows[0];if(!o)return;
+  try{
+    await assertCanonicalSourceWorkOrderExecutable(o.objective);
+  }catch(error){
+    const preflight=codingObjectiveSourcePreflightDecision(error);
+    if(preflight.action==='complete'){
+      await pool.query("update tigeriq_coding_objectives set status='completed',summary=$2,next_attempt_at=null,updated_at=now() where id=$1 and status='active'",[o.id,'Source Work Order already closed completed; stale no-job coding objective retired.']);
+    }else if(preflight.action==='block'){
+      await pool.query("update tigeriq_coding_objectives set status='blocked',summary=$2,next_attempt_at=null,updated_at=now() where id=$1 and status='active'",[o.id,'Source Work Order is no longer executable; stale no-job coding objective blocked.']);
+    }else{
+      await pool.query("update tigeriq_coding_objectives set summary=$2,next_attempt_at=now()+interval '30 seconds',updated_at=now() where id=$1 and status='active'",[o.id,`Source Work Order preflight deferred: ${preflight.code}`]);
+    }
+    return;
+  }
+  let manager=pickManagerResource();if(!manager)return
+  const canonical=extractCanonicalAllowedPaths(o.objective);
+  const mutationAuth={...controlPlaneRepairIntent(o.objective),executorClass:'CODING_LANE_MANAGER'};
+  const ownerWaiver=codingOwnerReviewWaiver(resolveCodingRepository(targetRepositoryFromObjective(o.objective)));
+  let liveGithubContext=null;
+  try{liveGithubContext=await loadAuthoritativeGithubContext(o.objective)}
+  catch(error){
+    await pool.query("update tigeriq_coding_objectives set status='blocked',summary=$2,manager_employee_id=$3,next_attempt_at=null,updated_at=now() where id=$1",[o.id,String(error?.message||error).slice(0,1000),manager.id]);
+    return;
+  }
+  const liveGithubContextBlock=formatAuthoritativeGithubContext(liveGithubContext);
+  const targetRepository=resolveCodingRepository(targetRepositoryFromObjective(o.objective));
+  const tree=await repoTree(targetRepository);
+  const canary=codingP0CanaryApplies(o.objective);
+  const sourceHeadSha=canary?await mainSha(targetRepository):null;
+  const scopeText=canonical.length?`\nCANONICAL ALLOWED PATHS (MUST NOT EXPAND):\n${canonical.join('\n')}\n`:'';
+  const liveContextText=liveGithubContextBlock?`\n\n${liveGithubContextBlock}\n`:'';
+  let prompt=`You are TigerIQ Coding Manager. Decompose this repository objective into ONE safe coding job. Repository files:\n${tree.join('\n').slice(0,45000)}\n\nOBJECTIVE: ${o.objective}${scopeText}${liveContextText}\nDependencies and backlog eligibility were already validated by Core before this objective reached Coding Lane. When AUTHORITATIVE_GITHUB_CONTEXT is present, it is the authoritative bounded snapshot for referenced issue/PR facts; do not infer different live state. Do NOT block because a DEPENDS_ON issue is not represented in repository files or because you cannot independently confirm a GitHub dependency that is not required by the live-context marker. Decompose only the repository implementation requested here. Use status=blocked ONLY for a concrete hard safety/policy condition such as security, credential, paid cost, Production, destructive action, browser authentication, authorization required, canonical out-of-scope, or unavailable required live GitHub context. Uncertainty, preference, placeholder text, inability to independently reconfirm eligibility outside required live context, or "reason for blocking" are NOT valid blockers. Return ONLY JSON {"status":"continue|blocked","summary":"short","job":{"title":"short Vietnamese work title","instruction":"standalone implementation instruction","paths":["exact/repo/path"]}}. job.title MUST be Vietnamese, concise, and preserve only necessary technical codes such as P0, CORE, API, NVxx, OpenClaw. Max 8 paths. Include relevant tests only when they are inside canonical scope. Never select .github/workflows, credentials/secrets, production/deploy config, docs/EXECUTION_BOUNDARY.md, docs/SECURITY.md, scripts/tigeriq-core/run-core.ps1, or main/release controls.`+formatCodingOwnerReviewPolicy(ownerWaiver);
+  let managerSkills={evidence:[],contextBlock:''};
+  const contractRevision=createHash('sha256').update(JSON.stringify({objective:o.objective,context:liveGithubContext?.fingerprint||null})).digest('hex');
+  try{
+    if((canary)){
+      managerSkills=loadRequiredCodingSkills(o.objective);
+      prompt+='\n\nOWNER_P0_CODING_STEP_PACKET_REQUIRED=true\n';
+      prompt+='Return job.step_id, job.deliverable_type (source|frontend|backend|android|test|documentation), job.required_changed_paths, job.steps, job.acceptance, job.evidence_required, and job.required_checks. job.paths and required_changed_paths MUST identify EXACT FILES rather than a directory or a proposed README. For Android require actual Gradle/Manifest/Kotlin source files and Android Build Verify; frontend and backend require their domain-specific functional CI. One real implementation step only. No invented tests or PASS.\n';
+      prompt+=managerSkills.contextBlock;
+    }
+    const validateManagerDecision=d=>{
+      if(d?.status==='blocked'&&managerBlockKind(d?.summary)!=='hard'){
+        const e=new Error(`MANAGER_SOFT_BLOCK:${String(d?.summary||'unspecified').slice(0,300)}`);
+        e.code='MANAGER_SOFT_BLOCK';
+        throw e;
+      }
+      validateManagerJobTitle(d,o.objective);
+      const scoped=validateManagerJobPaths(d,canonical,mutationAuth);
+      if((canary)&&d?.status==='continue'){
+        compileCodingStepPacket({objectiveId:o.id,sourceRevision:contractRevision,sourceHeadSha,job:d.job,allowedPaths:scoped,skillEvidence:managerSkills.proof});
+      }
+    };
+    const invoked=await invokeJsonWithFailover(manager,prompt,{
+      resourcePool:selectableManagerResources([]),
+      // An overloaded local 27B model must not occupy the single-flight Manager for 240 seconds.
+      // Abort Ollama HTTP on the Manager-only budget, then fail over to a distinct eligible AI.
+      // Per-provider retry defaults and all Worker/reviewer timeouts remain unchanged.
+      invokeFn:(r,managerPrompt)=>invoke(r,managerPrompt,{ollamaTimeoutMs:MANAGER_OLLAMA_TIMEOUT_MS}),
+      maxSameResourceAttempts:1,
+      validateData:validateManagerDecision,
+      leaseContext:{workId:`CODING-MANAGER:${o.id}`,role:'manager'},
+    });manager=invoked.resource;const d=invoked.data;
+    if(d.status!=='continue'||!d.job){await pool.query("update tigeriq_coding_objectives set status='blocked',summary=$2,manager_employee_id=$3,next_attempt_at=null,resource_retry_count=0,resource_retry_started_at=null,updated_at=now() where id=$1",[o.id,String(d.summary||'manager blocked').slice(0,1000),manager.id]);return}
+    const paths=validateManagerJobPaths(d,canonical,mutationAuth);
+    if(canary){
+      managerSkills=loadRequiredCodingSkills(o.objective,{requiredIds:requiredCodingSkillIdsForDeliverable(d.job.deliverable_type)});
+    }
+    let jobInstruction=String(d.job.instruction||o.objective);
+    let replayGuard=null,atomicWorkOrderId=null;
+    if((canary)){
+      const sourceTree=await ghRepo(targetRepository,`/git/trees/${sourceHeadSha}?recursive=1`);
+      if(sourceTree?.truncated||!Array.isArray(sourceTree?.tree))throw Error('CODING_MATERIAL_TREE_INCOMPLETE');
+      const blobMap=new Map(sourceTree.tree.filter(x=>x.type==='blob').map(x=>[x.path,x.sha]));
+      const materialPaths=codingSourceRevisionPaths({canonicalPaths:canonical,proposedPaths:paths});
+      const sourceBlobs=Object.fromEntries(materialPaths.map(path=>[path,blobMap.get(path)||null]));
+      const sourceWorkOrder=sourceWorkOrderNumber(o.objective);
+      const materialSpecRevision=String(o.objective||'').match(/^WORK_SPEC_REVISION=([A-Za-z0-9._-]{1,80})$/m)?.[1]||'';
+      const materialRevision=codingMaterialSourceRevision({
+        objective:o.objective,canonicalWorkOrderId:sourceWorkOrder?String(sourceWorkOrder):'',materialSpecRevision,paths:materialPaths,sourceBlobs
+      });
+      const packet=compileCodingStepPacket({objectiveId:o.id,sourceRevision:materialRevision,sourceHeadSha,job:d.job,allowedPaths:paths,skillEvidence:managerSkills.proof});
+      const workOrderId=String(sourceWorkOrder||o.id);
+      replayGuard=async db=>{
+      const previous=sourceWorkOrder
+        ?await db.query("select x.id as source_objective_id,x.objective,j.instruction,j.status,j.failure from tigeriq_coding_jobs j join tigeriq_coding_objectives x on x.id=j.objective_id where x.objective ilike $1 order by j.created_at desc limit 5000",['%issue #'+sourceWorkOrder+'%'])
+        :await db.query("select x.id as source_objective_id,x.objective,j.instruction,j.status,j.failure from tigeriq_coding_jobs j join tigeriq_coding_objectives x on x.id=j.objective_id where x.id=$1 order by j.created_at desc limit 5000",[o.id]);
+      if(previous.rows.length>=5000)throw Error('CODING_ATTEMPT_HISTORY_INCOMPLETE');
+      const history=[],legacyRows=[];
+      for(const row of previous.rows||[]){
+        const previousWorkOrderId=String(sourceWorkOrderNumber(row.objective)||row.source_objective_id);
+        const previousPacket=codingStepPacketFromInstruction(row.instruction);
+        if(!previousPacket){
+          legacyRows.push({workOrderId:previousWorkOrderId,status:row.status});
+          continue;
+        }
+        const failure=typeof row.failure==='string'?JSON.parse(row.failure):row.failure;
+        history.push({workOrderId:String(sourceWorkOrderNumber(row.objective)||row.source_objective_id),stepId:previousPacket.step_id,sourceRevision:previousPacket.source_revision,
+          status:row.status==='done'?'merged_unaccepted':row.status==='blocked'?'blocked_unaccepted':row.status==='failed'?'failed':String(row.status||''),
+          failureSignature:codingFailureSignature(failure)});
+      }
+      const legacy=codingUnverifiedLegacyHistoryDecision({workOrderId,legacyRows});
+      if(!legacy.allow)throw Object.assign(new Error(legacy.code),{code:legacy.code});
+      const same=history.filter(h=>h.workOrderId===workOrderId&&h.sourceRevision===packet.source_revision); // preserve cross-step aliases for replay guard
+      const accepted=repeatedCodingAttemptDecision({workOrderId,stepId:packet.step_id,sourceRevision:packet.source_revision,history:same});
+      const seenFailures=[...new Set(same.filter(h=>h.status==='failed').map(h=>h.failureSignature))];
+      const stop=accepted.allow?seenFailures.map(failureSignature=>repeatedCodingAttemptDecision({workOrderId,stepId:packet.step_id,sourceRevision:packet.source_revision,failureSignature,history:same})).find(x=>!x.allow):accepted;
+      if(stop&&!stop.allow)throw Object.assign(new Error(stop.code),{code:stop.code});
+      };
+      atomicWorkOrderId=workOrderId;
+      jobInstruction=codingStepInstruction(packet);
+      if(jobInstruction.length>12000)throw Error('CODING_STEP_STORED_INSTRUCTION_TOO_LONG');
+    }
+    if(sourceHeadSha&&await mainSha(targetRepository)!==sourceHeadSha)throw Error('CODING_STEP_SOURCE_HEAD_CHANGED_DURING_PLANNING');
+    let resumeBranch=null,resumePr=null,resumeHead=null;
+    if(o.current_pr){
+      const livePr=await ghRepo(targetRepository,`/pulls/${Number(o.current_pr)}`);
+      const resume=validateExistingPrResume(livePr,{number:o.current_pr,targetHead:o.target_head,repoFullName:targetRepository.fullName});
+      resumeBranch=resume.branch;resumePr=resume.number;resumeHead=resume.headSha;
+    }
+    const id=`CODE-${randomUUID()}`;
+    const persist=async db=>{
+      if(replayGuard)await replayGuard(db);
+      await db.query(
+        'insert into tigeriq_coding_jobs(id,objective_id,title,instruction,paths,target_employee_id,branch,pr_number,head_sha) values($1,$2,$3,$4,$5,$6,$7,$8,$9)',
+        [id,o.id,canonicalCodingJobTitle(o.objective,d.job.title),jobInstruction.slice(0,12000),JSON.stringify(paths),o.target_employee||null,resumeBranch,resumePr,resumeHead]
+      );
+      await db.query("update tigeriq_coding_objectives set manager_employee_id=$2,summary=$3,next_attempt_at=null,resource_retry_count=0,resource_retry_started_at=null,updated_at=now() where id=$1",[o.id,manager.id,String(d.summary||'coding job created').slice(0,1000)]);
+    };
+    if(replayGuard)await withAtomicCodingSourceClaim(pool,{workOrderId:atomicWorkOrderId,paths,run:persist});
+    else await persist(pool);
+  }catch(e){
+    const plan=managerResourceFailurePlan(e,o);
+    if(plan.transient&&plan.wait){
+      await pool.query("update tigeriq_coding_objectives set status='active',summary=$2,manager_employee_id=$3,next_attempt_at=$4,resource_retry_count=$5,resource_retry_started_at=coalesce(resource_retry_started_at,now()),updated_at=now() where id=$1",[o.id,`WAITING_RESOURCE_MANAGER retry ${plan.retryCount}/${RESOURCE_WAIT_MAX_RETRIES}: ${String(e?.message||e)}`.slice(0,1000),manager.id,plan.nextAttemptAt,plan.retryCount]);
+      return;
+    }
+    await pool.query("update tigeriq_coding_objectives set status='blocked',summary=$2,manager_employee_id=$3,next_attempt_at=null,updated_at=now() where id=$1",[o.id,String(e.message).slice(0,1000),manager.id]);
+  }
+}
+
+export function restartRecoveryDecision(job,pr){
+  const status=String(job?.status||'').toLowerCase();
+  if(!['running','waiting_ci','review'].includes(status))return{action:'ignore',code:'CODING_RESTART_NOT_ORPHANED'};
+  const prNumber=Number(job?.pr_number||0);
+  if(!Number.isInteger(prNumber)||prNumber<=0){
+    const branch=String(job?.branch||'').trim();
+    if(status==='running'&&!branch)return{action:'queue',code:'CODING_RESTART_REQUEUE_PRE_BRANCH',prNumber:null};
+    return{action:'fail',code:'CODING_RESTART_RESUME_IDENTITY_INCOMPLETE'};
+  }
+  const prState=String(pr?.state||'').toLowerCase();
+  if(pr?.merged===true||pr?.merged_at){
+    // G6: a merged PR is not proof of G5 acceptance. Crash recovery must
+    // never promote an unfinished P0 step packet to DONE on merge alone.
+    // Include corrupt/partial packet markers in the fail-closed gate.
+    if(/(?:^|\n)CODING_STEP_PACKET_JSON=/.test(String(job?.instruction||'')))
+      return{action:'fail',code:'CODING_RESTART_CANARY_MERGED_UNACCEPTED',prNumber};
+    return{action:'done',code:'CODING_RESTART_PR_ALREADY_MERGED',prNumber};
+  }
+  if(prState==='closed')return{action:'fail',code:'CODING_RESTART_PR_CLOSED',prNumber};
+  if(prState==='open'){
+    if(!String(job?.branch||'').trim())return{action:'fail',code:'CODING_RESTART_RESUME_IDENTITY_INCOMPLETE',prNumber};
+    return{action:'queue',code:'CODING_RESTART_RESUME_PR_OPEN',prNumber};
+  }
+  return{action:'defer',code:'CODING_RESTART_PR_STATE_UNVERIFIED',prNumber};
+}
+
+export function restartWaitingResourceDecision(job){
+  if(String(job?.status||'').toLowerCase()!=='waiting_resource')return{action:'ignore',code:'CODING_RESTART_NOT_WAITING_RESOURCE'};
+  let failure=job?.failure;
+  if(typeof failure==='string'){try{failure=JSON.parse(failure)}catch{failure=null}}
+  if(String(failure?.code||'')==='AI_RESOURCES_BUSY')return{action:'queue',code:'CODING_RESTART_REQUEUE_STALE_AI_BUSY'};
+  return{action:'ignore',code:'CODING_RESTART_PRESERVE_RESOURCE_WAIT'};
+}
+
+export async function recoverAfterCodingRestart({db=pool,fetchPr=async(number)=>gh(`/pulls/${number}`)}={}){
+  if(!db)return{requeued:0,completed:0,failed:0,deferred:0};
+  const rows=(await db.query("select * from tigeriq_coding_jobs where status in ('running','waiting_ci','review','waiting_resource') order by created_at")).rows||[];
+  const out={requeued:0,completed:0,failed:0,deferred:0};
+  for(const job of rows){
+    const waitingDecision=restartWaitingResourceDecision(job);
+    if(waitingDecision.action==='queue'){
+      const changed=await db.query("update tigeriq_coding_jobs set status='queued',started_at=null,completed_at=null,next_attempt_at=null where id=$1 and status='waiting_resource'",[job.id]);
+      if(changed.rowCount){
+        await db.query("update tigeriq_coding_objectives set status='active',summary=$2,updated_at=now() where id=$1",[job.objective_id,'Restart recovery rearmed stale in-memory AI_RESOURCES_BUSY wait.']);
+        out.requeued++;
+      }
+      continue;
+    }
+    if(String(job?.status||'').toLowerCase()==='waiting_resource')continue;
+    let pr=null;
+    const prNumber=Number(job?.pr_number||0);
+    if(Number.isInteger(prNumber)&&prNumber>0){
+      try{pr=await fetchPr(prNumber)}
+      catch(error){
+        out.deferred++;
+        console.warn(JSON.stringify({event:'CODING_RESTART_RECOVERY_DEFERRED',jobId:job.id,prNumber,error:String(error?.message||error)}));
+        continue;
+      }
+    }
+    const decision=restartRecoveryDecision(job,pr);
+    if(decision.action==='ignore')continue;
+    if(decision.action==='defer'){out.deferred++;continue}
+    if(decision.action==='queue'){
+      const changed=await db.query("update tigeriq_coding_jobs set status='queued',started_at=null,completed_at=null,next_attempt_at=null where id=$1 and status=$2",[job.id,job.status]);
+      if(changed.rowCount){
+        const summary=decision.code==='CODING_RESTART_REQUEUE_PRE_BRANCH'
+          ?'Restart recovery safely requeued pre-branch generation.'
+          :`Restart recovery queued existing PR #${decision.prNumber}`;
+        await db.query("update tigeriq_coding_objectives set status='active',summary=$2,updated_at=now() where id=$1",[job.objective_id,summary]);
+        out.requeued++;
+      }
+      continue;
+    }
+    if(decision.action==='done'){
+      const result={recoveredAfterRestart:true,prNumber:decision.prNumber,merge:{merged:true,message:'PR already merged before restart reconciliation'}};
+      const changed=await db.query("update tigeriq_coding_jobs set status='done',result=$2,failure=null,completed_at=coalesce(completed_at,now()),next_attempt_at=null where id=$1 and status=$3",[job.id,JSON.stringify(result),job.status]);
+      if(changed.rowCount){
+        await db.query("update tigeriq_coding_objectives set status='completed',summary=$2,updated_at=now() where id=$1",[job.objective_id,`Restart recovery observed merged PR #${decision.prNumber}`]);
+        out.completed++;
+      }
+      continue;
+    }
+    const failure={code:decision.code,message:decision.code==='CODING_RESTART_PR_CLOSED'?`PR #${decision.prNumber} is closed and unmerged; stale runtime job terminalized after restart.`:decision.code==='CODING_RESTART_CANARY_MERGED_UNACCEPTED'?`Merged P0 canary PR #${decision.prNumber} has no verified G5 acceptance receipt; restart recovery refused DONE.`:'Restart recovery cannot safely resume this orphaned coding job.'};
+    const changed=await db.query("update tigeriq_coding_jobs set status='failed',failure=$2,completed_at=now(),next_attempt_at=null where id=$1 and status=$3",[job.id,JSON.stringify(failure),job.status]);
+    if(changed.rowCount){
+      await db.query("update tigeriq_coding_objectives set status='blocked',summary=$2,updated_at=now() where id=$1",[job.objective_id,failure.message]);
+      out.failed++;
+    }
+  }
+  if(rows.length)console.log(JSON.stringify({event:'CODING_RESTART_RECOVERY',orphaned:rows.length,...out}));
+  return out;
+}
+
+export function staleRunningRecoveryDecision(job,{nowMs=Date.now(),active=false,staleMs=STALE_RUNNING_TIMEOUT_MS,maxRequeues=STALE_RUNNING_MAX_REQUEUES,sourceExecutable=true,pr=null}={}){
+  const status=String(job?.status||'').toLowerCase();
+  if(status!=='running')return{action:'ignore',code:'CODING_STALE_NOT_RUNNING'};
+  if(active)return{action:'ignore',code:'CODING_STALE_ACTIVE_LEASE'};
+  const startedMs=Date.parse(String(job?.started_at||''));
+  if(!Number.isFinite(startedMs))return{action:'ignore',code:'CODING_STALE_STARTED_AT_MISSING'};
+  const ageMs=Math.max(0,Number(nowMs)-startedMs);
+  if(ageMs<Math.max(1000,Number(staleMs)||0))return{action:'ignore',code:'CODING_STALE_WITHIN_DEADLINE',ageMs};
+
+  const branch=String(job?.branch||'').trim();
+  const prNumber=Number(job?.pr_number||0);
+  const preBranch=!branch&&(!Number.isInteger(prNumber)||prNumber<=0);
+  if(preBranch){
+    if(sourceExecutable===false)return{action:'fail',code:'SOURCE_WORK_ORDER_NO_LONGER_EXECUTABLE',ageMs};
+    if(Math.max(0,Number(job?.stale_recovery_count)||0)>=Math.max(0,Number(maxRequeues)||0))
+      return{action:'fail',code:'CODING_STALE_RUNNING_RETRY_EXHAUSTED',ageMs};
+    return{action:'queue',code:'CODING_STALE_REQUEUE_PRE_BRANCH',ageMs};
+  }
+
+  const restart=restartRecoveryDecision(job,pr);
+  return{...restart,ageMs};
+}
+
+export async function recoverStaleRunningJobs({
+  db=pool,
+  activeIds=new Set(),
+  fetchIssue=async(number)=>gh(`/issues/${number}`),
+  fetchPr=async(number)=>gh(`/pulls/${number}`),
+  nowMs=Date.now(),
+  staleMs=STALE_RUNNING_TIMEOUT_MS,
+  maxRequeues=STALE_RUNNING_MAX_REQUEUES,
+}={}){
+  if(!db)return{scanned:0,requeued:0,failed:0,deferred:0,ignored:0};
+  const cutoff=new Date(Number(nowMs)-Math.max(1000,Number(staleMs)||0)).toISOString();
+  const rows=(await db.query(
+    "select j.*,o.objective from tigeriq_coding_jobs j join tigeriq_coding_objectives o on o.id=j.objective_id where j.status='running' and j.started_at is not null and j.started_at<=$1 order by j.started_at",
+    [cutoff],
+  )).rows||[];
+  const out={scanned:rows.length,requeued:0,failed:0,deferred:0,ignored:0};
+
+  for(const job of rows){
+    const active=activeIds instanceof Set?activeIds.has(job.id):Array.isArray(activeIds)?activeIds.includes(job.id):false;
+    let sourceExecutable=true;
+    let pr=null;
+    const branch=String(job?.branch||'').trim();
+    const prNumber=Number(job?.pr_number||0);
+    const preBranch=!branch&&(!Number.isInteger(prNumber)||prNumber<=0);
+
+    if(preBranch){
+      try{await assertCanonicalSourceWorkOrderExecutable(job.objective,{fetchIssue})}
+      catch(error){
+        if(error?.code==='SOURCE_WORK_ORDER_NO_LONGER_EXECUTABLE')sourceExecutable=false;
+        else{
+          out.deferred++;
+          console.warn(JSON.stringify({event:'CODING_STALE_RUNNING_DEFERRED',jobId:job.id,reason:String(error?.code||error?.message||error).slice(0,160)}));
+          continue;
+        }
+      }
+    }else if(Number.isInteger(prNumber)&&prNumber>0){
+      try{pr=await fetchPr(prNumber)}
+      catch(error){
+        out.deferred++;
+        console.warn(JSON.stringify({event:'CODING_STALE_RUNNING_DEFERRED',jobId:job.id,prNumber,reason:'PR_LOOKUP_FAILED'}));
+        continue;
+      }
+    }
+
+    const decision=staleRunningRecoveryDecision(job,{nowMs,active,staleMs,maxRequeues,sourceExecutable,pr});
+    if(decision.action==='ignore'){out.ignored++;continue}
+    const evidence={code:decision.code,priorState:'running',action:decision.action,ageMs:decision.ageMs??null,recoveredAt:new Date(Number(nowMs)).toISOString()};
+
+    if(decision.action==='queue'){
+      const increment=decision.code==='CODING_STALE_REQUEUE_PRE_BRANCH'?1:0;
+      const changed=await db.query(
+        "update tigeriq_coding_jobs set status='queued',started_at=null,completed_at=null,next_attempt_at=null,stale_recovery_count=stale_recovery_count+$4,failure=$5 where id=$1 and status='running' and started_at=$2 and stale_recovery_count=$3",
+        [job.id,job.started_at,Math.max(0,Number(job.stale_recovery_count)||0),increment,JSON.stringify({staleRecovery:evidence})],
+      );
+      if(changed.rowCount){
+        const summary=decision.code==='CODING_STALE_REQUEUE_PRE_BRANCH'
+          ?'In-process stale-running watchdog safely requeued one orphaned pre-branch generation.'
+          :decision.code==='CODING_RESTART_RESUME_PR_OPEN'
+            ?`In-process stale-running watchdog resumed existing PR #${decision.prNumber}.`
+            :`In-process stale-running watchdog recovered job: ${decision.code}`;
+        await db.query("update tigeriq_coding_objectives set status='active',summary=$2,updated_at=now() where id=$1",[job.objective_id,summary]);
+        out.requeued++;
+        console.warn(JSON.stringify({event:'CODING_STALE_RUNNING_RECOVERED',jobId:job.id,action:'requeue',reason:decision.code,ageMs:decision.ageMs??null}));
+      }else out.deferred++;
+      continue;
+    }
+
+    if(decision.action==='done'){
+      const result={recoveredByWatchdog:true,prNumber:decision.prNumber,merge:{merged:true,message:'PR already merged before in-process stale reconciliation'}};
+      const changed=await db.query("update tigeriq_coding_jobs set status='done',result=$2,failure=null,completed_at=coalesce(completed_at,now()),next_attempt_at=null where id=$1 and status='running' and started_at=$3",[job.id,JSON.stringify(result),job.started_at]);
+      if(changed.rowCount){
+        await db.query("update tigeriq_coding_objectives set status='completed',summary=$2,updated_at=now() where id=$1",[job.objective_id,`In-process stale-running watchdog observed merged PR #${decision.prNumber}`]);
+        console.warn(JSON.stringify({event:'CODING_STALE_RUNNING_RECOVERED',jobId:job.id,action:'done',reason:decision.code,ageMs:decision.ageMs??null}));
+      }else out.deferred++;
+      continue;
+    }
+
+    if(decision.action==='defer'){out.deferred++;continue}
+    const message=decision.code==='SOURCE_WORK_ORDER_NO_LONGER_EXECUTABLE'
+      ?'Source Work Order is no longer executable; stale pre-branch coding job terminalized without requeue.'
+      :decision.code==='CODING_STALE_RUNNING_RETRY_EXHAUSTED'
+        ?'In-process stale-running recovery budget exhausted; coding job terminalized.'
+        :decision.code==='CODING_RESTART_PR_CLOSED'
+          ?`PR #${decision.prNumber} is closed and unmerged; stale coding job terminalized.`
+          :decision.code==='CODING_RESTART_CANARY_MERGED_UNACCEPTED'
+            ?`Merged P0 canary PR #${decision.prNumber} has no verified G5 acceptance receipt; watchdog refused DONE.`
+            :'In-process stale-running watchdog cannot safely resume this orphaned coding job.';
+    const failure={code:decision.code,message,staleRecovery:evidence};
+    const changed=await db.query("update tigeriq_coding_jobs set status='failed',failure=$2,completed_at=now(),next_attempt_at=null where id=$1 and status='running' and started_at=$3",[job.id,JSON.stringify(failure),job.started_at]);
+    if(changed.rowCount){
+      await db.query("update tigeriq_coding_objectives set status='blocked',summary=$2,updated_at=now() where id=$1",[job.objective_id,message]);
+      out.failed++;
+      console.warn(JSON.stringify({event:'CODING_STALE_RUNNING_RECOVERED',jobId:job.id,action:'fail',reason:decision.code,ageMs:decision.ageMs??null}));
+    }else out.deferred++;
+  }
+  return out;
+}
+
+export async function cleanupStaleRunningRuntimeCanary({db=pool}={}){
+  if(!db)return{cleaned:false,reason:'DB_UNAVAILABLE'};
+  await db.query("delete from tigeriq_coding_jobs where id=$1",[STALE_RUNNING_RUNTIME_CANARY_JOB_ID]);
+  await db.query("delete from tigeriq_coding_objectives where id=$1",[STALE_RUNNING_RUNTIME_CANARY_OBJECTIVE_ID]);
+  return{cleaned:true};
+}
+
+export async function armStaleRunningRuntimeCanary({db=pool,nowMs=Date.now(),staleMs=STALE_RUNNING_TIMEOUT_MS}={}){
+  if(!db)return{armed:false,reason:'DB_UNAVAILABLE'};
+  await cleanupStaleRunningRuntimeCanary({db});
+  const ageMs=Math.max(1000,Number(staleMs)||0)+5000;
+  const startedAt=new Date(Number(nowMs)-ageMs).toISOString();
+  const objective=`GitHub autonomous coding issue #${STALE_RUNNING_RUNTIME_CANARY_SOURCE_ISSUE}: bounded stale-running runtime canary`;
+  await db.query(
+    "insert into tigeriq_coding_objectives(id,objective,priority,status,summary) values($1,$2,'P1','active',$3)",
+    [STALE_RUNNING_RUNTIME_CANARY_OBJECTIVE_ID,objective,'Runtime A8 stale-running canary armed.'],
+  );
+  await db.query(
+    "insert into tigeriq_coding_jobs(id,objective_id,title,instruction,paths,status,started_at,stale_recovery_count) values($1,$2,$3,$4,'[]'::jsonb,'running',$5,0)",
+    [STALE_RUNNING_RUNTIME_CANARY_JOB_ID,STALE_RUNNING_RUNTIME_CANARY_OBJECTIVE_ID,'Canary A8 stale-running watchdog','Synthetic bounded canary; never execute generation.',startedAt],
+  );
+  return{armed:true,objectiveId:STALE_RUNNING_RUNTIME_CANARY_OBJECTIVE_ID,jobId:STALE_RUNNING_RUNTIME_CANARY_JOB_ID,startedAt,sourceIssue:STALE_RUNNING_RUNTIME_CANARY_SOURCE_ISSUE};
+}
+
+export async function settleStaleRunningRuntimeCanary({db=pool,pid=process.pid,emit=(entry)=>console.warn(JSON.stringify(entry))}={}){
+  if(!db)return{done:false,pass:false,reason:'DB_UNAVAILABLE'};
+  const row=(await db.query("select id,status,failure from tigeriq_coding_jobs where id=$1",[STALE_RUNNING_RUNTIME_CANARY_JOB_ID])).rows?.[0];
+  if(!row)return{done:false,pass:false,reason:'CANARY_JOB_MISSING'};
+  let failure=row.failure;
+  if(typeof failure==='string'){try{failure=JSON.parse(failure)}catch{failure={code:null}}}
+  const reason=String(failure?.code||failure?.staleRecovery?.code||'');
+  if(String(row.status||'').toLowerCase()!=='failed'||reason!=='SOURCE_WORK_ORDER_NO_LONGER_EXECUTABLE'){
+    return{done:false,pass:false,status:String(row.status||''),reason:reason||null};
+  }
+  const evidence={event:'CODING_STALE_RUNNING_CANARY_PASS',canaryId:'A8-2068',jobId:STALE_RUNNING_RUNTIME_CANARY_JOB_ID,priorState:'running',terminalState:'failed',reason,pid:Number(pid)};
+  emit(evidence);
+  await cleanupStaleRunningRuntimeCanary({db});
+  return{done:true,pass:true,evidence};
+}
+
+export function codingPathsOverlap(left=[],right=[]){
+  const a=(Array.isArray(left)?left:[]).map(String),b=(Array.isArray(right)?right:[]).map(String);
+  return a.some(x=>b.some(y=>x===y||x.startsWith(y.endsWith('/')?y:y+'/')||y.startsWith(x.endsWith('/')?x:x+'/')));
+}
+async function claimJob(){
+  const c=await pool.connect();
+  try{
+    await c.query('begin');
+    const activeRows=(await c.query("select paths from tigeriq_coding_jobs where status in ('running','review','waiting_ci','waiting_owner')")).rows||[];
+    const candidates=(await c.query("select * from tigeriq_coding_jobs where status='queued' or (status='waiting_resource' and coalesce(next_attempt_at,now())<=now()) order by case when status='waiting_resource' then 0 else 1 end,created_at for update skip locked limit 20")).rows||[];
+    const j=candidates.find(candidate=>!activeRows.some(active=>codingPathsOverlap(candidate.paths,active.paths)));
+    if(!j){await c.query('commit');return null}
+    await c.query("update tigeriq_coding_jobs set status='running',started_at=now(),attempts=attempts+1,completed_at=null where id=$1",[j.id]);
+    await c.query('commit');return j;
+  }catch(e){await c.query('rollback');throw e}finally{c.release()}
+}
+export function buildLocalFileContext(files=[]){return files.map(file=>`FILE ${file.path}\n${String(file.content??'')}`).join('\n\n---\n\n')}
+export function codingMicroContext(files=[],request='',budgetChars=9000){
+  const list=Array.isArray(files)?files:[];
+  const before=buildLocalFileContext(list);
+  const requestText=String(request||'');
+  const symbols=[...new Set((requestText.match(/\b[A-Za-z_$][A-Za-z0-9_$]{2,}\b/g)||[])
+    .filter(x=>!/^(const|function|return|export|import|async|await|true|false|null|undefined|current|files|change|review|issue|coding|context|source|branch|tests?)$/i.test(x))
+    .slice(0,24))];
+  const supported=path=>/\.(?:[cm]?[jt]sx?|tsx?)$/i.test(String(path||''));
+  const escapeRegex=value=>String(value).replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  if(!list.length||!symbols.length||list.some(file=>!supported(file.path))){
+    return {context:before,telemetry:{fallbackReason:!list.length?'NO_FILES':!symbols.length?'NO_TARGET_SYMBOL':'UNSUPPORTED_LANGUAGE',charsBefore:before.length,charsAfter:before.length,symbolsSelected:[],dependencyEdges:[]}};
+  }
+  try{
+    const sliced=[];const selected=[];const edges=[];
+    for(const file of list){
+      const content=String(file.content??'');
+      const fileLines=content.split(/\r?\n/);
+      const hitLines=[];
+      for(let i=0;i<fileLines.length;i++){
+        if(symbols.some(symbol=>new RegExp('\\b'+escapeRegex(symbol)+'\\b').test(fileLines[i])))hitLines.push(i);
+      }
+      if(!hitLines.length){
+        sliced.push({path:file.path,content:'// MICRO_CONTEXT: no directly referenced symbol in this file'});
+        continue;
+      }
+      const ranges=[];
+      for(const line of hitLines.slice(0,12)){
+        const rangeStart=Math.max(0,line-4),rangeEnd=Math.min(fileLines.length,line+9);
+        ranges.push([rangeStart,rangeEnd]);
+      }
+      ranges.sort((a,b)=>a[0]-b[0]);
+      const merged=[];
+      for(const r of ranges){
+        const last=merged[merged.length-1];
+        if(last&&r[0]<=last[1]+1)last[1]=Math.max(last[1],r[1]); else merged.push([...r]);
+      }
+      const chunks=merged.map(([a,b])=>fileLines.slice(a,b).join('\n')).filter(Boolean);
+      const usedSymbols=symbols.filter(symbol=>chunks.some(chunk=>new RegExp('\\b'+escapeRegex(symbol)+'\\b').test(chunk)));
+      selected.push(...usedSymbols);
+      sliced.push({path:file.path,content:chunks.join('\n\n// ... MICRO_CONTEXT GAP ...\n\n')});
+      for(const symbol of usedSymbols)edges.push({path:file.path,symbol,reason:'request-symbol'});
+    }
+    const context=buildLocalFileContext(sliced);
+    if(context.length>=before.length||context.length>Math.max(2000,Number(budgetChars)||9000)){
+      return {context:before,telemetry:{fallbackReason:context.length>=before.length?'NO_REDUCTION':'BUDGET_EXCEEDED',charsBefore:before.length,charsAfter:before.length,symbolsSelected:[],dependencyEdges:[]}};
+    }
+    return {context,telemetry:{fallbackReason:null,charsBefore:before.length,charsAfter:context.length,symbolsSelected:[...new Set(selected)],dependencyEdges:edges}};
+  }catch{
+    return {context:before,telemetry:{fallbackReason:'SLICE_ERROR',charsBefore:before.length,charsAfter:before.length,symbolsSelected:[],dependencyEdges:[]}};
+  }
+}
+async function filesFor(paths,ref='main',repository=SOURCE_REPOSITORY){const files=[];for(const p of paths){const f=await readRepoFile(p,ref,repository);files.push({path:p,content:f.content})}return files}
+async function contextFor(paths,ref='main',repository=SOURCE_REPOSITORY){return buildLocalFileContext(await filesFor(paths,ref,repository))}
+export function partitionGenerationFiles(files=[],maxBatchChars=9000){
+  const batches=[];let current=[],size=0;
+  const flush=()=>{if(current.length){batches.push(current);current=[];size=0}};
+  for(const file of files){
+    const fileSize=Buffer.byteLength(String(file?.content??''),'utf8')+Buffer.byteLength(String(file?.path??''),'utf8')+16;
+    if(fileSize>maxBatchChars){flush();batches.push([file]);continue}
+    if(current.length&&size+fileSize>maxBatchChars)flush();
+    current.push(file);size+=fileSize;
+  }
+  flush();
+  return batches;
+}
+export function formatMicroContextTelemetry(telemetry={}){
+  const charsBefore=Math.max(0,Number(telemetry?.charsBefore)||0);
+  const charsAfter=Math.max(0,Number(telemetry?.charsAfter)||0);
+  const fallbackReason=telemetry?.fallbackReason==null?'NONE':String(telemetry.fallbackReason).slice(0,80).replace(/[^A-Z0-9_:-]/gi,'_');
+  const symbols=Array.isArray(telemetry?.symbolsSelected)?telemetry.symbolsSelected.length:0;
+  const edges=Array.isArray(telemetry?.dependencyEdges)?telemetry.dependencyEdges.length:0;
+  return `MICRO_CONTEXT charsBefore=${charsBefore} charsAfter=${charsAfter} fallback=${fallbackReason} symbols=${symbols} edges=${edges}`;
+}
+
+async function generationContextsFor(paths,ref='main',maxBatchChars=9000,repository=SOURCE_REPOSITORY,request=''){
+  return partitionGenerationFiles(await filesFor(paths,ref,repository),maxBatchChars).map(files=>{
+    const micro=codingMicroContext(files,request,maxBatchChars);
+    return {paths:files.map(x=>x.path),context:micro.context,contextTelemetry:micro.telemetry};
+  });
+}
+export function validateCompactEdits(edits,allowedPaths=[]){
+  if(!Array.isArray(edits)||edits.length<1||edits.length>12)throw new Error('CODING_COMPACT_EDITS_COUNT_INVALID');
+  const allow=new Set((allowedPaths||[]).map(String)),seen=new Set(),paths=new Set();
+  let bytes=0;
+  for(const edit of edits){
+    const path=String(edit?.path||'').trim(),old=String(edit?.old??''),next=String(edit?.new??'');
+    if(/^exact allowed path$/i.test(path))throw new Error('CODING_COMPACT_EDIT_PATH_PLACEHOLDER');
+    if(!safeRepoPath(path)||!allow.has(path))throw new CodingScopeViolationError([path||'<empty>']);
+    paths.add(path);
+    if(!old||old===next)throw new Error('CODING_COMPACT_EDIT_INVALID');
+    const key=`${path}\u0000${old}`;if(seen.has(key))throw new Error('CODING_COMPACT_EDIT_DUPLICATE');seen.add(key);
+    bytes+=Buffer.byteLength(old,'utf8')+Buffer.byteLength(next,'utf8');
+  }
+  if(paths.size>8)throw new Error('CODING_COMPACT_REPAIR_PATHS_TOO_MANY');
+  if(bytes>120000)throw new Error('CODING_COMPACT_EDITSET_TOO_LARGE');
+  return true;
+}
+
+export function applyCompactEdits(content,edits){
+  const source=String(content??''),ranges=[];
+  for(const edit of edits||[]){
+    const old=String(edit.old),next=String(edit.new),first=source.indexOf(old);
+    if(first<0)throw new Error('CODING_COMPACT_EDIT_OLD_NOT_FOUND');
+    if(source.indexOf(old,first+old.length)>=0)throw new Error('CODING_COMPACT_EDIT_OLD_NOT_UNIQUE');
+    ranges.push({start:first,end:first+old.length,next});
+  }
+  ranges.sort((a,b)=>a.start-b.start);
+  for(let i=1;i<ranges.length;i++)if(ranges[i].start<ranges[i-1].end)throw new Error('CODING_COMPACT_EDIT_OVERLAP');
+  let out=source;
+  for(const r of [...ranges].sort((a,b)=>b.start-a.start))out=out.slice(0,r.start)+r.next+out.slice(r.end);
+  return out;
+}
+
+export function canonicalWorkContext(j,canonicalObjective='',liveGithubContext=null){
+  const canonical=String(canonicalObjective||'').trim()||String(j?.instruction||'').trim();
+  const manager=String(j?.instruction||'').trim();
+  const live=formatAuthoritativeGithubContext(liveGithubContext??j?.liveGithubContext??null);
+  return `CANONICAL_WORK_ORDER:\n${canonical}\n\nMANAGER_JOB_INSTRUCTION:\n${manager}${live?`\n\n${live}`:''}`;
+}
+export function buildRepairGenerationPrompt(worker,j,context,issues=[],canonicalObjective='',liveGithubContext=null){
+  return `You are ${worker.id}, an autonomous TigerIQ repository engineer. Fix ONLY the listed issues on the existing branch.\n${canonicalWorkContext(j,canonicalObjective,liveGithubContext)}\nALLOWED PATHS: ${j.paths.join(', ')}\nPATCH_CONTRACT_V2_COMPACT_REPAIR=true\nBATCH_NOOP_ALLOWED=true\nEvery edit.path MUST exactly equal one ALLOWED PATH. For one-line fixes emit only the smallest exact search/replace; never return implementation-source paths not listed.\nIf this batch needs no mutation, return an explicit bounded no-op; do not invent an edit.\nREVIEW ISSUES TO FIX: ${JSON.stringify(issues)}\nCURRENT FILES:\n${context}\nReturn ONLY JSON {"summary":"short","changes":[{"path":"exact allowed path","content":"complete replacement UTF-8 file content"}]}. Do not touch paths outside ALLOWED PATHS. Never output secrets. Keep changes minimal and testable.`;
+}
+export function assertGenerationContextPaths(prompt,allowedPaths=[]){
+  const files=currentFilesFromPrompt(prompt);
+  const missing=(allowedPaths||[]).filter(path=>!files.has(String(path)));
+  if(missing.length){const e=new Error(`CODING_GENERATION_CONTEXT_PATH_MISSING:${missing.join(',')}`);e.code='CODING_GENERATION_CONTEXT_PATH_MISSING';throw e}
+  return true;
+}
+async function invokeCompactGeneration(worker,prompt,allowedPaths,exclude=[],leaseContext=null){
+  assertGenerationContextPaths(prompt,allowedPaths);
+  const modelPrompt=compactPromptForChanges(prompt,{maxContextChars:6000,maxOutputChars:3200});
+  const expand=d=>expandCompactChanges(prompt,JSON.stringify(d));
+  const validateData=d=>{const expanded=expand(d);if(expanded.changes.length){validateChanges(expanded.changes,allowedPaths);validateJobScope(allowedPaths,expanded.changes)}else if(!(expanded.noop===true&&/^BATCH_NOOP_ALLOWED=true$/m.test(prompt)))throw new Error('CODING_BATCH_NOOP_INVALID')};
+  const invoked=await invokeJsonWithFailover(worker,modelPrompt,{exclude,validateData,parseData:parseCompactEditJson,shrinkPrompt:preserveGenerationPrompt,maxSameResourceAttempts:codingP0CanaryApplies(leaseContext?.objective)?1:2,leaseContext});
+  return {payload:expand(invoked.data),resource:invoked.resource};
+}
+export function validateAggregatedGenerationChanges(changes,allowedPaths,batchCount=0){
+  const list=Array.isArray(changes)?changes:[];
+  if(Number(batchCount)>0&&list.length===0){
+    const error=new Error('CODING_ALL_BATCHES_NOOP');
+    error.code='CODING_ALL_BATCHES_NOOP';
+    throw error;
+  }
+  validateChanges(list,allowedPaths);
+  validateJobScope(allowedPaths,list);
+  return true;
+}
+
+async function generateRepairChanges(worker,j,ref='main',issues=[],exclude=[],canonicalObjective='',liveGithubContext=null,repository=SOURCE_REPOSITORY){
+  const batches=await generationContextsFor(j.paths,ref,9000,repository,[canonicalObjective,j.instruction,...issues].filter(Boolean).join('\n'));
+  let selected=worker;const changes=[];const summaries=[];
+  for(const batch of batches){
+    const scopedJob={...j,paths:batch.paths};
+    const prompt=buildRepairGenerationPrompt(selected,scopedJob,batch.context,issues,canonicalObjective,liveGithubContext);
+    const invoked=await invokeCompactGeneration(selected,prompt,batch.paths,exclude,{workId:j.id,role:'implementer',objective:canonicalObjective});
+    selected=invoked.resource;
+    summaries.push(formatMicroContextTelemetry(batch.contextTelemetry));
+    summaries.push(String(invoked.payload.summary||'').slice(0,300));
+    changes.push(...invoked.payload.changes);
+  }
+  validateAggregatedGenerationChanges(changes,j.paths,batches.length);
+  return {payload:{summary:summaries.filter(Boolean).join('; ').slice(0,1000)||'staged repair',changes},resource:selected};
+}
+async function writeRepairChanges(branch,changes,mutationAuth={},repository=SOURCE_REPOSITORY){
+  for(const change of changes)await writeFile(branch,change,mutationAuth,repository);
+}
+export function isRefreshableCompactPatchError(error){
+  return /CODING_COMPACT_EDIT_(?:OLD_NOT_FOUND|OLD_NOT_UNIQUE)|COMPACT_EDIT_(?:SEARCH_MISSING|SEARCH_AMBIGUOUS)/i.test(String(error?.message||error||''));
+}
+async function generateAndWriteRepair(worker,j,branch,issues=[],exclude=[],mutationAuth={},canonicalObjective='',liveGithubContext=null,repository=SOURCE_REPOSITORY){
+  let selected=worker,last=null;
+  for(let attempt=1;attempt<=2;attempt++){
+    const retryIssues=attempt===1?issues:[...issues,'Refresh the CURRENT FILES from this same PR branch and regenerate the compact patch; keep the same PR and scope.'];
+    try{
+      const generated=await generateRepairChanges(selected,j,branch,retryIssues,exclude,canonicalObjective,liveGithubContext,repository);
+      selected=generated.resource;
+      await writeRepairChanges(branch,generated.payload.changes,mutationAuth,repository);
+      return {worker:selected,payload:generated.payload};
+    }catch(error){
+      last=error;
+      if(attempt<2&&isRefreshableCompactPatchError(error))continue;
+      throw error;
+    }
+  }
+  throw last||new Error('CODING_COMPACT_PATCH_REFRESH_EXHAUSTED');
+}
+async function generateChanges(worker,j,ref='main',reviewIssues=[],exclude=[],canonicalObjective='',liveGithubContext=null,repository=SOURCE_REPOSITORY){
+  const batches=await generationContextsFor(j.paths,ref,9000,repository,[canonicalObjective,j.instruction,...reviewIssues].filter(Boolean).join('\n'));
+  let selected=worker;const changes=[];const summaries=[];
+  for(const batch of batches){
+    const prompt=`You are ${selected.id}, an autonomous TigerIQ repository engineer. Implement ONLY the assigned task on a GitHub branch.\n${canonicalWorkContext(j,canonicalObjective,liveGithubContext)}\nALLOWED PATHS FOR THIS BATCH: ${batch.paths.join(', ')}\nOTHER ALLOWED PATHS are handled in separate bounded batches; do not emit them here.\nBATCH_NOOP_ALLOWED=true\nIf this batch needs no mutation, return an explicit bounded no-op; do not invent an edit.\n${reviewIssues.length?`REVIEW ISSUES TO FIX: ${JSON.stringify(reviewIssues)}\n`:''}CURRENT FILES:\n${batch.context}\nReturn ONLY JSON {"summary":"short","changes":[{"path":"exact allowed path","content":"complete replacement UTF-8 file content"}]}. Do not touch paths outside this batch. Never output secrets. Keep changes minimal and testable.`;
+    const invoked=await invokeCompactGeneration(selected,prompt,batch.paths,exclude,{workId:j.id,role:'implementer',objective:canonicalObjective});
+    selected=invoked.resource;
+    summaries.push(formatMicroContextTelemetry(batch.contextTelemetry));
+    summaries.push(String(invoked.payload.summary||'').slice(0,300));
+    changes.push(...invoked.payload.changes);
+  }
+  validateAggregatedGenerationChanges(changes,j.paths,batches.length);
+  return {payload:{summary:summaries.filter(Boolean).join('; ').slice(0,1000)||'staged implementation',changes},resource:selected};
+}
+async function reviewPr(reviewer,j,diff,implementerId,extraExclude=[],canonicalObjective='',liveGithubContext=null){let prompt=`You are ${reviewer.id}, independent TigerIQ code reviewer. Review against the canonical Work Order, manager instruction, and safety boundaries.\n${canonicalWorkContext(j,canonicalObjective,liveGithubContext)}\nDIFF:\n${diff.slice(0,180000)}\nReturn ONLY JSON {"decision":"approve|changes_requested","summary":"short","issues":["specific issue"]}. The canonical Work Order is authoritative if the manager instruction omits or conflicts with acceptance. Reject unsafe, untested, incomplete, out-of-scope, credential/security/production changes.`;if(codingP0CanaryApplies(canonicalObjective)){const packet=codingStepPacketFromInstruction(j.instruction);if(!packet)throw Error('CODING_REVIEW_STEP_PACKET_MISSING');const reviewSkills=loadRequiredCodingSkills(canonicalObjective,{requiredIds:requiredCodingSkillIdsForDeliverable(packet.deliverable_type)});assertCodingSkillProof(packet.skill_refs,reviewSkills);prompt+='\n'+codingRolePrompt({role:'reviewer',packet,skillContext:reviewSkills.contextBlock,context:canonicalObjective,diff});}const invoked=await invokeJsonWithFailover(reviewer,prompt,{exclude:[implementerId,...extraExclude],leaseContext:{workId:`CODING-REVIEW:${j.id}`,role:'reviewer'}});const d=invoked.data;if(!['approve','changes_requested'].includes(d.decision)){const e=new Error('REVIEW_DECISION_INVALID');e.code='REVIEW_SCHEMA_INVALID';throw e}d.issues=Array.isArray(d.issues)?d.issues.slice(0,8):[];return {review:d,resource:invoked.resource}}
+
+
+ // A technically verified draft is NOT a failed job. A separate held status
+ // preserves the Owner release gate and prevents the queue from re-dispatching
+ // the identical Work Order just because automatic merge is disabled.
+ export function codingVerifiedCanaryOwnerHandoff({canary=false,merge={},gates=null,productAcceptance=null,review=null,ownerWaiver=null,headSha=''}={}){
+   if(!canary){
+     const merged=merge?.merged===true;
+     return {jobStatus:merged?'done':'blocked',objectiveStatus:merged?'completed':'blocked',
+       code:merged?'CODING_LEGACY_MERGED':'CODING_LEGACY_MERGE_BLOCKED',
+       summary:merged?'Merged PR #{PR}':'PR #{PR} ready but merge blocked: '+String(merge?.message||'unknown').slice(0,500)};
+   }
+   if(merge?.merged)throw Error('CODING_CANARY_OWNER_RELEASE_GATE_BYPASSED');
+   const sha=String(headSha||'').toLowerCase();
+   if(!/^[a-f0-9]{40}$/.test(sha)||String(gates?.sha||'').toLowerCase()!==sha)
+     throw Error('CODING_CANARY_HANDOFF_HEAD_UNVERIFIED');
+   if(productAcceptance?.pass!==true||
+      !['CODING_PRODUCT_GATE_VERIFIED','CODING_NON_PRODUCT_STEP_STRUCTURAL_ONLY'].includes(productAcceptance?.code))
+     throw Error('CODING_CANARY_HANDOFF_PRODUCT_UNVERIFIED');
+   if(!ownerWaiver&&review?.decision!=='approve')
+     throw Error('CODING_CANARY_HANDOFF_REVIEW_UNVERIFIED');
+   const waiver=Boolean(ownerWaiver);
+   return {jobStatus:'waiting_owner',objectiveStatus:'waiting_owner',
+     code:'CODING_CANARY_VERIFIED_AWAITING_OWNER_RELEASE',
+     sourceHeadSha:sha,reviewMode:waiver?'OWNER_WAIVED_NOT_INDEPENDENT_PASS':'INDEPENDENT_APPROVED',
+     summary:'PR #{PR} technically verified at '+sha+'; waiting for Owner release authorization'};
+ }
+async function runJob(j){
+  await refreshCoreResourceHealth();
+  j.paths=Array.isArray(j.paths)?j.paths:j.paths||[];
+  const objectiveRow=(await pool.query('select objective from tigeriq_coding_objectives where id=$1',[j.objective_id])).rows[0];
+  const canonicalObjective=String(objectiveRow?.objective||j.instruction||'').slice(0,24000);
+  const canary=codingP0CanaryApplies(canonicalObjective);
+  // A stored canary packet must never silently fall back into legacy auto-merge
+  // after config is disabled, target Issue is changed, or objective is missing.
+  const storedCanaryPacket=codingStepPacketFromInstruction(j.instruction);
+  if(storedCanaryPacket&&!canary)throw Object.assign(new Error('CODING_STEP_PACKET_OUTSIDE_CANARY_SCOPE'),{code:'CODING_STEP_PACKET_OUTSIDE_CANARY_SCOPE'});
+  const targetRepository=resolveCodingRepository(targetRepositoryFromObjective(canonicalObjective));
+  const ownerWaiver=codingOwnerReviewWaiver(targetRepository);
+  const mutationAuth={...controlPlaneRepairIntent(canonicalObjective),executorClass:'CODING_LANE'};
+  const generatedGithubContext=await loadAuthoritativeGithubContext(canonicalObjective);
+  let stepPacket=null;
+  if((canary)){
+    stepPacket=codingStepPacketFromInstruction(j.instruction);
+    if(!stepPacket)throw Error('CODING_STEP_PACKET_MISSING');
+    const activeSkills=loadRequiredCodingSkills(canonicalObjective,{requiredIds:requiredCodingSkillIdsForDeliverable(stepPacket.deliverable_type)});
+    assertCodingSkillProof(stepPacket.skill_refs,activeSkills);
+    j.instruction+='\n\n'+codingRolePrompt({role:'implementer',packet:stepPacket,skillContext:activeSkills.contextBlock});
+  }
+  j.liveGithubContext=generatedGithubContext;
+  const storedGithubContext=j.live_github_context&&typeof j.live_github_context==='object'?j.live_github_context:null;
+  if(requiresLiveGithubContext(canonicalObjective)&&shouldResumeExistingPr(j)&&!storedGithubContext)
+    throw Object.assign(new Error('LIVE_GITHUB_CONTEXT_UNAVAILABLE:GENERATION_BASELINE_MISSING'),{code:'LIVE_GITHUB_CONTEXT_UNAVAILABLE'});
+  if(storedGithubContext)assertLiveGithubContextFresh(storedGithubContext,generatedGithubContext);
+  assertExecutionPlaneMutationPaths(j.paths,mutationAuth);
+  const cooldownExcludes=activeProviderCooldownIds(j.failure);
+  const requiredEmployee=String(j.target_employee_id||'').trim().toUpperCase();
+  const available=selectableResources(cooldownExcludes);
+  let worker=selectCodingWorker(available,requiredEmployee,()=>available.find(r=>r.id===j.employee_id)||pickResource(cooldownExcludes));
+  if(!worker){
+    const e=new Error(requiredEmployee?`NO_TARGET_EMPLOYEE_AVAILABLE:${requiredEmployee}`:'NO_IMPLEMENTER_AVAILABLE');
+    e.code=requiredEmployee?'NO_TARGET_EMPLOYEE_AVAILABLE':'NO_IMPLEMENTER_AVAILABLE';
+    throw e;
+  }
+  await pool.query("update tigeriq_coding_jobs set employee_id=$2,status='running' where id=$1",[j.id,worker.id]);
+  j.employee_id=worker.id;
+  let context=null,generated=null,gen={summary:'resumed existing PR'},reviewer=null;
+  let branch=j.branch||null,pr=j.pr_number?{number:Number(j.pr_number)}:null;
+  if((canary)&&!shouldResumeExistingPr(j)&&stepPacket.source_head_sha!==await mainSha(targetRepository))throw Error('CODING_STEP_SOURCE_HEAD_STALE_REPLAN_REQUIRED');
+  if(shouldResumeExistingPr(j)){
+    const livePr=await ghRepo(targetRepository,`/pulls/${pr.number}`);
+    const reconciled=await reconcileExistingPrBranch(livePr,j.head_sha,targetRepository);
+    branch=reconciled.branch;
+    j.head_sha=reconciled.headSha;
+    await pool.query("update tigeriq_coding_jobs set branch=$2,pr_number=$3,head_sha=$4 where id=$1",[j.id,branch,reconciled.number,reconciled.headSha]);
+    context=await contextFor(j.paths,branch,targetRepository);
+    if(!ownerWaiver){
+    reviewer=selectableResources([worker.id,...cooldownExcludes]).find(r=>r.id===j.reviewer_employee_id)||pickResource([worker.id,...cooldownExcludes]);
+    if(!reviewer)throw new Error('NO_INDEPENDENT_REVIEWER_AVAILABLE');
+    }
+    await pool.query("update tigeriq_coding_jobs set employee_id=$2,reviewer_employee_id=$3,status='waiting_ci',next_attempt_at=null,completed_at=null where id=$1",[j.id,worker.id,reviewer?.id||null]);
+  }else{
+    // generateChanges(worker,j,'main',[],cooldownExcludes,canonicalObjective,generatedGithubContext)
+    generated=await generateChanges(worker,j,'main',[],cooldownExcludes,canonicalObjective,generatedGithubContext,targetRepository);worker=generated.resource;gen=generated.payload;
+    validateJobScope(j.paths,gen.changes);
+    if((canary)){
+      const artifactGate=verifyCodingDeliverable({packet:stepPacket,changes:gen.changes});
+      if(!artifactGate.pass)throw Object.assign(new Error(artifactGate.code+':'+artifactGate.reasons.join(';')),{code:artifactGate.code});
+    }
+    if(generatedGithubContext){
+      await pool.query("update tigeriq_coding_jobs set live_github_context=$2,live_github_context_fingerprint=$3 where id=$1",[j.id,JSON.stringify(generatedGithubContext),generatedGithubContext.fingerprint]);
+      j.live_github_context=generatedGithubContext;j.live_github_context_fingerprint=generatedGithubContext.fingerprint;
+    }
+    if(!ownerWaiver){reviewer=pickResource([worker.id,...cooldownExcludes]);if(!reviewer)throw new Error('NO_INDEPENDENT_REVIEWER_AVAILABLE')}
+    await assertCanonicalSourceWorkOrderExecutable(canonicalObjective);
+    const base=await mainSha(targetRepository);branch=branchName(worker.id,j.id);
+    // await createBranch(branch,base)
+    await createBranch(branch,base,targetRepository);
+    await pool.query("update tigeriq_coding_jobs set employee_id=$2,reviewer_employee_id=$3,branch=$4,next_attempt_at=null where id=$1",[j.id,worker.id,reviewer?.id||null,branch]);
+    for(const ch of gen.changes)await writeFile(branch,ch,mutationAuth,targetRepository);
+    await assertCanonicalSourceWorkOrderExecutable(canonicalObjective);
+    pr=await openPr(branch,`[${worker.id}] ${j.title}`,`Automated TigerIQ Coding Lane job \`${j.id}\`.\n\nImplementer: ${worker.id}\nReview: ${ownerWaiver?'OWNER_WAIVER (not independent PASS)':reviewer.id}\nTarget repository: ${targetRepository.fullName}\nDirect writes to main are forbidden. Merge is attempted only after exact-head CI and an applicable independent approval or explicit Owner waiver.`,targetRepository,{canary});
+    await pool.query("update tigeriq_coding_jobs set pr_number=$2,status='waiting_ci' where id=$1",[j.id,pr.number]);
+  }
+  let review=null,gates=null,approvedHead='',approvedReviewer='',approvedImplementer='';
+  const waitGatesFn=async()=>runGateWithRepair({
+
+      // waitGates(branch,pr.number)
+      waitFn:()=>waitGates(branch,pr.number,targetRepository),
+      onWaiting:async()=>{await pool.query("update tigeriq_coding_jobs set status='waiting_ci' where id=$1",[j.id])},
+      repairFn:async({evidence})=>{
+        const freshContext=await loadAuthoritativeGithubContext(canonicalObjective);assertLiveGithubContextFresh(generatedGithubContext,freshContext);j.liveGithubContext=freshContext;
+        await assertCanonicalSourceWorkOrderExecutable(canonicalObjective);
+        // generateAndWriteRepair(worker,j,branch,[`CI gate failure on same PR #${pr.number}`,...evidence],cooldownExcludes,mutationAuth,canonicalObjective,freshContext)
+        const repaired=await generateAndWriteRepair(worker,j,branch,[`CI gate failure on same PR #${pr.number}`,...evidence],cooldownExcludes,mutationAuth,canonicalObjective,freshContext,targetRepository);
+        worker=repaired.worker;gen=repaired.payload;
+        if(reviewer?.id===worker.id){reviewer=pickResource([worker.id,...cooldownExcludes]);if(!reviewer)throw new Error('NO_INDEPENDENT_REVIEWER_AVAILABLE')}
+        await pool.query("update tigeriq_coding_jobs set employee_id=$2,reviewer_employee_id=$3,status='waiting_ci' where id=$1",[j.id,worker.id,reviewer?.id||null]);
+      },
+      maxRepairCycles:canary?2:3,
+      timeoutRetries:1,
+    });
+  const onGatesPassed=async({gates:cycleGates})=>{
+    await pool.query("update tigeriq_coding_jobs set status=$3,head_sha=$2 where id=$1",[j.id,cycleGates.sha,ownerWaiver?'waiting_ci':'review']);
+  };
+  const lifecycle=ownerWaiver?await runOwnerWaivedAcceptance({
+    waiver:ownerWaiver,waitGatesFn,onGatesPassed,
+    recordWaiverFn:async({gates,waiver})=>{
+      const freshContext=await loadAuthoritativeGithubContext(canonicalObjective);
+      assertLiveGithubContextFresh(generatedGithubContext,freshContext);
+      await assertCanonicalSourceWorkOrderExecutable(canonicalObjective);
+      return persistOwnerReviewWaiverArtifact(pr.number,{implementerId:worker.id,targetHead:gates.sha,waiver},targetRepository);
+    },
+  }):await runReviewReworkLifecycle({
+    maxCycles:canary?2:3,waitGatesFn,onGatesPassed,
+    reviewFn:async({gates:cycleGates})=>{
+      if(reviewer?.id===worker.id){reviewer=pickResource([worker.id,...cooldownExcludes]);if(!reviewer)throw new Error('NO_INDEPENDENT_REVIEWER_AVAILABLE')}
+      const reviewGithubContext=await loadAuthoritativeGithubContext(canonicalObjective);assertLiveGithubContextFresh(generatedGithubContext,reviewGithubContext);j.liveGithubContext=reviewGithubContext;
+      const diff=await ghTextRepo(targetRepository,`/pulls/${pr.number}`,'application/vnd.github.v3.diff');
+      const reviewed=await reviewPr(reviewer,j,diff,worker.id,cooldownExcludes,canonicalObjective,reviewGithubContext);reviewer=reviewed.resource;
+      if(reviewer.id===worker.id)throw new Error('REVIEWER_IMPLEMENTER_COLLISION');
+      await pool.query("update tigeriq_coding_jobs set reviewer_employee_id=$2 where id=$1",[j.id,reviewer.id]);
+      await persistIndependentReviewArtifact(pr.number,{implementerId:worker.id,reviewerId:reviewer.id,targetHead:cycleGates.sha,review:reviewed.review},targetRepository);
+      return reviewed.review;
+    },
+    repairFn:async({issues})=>{
+      const repairGithubContext=await loadAuthoritativeGithubContext(canonicalObjective);assertLiveGithubContextFresh(generatedGithubContext,repairGithubContext);j.liveGithubContext=repairGithubContext;
+      await assertCanonicalSourceWorkOrderExecutable(canonicalObjective);
+      // generateAndWriteRepair(worker,j,branch,issues,cooldownExcludes,mutationAuth,canonicalObjective,repairGithubContext)
+      const repaired=await generateAndWriteRepair(worker,j,branch,issues,cooldownExcludes,mutationAuth,canonicalObjective,repairGithubContext,targetRepository);worker=repaired.worker;gen=repaired.payload;
+      if(reviewer.id===worker.id){reviewer=pickResource([worker.id,...cooldownExcludes]);if(!reviewer)throw new Error('NO_INDEPENDENT_REVIEWER_AVAILABLE')}
+    },
+    onWaitingCi:async()=>{
+      await pool.query("update tigeriq_coding_jobs set employee_id=$2,reviewer_employee_id=$3,status='waiting_ci' where id=$1",[j.id,worker.id,reviewer?.id||null]);
+    },
+  });
+  review=lifecycle.review;gates=lifecycle.gates;
+  let productAcceptance=null;
+  if((canary)){
+    const changedFiles=await ghRepo(targetRepository,`/pulls/${pr.number}/files?per_page=100`);
+    if(!Array.isArray(changedFiles)||changedFiles.length>=100)
+      throw Error('CODING_CHANGED_FILES_LIST_UNVERIFIED');
+    if(changedFiles.some(x=>x.status==='removed'||!x.filename))throw Error('CODING_CHANGED_FILES_REMOVED_OR_INVALID');
+    const actual=new Set(changedFiles.map(x=>String(x.filename||'')));
+    const absent=stepPacket.required_changed_paths.filter(path=>!actual.has(path));
+    if(absent.length)throw Object.assign(new Error('CODING_REQUIRED_CHANGED_FILES_MISSING:'+absent.join(',')),{code:'CODING_REQUIRED_CHANGED_FILES_MISSING'});
+    // gates.states contains only the three generic required checks; inspect
+    // the real exact-SHA check-run collection for domain-specific build/contract checks.
+    const domainCheckReceipt=await ghRepo(targetRepository,`/commits/${encodeURIComponent(gates.sha)}/check-runs?per_page=100`);
+    if(!Array.isArray(domainCheckReceipt?.check_runs)||!Number.isSafeInteger(domainCheckReceipt?.total_count)||domainCheckReceipt.check_runs.length===0||domainCheckReceipt.check_runs.length>=100||domainCheckReceipt.total_count!==domainCheckReceipt.check_runs.length)throw Error('CODING_DOMAIN_CHECKS_UNVERIFIED');
+    const check=verifyCodingFunctionalChecks({packet:stepPacket,checkRuns:domainCheckReceipt.check_runs,sourceHeadSha:gates.sha,repositoryFullName:targetRepository.fullName});
+    if(!check.pass)throw Object.assign(new Error(check.code+':'+check.missing.join(',')),{code:check.code});
+    // G6: verify the PR HEAD against exact-SHA GitHub file bytes. A pending
+    // G5 module fails closed and cannot become a waived/implicit PASS.
+    const prHeadSha=await headSha(branch,targetRepository);
+    let productModule=null;
+    if(['android','frontend','backend'].includes(stepPacket.deliverable_type)){
+      try{productModule=await import('./product-acceptance.mjs')}
+      catch(error){
+        if(error?.code==='ERR_MODULE_NOT_FOUND')
+          throw Object.assign(new Error('CODING_G5_PRODUCT_ACCEPTOR_UNAVAILABLE'),{code:'CODING_G5_PRODUCT_ACCEPTOR_UNAVAILABLE'});
+        throw error;
+      }
+    }
+    productAcceptance=await verifyCodingCanaryProductGate({
+      packet:stepPacket,sourceHeadSha:gates.sha,prHeadSha,
+      repositoryFullName:targetRepository.fullName,
+      changedPaths:[...actual],
+      readSource:async(path,sha)=>readRepoFile(path,sha,targetRepository),
+      fetchEvidence:async(sha,repositoryFullName)=>{
+        if(repositoryFullName!==targetRepository.fullName)
+          throw Error('CODING_PRODUCT_REPOSITORY_DRIFT');
+        // Never accept a caller-supplied check run; this is an authenticated
+        // GitHub REST read performed by the execution plane on pinned SHA.
+        const raw=await ghRepo(targetRepository,`/commits/${encodeURIComponent(sha)}/check-runs?per_page=100`);
+        return {provider:'github_rest_authenticated',sourceHeadSha:sha,
+          repository:repositoryFullName,totalCount:raw?.total_count,
+          checkRuns:raw?.check_runs};
+      },
+      evaluateProduct:productModule?.evaluateProductAcceptance
+    });
+  }
+  approvedHead=gates.sha;approvedReviewer=reviewer?.id||null;approvedImplementer=worker.id;
+  if(!ownerWaiver&&review?.decision!=='approve')throw new Error('REVIEW_NOT_APPROVED');
+  assertPrOpenState(await ghRepo(targetRepository,`/pulls/${pr.number}`));
+  const mergeGithubContext=await loadAuthoritativeGithubContext(canonicalObjective);assertLiveGithubContextFresh(generatedGithubContext,mergeGithubContext);
+  const finalSha=await headSha(branch,targetRepository);
+  if(ownerWaiver)assertCodingReviewAcceptance({repository:targetRepository,implementerId:approvedImplementer,reviewerId:approvedReviewer,targetHead:approvedHead,expectedHead:finalSha,review});
+  else assertIndependentReviewApproval({implementerId:approvedImplementer,reviewerId:approvedReviewer,targetHead:approvedHead,expectedHead:finalSha,decision:review?.decision});
+  let merge={merged:false,message:'AUTO_MERGE_DISABLED'};
+  if(AUTO_MERGE&&!canary){
+    try{
+      await assertCanonicalSourceWorkOrderExecutable(canonicalObjective);
+      // merge=await mergePr(pr.number,approvedHead,j.title)
+      merge=await mergePr(pr.number,approvedHead,j.title,targetRepository);
+    }catch(e){merge={merged:false,message:String(e.message||e)}}
+  }
+  // Do not require the P0-only handoff adapter on legacy workers, including
+  // self-contained runJob harnesses that exercise the pre-existing path.
+  const handoff=canary
+    ?codingVerifiedCanaryOwnerHandoff({canary,merge,gates,productAcceptance,review,ownerWaiver,headSha:finalSha})
+    :{jobStatus:merge?.merged?'done':'blocked',objectiveStatus:merge?.merged?'completed':'blocked',
+      code:merge?.merged?'CODING_LEGACY_MERGED':'CODING_LEGACY_MERGE_BLOCKED',
+      summary:merge?.merged?'Merged PR #{PR}':'PR #{PR} ready but merge blocked: '+String(merge?.message||'unknown').slice(0,500)};
+  const status=handoff.jobStatus;
+  await pool.query("update tigeriq_coding_jobs set status=$2,head_sha=$3,result=$4,completed_at=now(),next_attempt_at=null,resource_retry_count=0,resource_retry_started_at=null where id=$1",[j.id,status,finalSha,JSON.stringify({summary:gen.summary,prNumber:pr.number,branch,gates,review,productAcceptance,merge,ownerHandoff:handoff})]);
+  await pool.query("update tigeriq_coding_objectives set status=$2,summary=$3,updated_at=now() where id=$1",[j.objective_id,handoff.objectiveStatus,handoff.summary.replace('{PR}',String(pr.number))]);
+  return {prNumber:pr.number,branch,merge};
+}
+async function failJob(j,e){
+  if(!pool)return;
+  const current=(await pool.query("select * from tigeriq_coding_jobs where id=$1",[j.id])).rows[0]||j;
+  const failure={message:String(e?.message||e),code:e?.code||null,detail:e?.detail||null};
+  if(isResourceTransientError(e)){
+    const cooldownPlan=/NO_(?:IMPLEMENTER_AVAILABLE|INDEPENDENT_REVIEWER_AVAILABLE)/i.test(failure.message)?providerCooldownPollPlan(current.failure):null;
+    if(cooldownPlan?.wait){
+      const preservedCount=Math.max(0,Number(current.resource_retry_count)||0);
+      const waitingFailure=cooldownWaitFailure(failure,current.failure,cooldownPlan,preservedCount);
+      await pool.query("update tigeriq_coding_jobs set status='waiting_resource',failure=$2,next_attempt_at=$3,completed_at=null where id=$1",[j.id,JSON.stringify(waitingFailure),cooldownPlan.nextAttemptAt]);
+      await pool.query("update tigeriq_coding_objectives set status='active',summary=$2,updated_at=now() where id=$1",[j.objective_id,`WAITING_RESOURCE_COOLDOWN retry ${preservedCount}/${RESOURCE_WAIT_MAX_RETRIES}: ${failure.message}`.slice(0,1000)]);
+      return;
+    }
+    const plan=resourceWaitPlan({retryCount:current.resource_retry_count,startedAt:current.resource_retry_started_at});
+    if(plan.wait){
+      await pool.query("update tigeriq_coding_jobs set status='waiting_resource',failure=$2,next_attempt_at=$3,resource_retry_count=$4,resource_retry_started_at=coalesce(resource_retry_started_at,now()),completed_at=null where id=$1",[j.id,JSON.stringify({...failure,resourceWait:{retryCount:plan.retryCount,delayMs:plan.delayMs,nextAttemptAt:plan.nextAttemptAt}}),plan.nextAttemptAt,plan.retryCount]);
+      await pool.query("update tigeriq_coding_objectives set status='active',summary=$2,updated_at=now() where id=$1",[j.objective_id,`WAITING_RESOURCE retry ${plan.retryCount}/${RESOURCE_WAIT_MAX_RETRIES}: ${failure.message}`.slice(0,1000)]);
+      return;
+    }
+  }
+  await pool.query("update tigeriq_coding_jobs set status='failed',failure=$2,completed_at=now(),next_attempt_at=null where id=$1",[j.id,JSON.stringify(failure)]);
+  await pool.query("update tigeriq_coding_objectives set status='blocked',summary=$2,updated_at=now() where id=$1",[j.objective_id,String(e?.message||e).slice(0,1000)]);
+}
+
+export async function codingIssueStatusSnapshot(db,issueNumber){
+  const n=Number(issueNumber);
+  if(!Number.isInteger(n)||n<1||n>999999)throw new Error('CODING_ISSUE_NUMBER_INVALID');
+  const pattern='%issue #'+n+':%';
+  const objectives=(await db.query("select id,status,summary,current_pr,target_head,updated_at from tigeriq_coding_objectives where objective ilike $1 order by updated_at desc limit 1",[pattern])).rows||[];
+  const objective=objectives[0]||null;
+  let job=null;
+  if(objective){
+    job=(await db.query("select id,status,employee_id,reviewer_employee_id,branch,pr_number,head_sha,result,failure,completed_at from tigeriq_coding_jobs where objective_id=$1 order by created_at desc limit 1",[objective.id])).rows?.[0]||null;
+  }
+  const result=job?.result&&typeof job.result==='object'?job.result:{};
+  const failure=job?.failure&&typeof job.failure==='object'?job.failure:{};
+  return {
+    ok:true,issueNumber:n,
+    objective:objective?{id:String(objective.id||''),status:String(objective.status||''),summary:String(objective.summary||'').slice(0,2400),currentPr:Number(objective.current_pr)||null,targetHead:String(objective.target_head||'').slice(0,64),updatedAt:objective.updated_at?String(objective.updated_at):null}:null,
+    job:job?{id:String(job.id||''),status:String(job.status||''),implementer:String(job.employee_id||''),reviewer:String(job.reviewer_employee_id||''),branch:String(job.branch||'').slice(0,180),prNumber:Number(job.pr_number)||null,headSha:String(job.head_sha||'').slice(0,64),resultSummary:String(result.summary||'').slice(0,2400),failureMessage:String(failure.message||'').slice(0,1200),completedAt:job.completed_at?String(job.completed_at):null}:null,
+  };
+}
+
+// Recent history must not hide an unfinished canonical dispatch from Core.
+// Keep blocked objectives until Core records a terminal result for that exact
+// issue/objective pair; an older attempt's final is not this attempt's final.
+export async function codingSnapshotObjectives(db){
+  const [recent,retained]=await Promise.all([
+    db.query('select * from tigeriq_coding_objectives order by created_at desc limit 20'),
+    db.query(`with latest_dispatch as (
+      select distinct on (data->>'issueNumber') data
+      from tigeriq_events
+      where type='GITHUB_CODING_DISPATCHED' and data ? 'issueNumber'
+      order by data->>'issueNumber',seq desc
+    )
+    select o.* from latest_dispatch d
+    join tigeriq_coding_objectives o on o.id=d.data->>'codingObjectiveId'
+    where o.status='blocked' and not exists (
+      select 1 from tigeriq_events e
+      where e.type in ('GITHUB_CODING_BLOCKED_FINAL','GITHUB_CODING_RESULT_REPORTED')
+        and e.data->>'issueNumber'=d.data->>'issueNumber'
+        and e.data->>'codingObjectiveId'=o.id
+    )
+    union select * from tigeriq_coding_objectives where status='active'`)
+  ]);
+  const byId=new Map();
+  for(const row of [...retained.rows,...recent.rows])byId.set(row.id,row);
+  return [...byId.values()].sort((a,b)=>new Date(b.created_at)-new Date(a.created_at)||String(a.id).localeCompare(String(b.id)));
+}
+
+async function snapshot(){const objectives=await codingSnapshotObjectives(pool);const jobs=(await pool.query('select * from tigeriq_coding_jobs order by created_at desc limit 30')).rows;const nowMs=Date.now();return {ok:true,service:'tigeriq-coding-lane',host:HOST,port:PORT,pid:process.pid,maxParallel:MAX_PARALLEL,coreHealthFresh:Boolean(coreResourceHealth.fetchedAt&&nowMs-coreResourceHealth.fetchedAt<=CORE_RESOURCE_HEALTH_TTL_MS),coreHealthReadback:codingCoreHealthReadback(coreResourceHealth,coreHealthReadback,{nowMs,ttlMs:CORE_RESOURCE_HEALTH_TTL_MS}),activeAiResources:[...busyAiResources],freeAiResources:selectableResources([]).map(x=>x.id),reviewPolicy:codingOwnerReviewWaiver()||{kind:'independent'},resources:resources.map(x=>({id:x.id,provider:x.provider,model:x.model,busy:busyAiResources.has(x.id),coreEligible:coreResourceEligible(x,nowMs)})),objectives,jobs}}
+async function body(req){let s='';for await(const c of req){s+=c;if(s.length>65536)throw new Error('BODY_TOO_LARGE')}return s?JSON.parse(s):{}}
+const server=createServer(async(req,res)=>{const u=new URL(req.url||'/','http://localhost');try{if(req.method==='GET'&&u.pathname==='/health'){res.writeHead(200,{'content-type':'application/json'});return res.end(JSON.stringify({ok:true,service:'tigeriq-coding-lane',pid:process.pid,resources:resources.length}))}if(req.method==='GET'&&u.pathname==='/api/status'){res.writeHead(200,{'content-type':'application/json','cache-control':'no-store'});return res.end(JSON.stringify(await snapshot()))}if(req.method==='GET'&&u.pathname==='/api/issue-status'){res.writeHead(200,{'content-type':'application/json','cache-control':'no-store'});return res.end(JSON.stringify(await codingIssueStatusSnapshot(pool,u.searchParams.get('issue'))))}if(req.method==='POST'&&u.pathname==='/api/objectives'){const b=await body(req);if(!String(b.objective||'').trim()){res.writeHead(400);return res.end('objective_required')}const routing=validateObjectiveRoutingInput(b);const id=`CODEOBJ-${randomUUID()}`;const priority=['P0','P1','P2'].includes(b.priority)?b.priority:'P1';await pool.query('insert into tigeriq_coding_objectives(id,objective,priority,target_employee,current_pr,target_head) values($1,$2,$3,$4,$5,$6)',[id,String(b.objective).slice(0,12000),priority,routing.targetEmployee,routing.currentPr,routing.targetHead]);res.writeHead(201,{'content-type':'application/json'});return res.end(JSON.stringify({ok:true,id}))}res.writeHead(404);res.end('not_found')}catch(e){res.writeHead(500,{'content-type':'application/json'});res.end(JSON.stringify({ok:false,error:String(e?.message||e)}))}});
+
+if(process.env.NODE_ENV!=='test'){
+  installAiJsonTransport({maxAttempts:1,baseDelayMs:350,attemptTimeoutMs:45000});
+  await initDb();
+  await recoverAfterCodingRestart();
+  void coreHealthPump.start().catch(()=>{});
+  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(PORT,HOST,resolve)});
+  console.log(JSON.stringify({event:'TIGERIQ_CODING_LANE_STARTED',host:HOST,port:PORT,pid:process.pid,resources:resources.map(x=>x.id),autoMerge:AUTO_MERGE}));
+  let stop=false;
+  let githubApiBackoffUntil=0;
+  const managerPump=createNonblockingManagerTick(managerTick,{
+    onError:(error)=>{
+      const rateLimitUntil=githubApiRateLimitBackoffUntil(error,Date.now());
+      // Only the manager has a bounded cooldown; do not stop queued worker jobs.
+      console.error(JSON.stringify({event:'CODING_MANAGER_NONBLOCKING_ERROR',
+        rateLimitUntil:rateLimitUntil>Date.now()?new Date(rateLimitUntil).toISOString():null,
+        error:String(error?.code||error?.message||error).slice(0,240)}));
+    },
+    onStall:({elapsedMs})=>console.warn(JSON.stringify({
+      event:'CODING_MANAGER_SLOW_SINGLE_FLIGHT',elapsedMs,pid:process.pid,
+    })),
+  });
+  const active=new Set();
+  let lastStaleRecoveryScanAt=0;
+  let staleRuntimeCanaryDone=false;
+  const staleRuntimeCanaryStartedAt=Date.now();
+  const staleRuntimeCanaryDeadline=staleRuntimeCanaryStartedAt+STALE_RUNNING_RUNTIME_CANARY_TIMEOUT_MS;
+  try{
+    const armed=await armStaleRunningRuntimeCanary({nowMs:staleRuntimeCanaryStartedAt});
+    if(!armed.armed){
+      staleRuntimeCanaryDone=true;
+      console.warn(JSON.stringify({event:'CODING_STALE_RUNNING_CANARY_FAIL',reason:armed.reason||'NOT_ARMED',pid:process.pid}));
+    }else{
+      console.warn(JSON.stringify({event:'CODING_STALE_RUNNING_CANARY_ARMED',canaryId:'A8-2068',jobId:armed.jobId,pid:process.pid}));
+    }
+  }catch(error){
+    staleRuntimeCanaryDone=true;
+    await cleanupStaleRunningRuntimeCanary().catch(()=>{});
+    console.warn(JSON.stringify({event:'CODING_STALE_RUNNING_CANARY_FAIL',reason:String(error?.code||error?.message||error).slice(0,160),pid:process.pid}));
+  }
+  process.on('SIGINT',()=>{stop=true;coreHealthPump.stop();server.close()});
+  process.on('SIGTERM',()=>{stop=true;coreHealthPump.stop();server.close()});
+  while(!stop){
+    const nowLoop=Date.now();
+    if(githubApiBackoffUntil>nowLoop){
+      await sleep(Math.min(60_000,githubApiBackoffUntil-nowLoop));
+      continue;
+    }
+    try{
+      await refreshCoreResourceHealth();
+      const nowMs=Date.now();
+      if(nowMs-lastStaleRecoveryScanAt>=STALE_RUNNING_SCAN_INTERVAL_MS){
+        await recoverStaleRunningJobs({activeIds:active,nowMs});
+        lastStaleRecoveryScanAt=nowMs;
+      }
+      if(!staleRuntimeCanaryDone){
+        const canary=await settleStaleRunningRuntimeCanary();
+        if(canary.pass)staleRuntimeCanaryDone=true;
+        else if(nowMs>=staleRuntimeCanaryDeadline){
+          staleRuntimeCanaryDone=true;
+          await cleanupStaleRunningRuntimeCanary();
+          console.warn(JSON.stringify({event:'CODING_STALE_RUNNING_CANARY_FAIL',reason:'TIMEOUT',status:canary.status||null,detail:canary.reason||null,pid:process.pid}));
+        }
+      }
+      if(DECOUPLED_MANAGER)managerPump.launch();
+      else await managerTick();
+      while(active.size<MAX_PARALLEL){
+        const j=await claimJob();
+        if(!j)break;
+        active.add(j.id);
+        void runJob(j).catch(e=>failJob(j,e)).finally(()=>active.delete(j.id));
+      }
+    }catch(e){
+      const rateLimitUntil=githubApiRateLimitBackoffUntil(e,Date.now());
+      if(rateLimitUntil>Date.now()){
+        githubApiBackoffUntil=rateLimitUntil;
+        console.error(JSON.stringify({event:'CODING_GITHUB_RATE_LIMIT_BACKOFF',status:Number(e?.status||0),remaining:e?.rateLimitRemaining??null,retryAfter:e?.retryAfter??null,rateLimitReset:e?.rateLimitReset??null,backoffUntil:new Date(githubApiBackoffUntil).toISOString(),error:String(e?.message||e)}));
+      }else{
+        console.error(JSON.stringify({event:'CODING_LANE_LOOP_ERROR',error:String(e?.message||e)}));
+      }
+    }
+    await sleep(1500);
+  }
+  coreHealthPump.stop();
+  if(pool)await pool.end();
+}

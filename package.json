@@ -1,0 +1,46 @@
+{
+  "name": "tigeriq-ai-lab",
+  "version": "0.9.0",
+  "private": true,
+  "description": "Evidence-gated distributed AI workforce control center",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run && node --test tests/core-ui-assignment.test.mjs tests/core-nv09-registration.test.mjs tests/coding-lane-nv09.test.mjs tests/github-projects-automation.test.mjs tests/core-4457-native-routing-gate.test.mjs tests/core-4457-ollama-native-structured.test.mjs tests/core-4457-campaign-receipt.test.mjs tests/cline-executor-benchmark.test.mjs tests/cline-executor-decision-gate.test.mjs && node --test tests/api-health-view-gateway.test.mjs && node --test tests/api-health-view-facade.test.mjs && node --test tests/health-view-transport.test.mjs && node --test tests/coding-step-contract.test.mjs && node --test tests/core-job-outcome-summary.test.mjs && node --test tests/core-work-orders-source-pagination.test.mjs && node --test tests/coding-skill-policy.test.mjs && node --test tests/coding-p0-isolated-contract-journey.test.mjs && node --test tests/coding-atomic-source-claim.test.mjs && node --test tests/coding-p0-g6-isolated-workflow.test.mjs && node --test tests/coding-p0-g6-restart-acceptance-guard.test.mjs && node tests/run-postgres-isolated-ci.mjs",
+    "test:e2e": "playwright test",
+    "test:chief": "node scripts/test-chief-router.mjs",
+    "test:vercel-policy": "node scripts/verify-vercel-deployment-policy.mjs",
+    "build": "tsc -p tsconfig.build.json && node scripts/package-bcct-runtime.mjs",
+    "command-center": "node dist/apps/dashboard/src/standalone.js",
+    "workforce-controller": "node dist/apps/workforce-controller/src/standalone.js",
+    "ci": "npm run test:vercel-policy && npm run typecheck && npm run test && npm run test:e2e && npm run build",
+    "test:chrome-mcp": "node scripts/chrome-devtools-mcp-smoke.mjs",
+    "nv0304:owner-cycle": "node dist/apps/chrome-controller/src/nv03-nv04-owner-sidecar.js",
+    "test:p0:postgres": "node --test tests/coding-postgres-integration.test.mjs",
+    "test:p0:g6": "node --test tests/coding-p0-g6-isolated-workflow.test.mjs",
+    "test:p0:postgres:ci": "node tests/run-postgres-isolated-ci.mjs"
+  },
+  "dependencies": {
+    "@vercel/oidc": "3.8.5",
+    "pg": "8.23.0",
+    "deepagents": "1.14.1",
+    "@langchain/core": "1.2.17",
+    "@langchain/langgraph": "1.4.20",
+    "@langchain/langgraph-checkpoint": "1.1.6",
+    "@langchain/langgraph-sdk": "1.12.2",
+    "@langchain/langgraph-checkpoint-postgres": "1.0.6",
+    "langchain": "1.5.15",
+    "langsmith": "0.9.0"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@playwright/test": "^1.55.0",
+    "@types/node": "^22.0.0",
+    "chrome-devtools-mcp": "1.9.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}

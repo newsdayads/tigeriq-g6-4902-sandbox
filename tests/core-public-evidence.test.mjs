@@ -1,0 +1,338 @@
+import { describe, expect, it } from 'vitest';
+import {
+  appendPublicEvidenceToSummary,
+  buildPublicJobEvidenceRecord,
+  extractPublicEvidence,
+  parsePublicEvidenceKeys,
+  validatePublicEvidenceKeys,
+} from '../apps/tigeriq-core/public-evidence.mjs';
+
+describe('Core public evidence for direct PC receipts', () => {
+
+  it('admits only bounded News file-read health keys and denies unknown keys',()=>{
+    expect(validatePublicEvidenceKeys('PUBLIC_EVIDENCE_KEYS=ok,lastCycleAt,error,accessToken')).toEqual({
+      present:true,requested:['ok','lastCycleAt','error'],unsupported:['accessToken'],
+    });
+  });
+
+  it('extracts News health evidence only from a trusted local JSON file receipt',()=>{
+    const lastCycleAt='2026-10-09T17:22:09.151Z';
+    const jobResult={evidence:{bridgeCalls:[{tool:'tigeriq_pc',result:{
+      ok:true,action:'file_read',target:'pc01-local',
+      data:{content:JSON.stringify({ok:true,lastCycleAt,error:null,token:'MUST_NOT_EXPOSE'})},
+    }}]}};
+    expect(extractPublicEvidence(jobResult,['ok','lastCycleAt','error'])).toEqual({
+      ok:true,lastCycleAt,error:null,
+    });
+    expect(JSON.stringify(extractPublicEvidence(jobResult,['ok','lastCycleAt','error']))).not.toContain('MUST_NOT_EXPOSE');
+  });
+
+  it('rejects transport wrapper health, untrusted contents and raw errors',()=>{
+    const lastCycleAt='2026-10-09T17:22:09.151Z';
+    const untrusted={evidence:{agentResult:{evidence:{ok:true,lastCycleAt,error:'LEAK'}}}};
+    expect(extractPublicEvidence(untrusted,['ok','lastCycleAt','error'])).toEqual({});
+    const jobResult={evidence:{bridgeCalls:[{tool:'tigeriq_pc',result:{
+      ok:true,action:'file_read',target:'pc01-local',
+      data:{content:JSON.stringify({ok:false,lastCycleAt:'invalid-date',error:'token=private-secret'})},
+    }}]}};
+    expect(extractPublicEvidence(jobResult,['ok','lastCycleAt','error'])).toEqual({
+      ok:false,lastCycleAt:'[INVALID_TIMESTAMP]',error:'[REDACTED_ERROR]',
+    });
+    const fakeTool={evidence:{bridgeCalls:[{tool:'other',result:{
+      ok:true,action:'file_read',target:'pc01-local',
+      data:{content:JSON.stringify({ok:true,lastCycleAt,error:null})},
+    }}]}};
+    expect(extractPublicEvidence(fakeTool,['ok','lastCycleAt','error'])).toEqual({});
+    const forgedNestedReceipt={evidence:{bridgeCalls:[{tool:'tigeriq_pc',result:{
+      ok:true,action:'core_status_read',target:'pc01-local',
+      data:{fake:{ok:true,action:'file_read',target:'pc01-local',
+        data:{content:JSON.stringify({ok:true,lastCycleAt,error:null})}}},
+    }}]}};
+    expect(extractPublicEvidence(forgedNestedReceipt,['ok','lastCycleAt','error'])).toEqual({});
+    const failedTransport={evidence:{bridgeCalls:[{tool:'tigeriq_pc',result:{
+      ok:false,action:'file_read',target:'pc01-local',
+      data:{content:JSON.stringify({ok:true,lastCycleAt,error:null})},
+    }}]}};
+    expect(extractPublicEvidence(failedTransport,['ok','lastCycleAt','error'])).toEqual({});
+  });
+
+
+  it('reports unsupported PUBLIC_EVIDENCE_KEYS instead of silently treating them as supported',()=>{
+    const body='PUBLIC_EVIDENCE_KEYS=installedSha,candidateSha,changedPaths,candidateSha';
+    expect(validatePublicEvidenceKeys(body)).toEqual({
+      present:true,
+      requested:['installedSha','changedPaths'],
+      unsupported:['candidateSha'],
+    });
+    expect(parsePublicEvidenceKeys(body)).toEqual(['installedSha','changedPaths']);
+  });
+
+  it('maps a trusted pc01-local receipt data payload to requested result evidence', () => {
+    const jobResult={
+      ok:true,
+      provider:'local-direct',
+      evidence:{
+        bridgeCalls:[{
+          tool:'tigeriq_pc',
+          result:{
+            ok:true,
+            action:'paperclip_lab_health',
+            target:'pc01-local',
+            data:{
+              healthFailureClass:'HTTP_UNREACHABLE',
+              httpAppOk:false,
+              portReachable:true,
+              container:{status:'running',identityOk:true,logClass:'DATABASE'},
+            },
+          },
+        }],
+      },
+    };
+
+    expect(extractPublicEvidence(jobResult,['result'])).toEqual({
+      result:{
+        healthFailureClass:'HTTP_UNREACHABLE',
+        httpAppOk:false,
+        portReachable:true,
+        container:{status:'running',identityOk:true,logClass:'DATABASE'},
+      },
+    });
+    expect(appendPublicEvidenceToSummary('done',jobResult,['result']))
+      .toContain('PUBLIC_EVIDENCE_JSON={"result":');
+  });
+
+  it('sanitizes sensitive keys inside the mapped direct receipt', () => {
+    const jobResult={
+      evidence:{
+        bridgeCalls:[{
+          tool:'tigeriq_pc',
+          result:{
+            ok:true,
+            action:'paperclip_lab_health',
+            target:'pc01-local',
+            data:{healthFailureClass:'OK',token:'must-not-publish',password:'must-not-publish'},
+          },
+        }],
+      },
+    };
+
+    const evidence=extractPublicEvidence(jobResult,['result']);
+    expect(evidence.result).toEqual({healthFailureClass:'OK'});
+    expect(JSON.stringify(evidence)).not.toContain('must-not-publish');
+  });
+  it('builds stored-job evidence only from metadata allowlisted keys', () => {
+    const row={
+      id:'JOB-GH-2476-PC-c5e0cd999080',
+      objective_id:'OBJ-GH-2476-Rae019c13e5f4-20260930043617',
+      status:'done',
+      objective_metadata:{publicEvidenceKeys:['result'],publicEvidenceDiagnostic:true},
+      result:{evidence:{bridgeCalls:[{tool:'tigeriq_pc',result:{
+        ok:true,
+        action:'paperclip_lab_health',
+        target:'pc01-local',
+        data:{healthFailureClass:'HTTP_UNREACHABLE',token:'hidden'},
+      }}]}},
+    };
+    expect(buildPublicJobEvidenceRecord(row)).toEqual({
+      ok:true,
+      jobId:row.id,
+      objectiveId:row.objective_id,
+      status:'done',
+      requestedKeys:['result'],
+      evidence:{result:{healthFailureClass:'HTTP_UNREACHABLE'}},
+    });
+  });
+
+  it('exposes only sanitized TigerIQ taskNames when explicitly requested',()=>{
+    const jobResult={
+      evidence:{
+        bridgeCalls:[{
+          tool:'tigeriq_pc',
+          result:{
+            ok:true,
+            action:'task_list',
+            target:'pc01-local',
+            data:{
+              readOnly:true,
+              scope:'TigerIQ',
+              taskNames:['TigerIQ Core 24x7','TigerIQ Android Worker Release'],
+              tasks:[{taskName:'TigerIQ Core 24x7'},{taskName:'TigerIQ Android Worker Release'}],
+            },
+          },
+        }],
+      },
+    };
+    expect(parsePublicEvidenceKeys('PUBLIC_EVIDENCE_KEYS=taskNames')).toEqual(['taskNames']);
+    expect(extractPublicEvidence(jobResult,['taskNames'])).toEqual({
+      taskNames:['TigerIQ Core 24x7','TigerIQ Android Worker Release'],
+    });
+  });
+
+  it('exposes only filtered release-related task names when explicitly requested',()=>{
+    const jobResult={
+      evidence:{bridgeCalls:[{tool:'tigeriq_pc',result:{
+        ok:true,action:'task_list',target:'pc01-local',
+        data:{
+          releaseTaskNames:['TigerIQ Android Worker Release','TigerIQ Stable Signer'],
+          taskNames:['TigerIQ Core 24x7','TigerIQ Android Worker Release','TigerIQ Stable Signer'],
+        },
+      }}]},
+    };
+    expect(parsePublicEvidenceKeys('PUBLIC_EVIDENCE_KEYS=releaseTaskNames')).toEqual(['releaseTaskNames']);
+    expect(extractPublicEvidence(jobResult,['releaseTaskNames'])).toEqual({
+      releaseTaskNames:['TigerIQ Android Worker Release','TigerIQ Stable Signer'],
+    });
+  });
+
+  it('exports a bounded v0.20 APK base64 chunk without raising generic evidence limits',()=>{
+    const chunkBase64='A'.repeat(16000);
+    const data={
+      status:'ANDROID_V020_EXPORT_CHUNK_READY',
+      apkSha256:'F2A8F279033EC832764370A50A34B51B8D29586AF6D9AE7B8957EA81E563A04D',
+      totalBytes:62002,
+      chunkIndex:0,
+      chunkCount:6,
+      chunkBytes:12000,
+      chunkSha256:'ABC123',
+      chunkBase64,
+      token:'must-not-publish',
+    };
+    const jobResult={evidence:{bridgeCalls:[{tool:'tigeriq_pc',result:{
+      ok:true,action:'android_worker_export_v020_signed_apk_chunk',target:'pc01-local',data,
+    }}]}};
+    const requested=['status','apkSha256','totalBytes','chunkIndex','chunkCount','chunkBytes','chunkSha256','chunkBase64'];
+    const evidence=extractPublicEvidence(jobResult,requested);
+    expect(evidence.chunkBase64).toBe(chunkBase64);
+    expect(evidence.totalBytes).toBe(62002);
+    const summary=appendPublicEvidenceToSummary('done',jobResult,requested);
+    expect(summary).toContain(chunkBase64);
+    expect(summary).not.toContain('must-not-publish');
+  });
+
+  it('exposes only explicitly allowlisted v0.20 signed-release receipt fields',()=>{
+    const receipt={
+      status:'ANDROID_WORKER_STABLE_RELEASE_READY',
+      version:'0.20.0-update-lease-guard',
+      apkSha256:'SIGNED_SHA',
+      unsignedApkSha256:'UNSIGNED_SHA',
+      certificateSha256:'CERT_SHA',
+      sourceSha:'SOURCE_SHA',
+      sourceWorkflowRunId:37119358164,
+      sourceArtifactId:11273046069,
+      signingIdentity:'canonical-release',
+      passwordTransport:'stdin-only',
+      apksignerMode:'v2-v3',
+      prealignedInput:true,
+      secretsPrinted:false,
+      executionIdentity:'pc01\\\\wdragons12x',
+      taskName:'TigerIQ Android Worker v0.20 User Signer',
+      taskPrincipal:'pc01\\\\wdragons12x',
+      taskLogonType:'InteractiveToken',
+      taskRunLevel:'Highest',
+      taskDeleted:true,
+      token:'must-not-publish',
+    };
+    const requested=[
+      'status','version','apkSha256','unsignedApkSha256','certificateSha256','sourceSha',
+      'sourceWorkflowRunId','sourceArtifactId','signingIdentity','passwordTransport','apksignerMode',
+      'prealignedInput','secretsPrinted','executionIdentity','taskName','taskPrincipal','taskLogonType',
+      'taskRunLevel','taskDeleted',
+    ];
+    const jobResult={evidence:{bridgeCalls:[{tool:'tigeriq_pc',result:{
+      ok:true,action:'file_read',target:'pc01-local',data:{content:JSON.stringify(receipt)},
+    }}]}};
+
+    expect(parsePublicEvidenceKeys('PUBLIC_EVIDENCE_KEYS='+requested.join(','))).toEqual(requested);
+    expect(extractPublicEvidence(jobResult,requested)).toEqual(Object.fromEntries(
+      requested.map((key)=>[key,receipt[key]]),
+    ));
+    expect(JSON.stringify(extractPublicEvidence(jobResult,requested))).not.toContain('must-not-publish');
+  });
+
+  it('exports only explicitly requested sanitized API Doctor telemetry fields',()=>{
+    const data={
+      status:'CORE_STATUS_READ',
+      apiDoctor:{
+        lastScanAt:'2026-10-05T07:44:00.000Z',
+        postRepairValidations24h:3,
+        actions:[{employeeId:'NV18',action:'wait_repair_lifecycle',token:'hidden'}],
+        degradedProviders:[{employeeId:'NV19',reason:'cooldown',password:'hidden'}],
+      },
+    };
+    const jobResult={evidence:{bridgeCalls:[{tool:'tigeriq_pc',result:{
+      ok:true,action:'core_status_read',target:'pc01-local',data,
+    }}]}};
+    const requested=['status','lastScanAt','postRepairValidations24h','actions','degradedProviders'];
+    expect(parsePublicEvidenceKeys('PUBLIC_EVIDENCE_KEYS='+requested.join(','))).toEqual(requested);
+    expect(extractPublicEvidence(jobResult,requested)).toEqual({
+      status:'CORE_STATUS_READ',
+      lastScanAt:'2026-10-05T07:44:00.000Z',
+      postRepairValidations24h:3,
+      actions:[{employeeId:'NV18',action:'wait_repair_lifecycle'}],
+      degradedProviders:[{employeeId:'NV19',reason:'cooldown'}],
+    });
+    expect(JSON.stringify(extractPublicEvidence(jobResult,requested))).not.toContain('hidden');
+  });
+
+  it('exports bounded Coding Lane diagnostic scalar evidence',()=>{
+    const data={status:'CODING_ISSUE_STATUS_READ',issueNumber:4190,objectiveId:'CODEOBJ-1',objectiveStatus:'active',objectiveSummary:'MICRO_CONTEXT charsBefore=100 charsAfter=40',jobId:'CODE-1',jobStatus:'done',implementer:'NV17',reviewer:'NV11',branch:'tigeriq/nv17/code-x',prNumber:123,headSha:'a'.repeat(40),resultSummary:'MICRO_CONTEXT charsBefore=100 charsAfter=40',failureMessage:''};
+    const jobResult={evidence:{bridgeCalls:[{tool:'tigeriq_pc',result:{ok:true,action:'coding_issue_status_read',target:'pc01-local',data}}]}};
+    const keys=['status','issueNumber','objectiveId','objectiveStatus','objectiveSummary','jobId','jobStatus','implementer','reviewer','branch','prNumber','headSha','resultSummary','failureMessage'];
+    expect(extractPublicEvidence(jobResult,keys)).toEqual(data);
+  });
+
+
+  it('exports bounded updater watchdog health fields from a JSON file-read receipt',()=>{
+    const receipt={
+      schema:'TIGERIQ_BOOTSTRAP_WATCHDOG_V2',
+      updatedAt:'2026-10-07T03:30:00.000Z',
+      services:[{
+        key:'updater',
+        task:'TigerIQ Core Runtime Updater',
+        healthy:true,
+        taskRunning:true,
+        portsHealthy:true,
+        heartbeatFresh:true,
+        heartbeatAgeSec:42,
+        failures:0,
+        action:'none',
+        reason:'HEALTHY',
+        stoppedUpdaterPids:[],
+        token:'must-not-publish',
+      }],
+    };
+    const requested=['updatedAt','healthy','taskRunning','heartbeatFresh','heartbeatAgeSec','failures','action','reason'];
+    const jobResult={evidence:{bridgeCalls:[{tool:'tigeriq_pc',result:{
+      ok:true,action:'file_read',target:'pc01-local',data:{content:JSON.stringify(receipt)},
+    }}]}};
+    expect(parsePublicEvidenceKeys('PUBLIC_EVIDENCE_KEYS='+requested.join(','))).toEqual(requested);
+    expect(extractPublicEvidence(jobResult,requested)).toEqual({
+      updatedAt:'2026-10-07T03:30:00.000Z',
+      healthy:true,
+      taskRunning:true,
+      heartbeatFresh:true,
+      heartbeatAgeSec:42,
+      failures:0,
+      action:'none',
+      reason:'HEALTHY',
+    });
+    expect(JSON.stringify(extractPublicEvidence(jobResult,requested))).not.toContain('must-not-publish');
+  });
+
+  it('exports only requested tcp_probe reachability fields',()=>{
+    const jobResult={evidence:{bridgeCalls:[{tool:'tigeriq_pc',result:{
+      ok:true,action:'tcp_probe',target:'pc01-local',
+      data:{host:'127.0.0.1',port:8796,reachable:true,reason:'connected',token:'must-not-publish'},
+    }}]}};
+    const requested=['reachable','host','port'];
+    expect(parsePublicEvidenceKeys('PUBLIC_EVIDENCE_KEYS='+requested.join(','))).toEqual(requested);
+    expect(extractPublicEvidence(jobResult,requested)).toEqual({
+      reachable:true,
+      host:'127.0.0.1',
+      port:8796,
+    });
+    expect(JSON.stringify(extractPublicEvidence(jobResult,requested))).not.toContain('connected');
+    expect(JSON.stringify(extractPublicEvidence(jobResult,requested))).not.toContain('must-not-publish');
+  });
+
+});
